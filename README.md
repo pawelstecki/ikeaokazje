@@ -22,8 +22,20 @@ fingerprintu TLS, nie tylko naglowkow HTTP. Dlatego uzywam `curl_cffi`
 (a nie zwyklego `requests`) - podszywa sie pod prawdziwa przegladarke na
 poziomie handshake'u, bez czego dostajesz czysty 403 zanim serwer nawet
 zobaczy Twoje naglowki. `HEADERS` i `IMPERSONATE` w skrypcie musza sie
-wzajemnie zgadzac (ta sama wersja Chrome) - nie polecam edytowac ich
-osobno, latwo znowu wpasc w blokade.
+wzajemnie zgadzac (ta sama wersja Chrome) - to jedyne dwie rzeczy w kodzie,
+ktorych bym nie ruszal.
+
+## Kod vs ustawienia - waznny podzial
+
+**Caly kod (`ikea_okazje.py`) mozesz spokojnie aktualizowac z GitHuba** -
+`git pull` albo pobranie nowej wersji nigdy nie nadpisze Twoich osobistych
+ustawien, bo one nie sa w tym pliku. Wszystko, co dotyczy Ciebie - jakich
+produktow szukasz, w jakich sklepach, jak wysylac powiadomienia - jest w
+`~/.config/ikea-okazje.env`.
+
+Wczesniej mialem to pomieszane (ustawienia na sztywno w kodzie), i przez
+to skopiowanie nowej wersji skryptu z repo nadpisywalo mi liste szukanych
+produktow, ktora lokalnie juz rozbudowalem. Stad ten podzial.
 
 ## Instalacja
 
@@ -38,7 +50,7 @@ Pythona, `curl_cffi` w wersji obslugujacej impersonacje wymaga 3.8+.
 
 ## Konfiguracja
 
-Skopiuj przykladowy plik z sekretami:
+Skopiuj przykladowy plik i wypelnij go swoimi ustawieniami:
 
 ```
 mkdir -p ~/.config
@@ -47,37 +59,40 @@ chmod 600 ~/.config/ikea-okazje.env
 nano ~/.config/ikea-okazje.env
 ```
 
-Wypelnij `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`. Jesli uzywasz Gmaila,
-`SMTP_PASS` to haslo aplikacji (16 znakow), nie zwykle haslo do konta -
-trzeba wlaczyc weryfikacje dwuetapowa i wygenerowac je w ustawieniach
-konta Google. Telegram jest opcjonalny - patrz sekcja nizej.
+Dostepne pola (wszystkie oprocz danych e-mail sa opcjonalne - jesli ich
+nie ustawisz, skrypt uzyje sensownych domyslnych wartosci):
 
-W samym `ikea_okazje.py` na gorze pliku ustaw:
+| Pole | Opis | Domyslnie |
+|---|---|---|
+| `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysylki maila | wymagane |
+| `SMTP_MODE` | `gmail`, `local587` albo `exim` | `gmail` |
+| `SMTP_HOST` | tylko dla `local587`/`exim`, jesli nie `localhost` | `localhost` |
+| `VERIFY_TLS` | `false`, jesli lokalny MTA ma zly/przeterminowany certyfikat | `true` |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | opcjonalny drugi kanal | wylaczone |
+| `STORE_IDS` | numery sklepow IKEA, po przecinku | `294` (Wroclaw) |
+| `SEARCH_TERMS` | szukane frazy, po przecinku | `Stall` |
+| `SEARCH_ARTICLE_NUMBERS` | numery artykulu, po przecinku | brak |
+| `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak (wylaczone) |
+| `MAX_PRICE` | maksymalna cena | brak (wylaczone) |
+| `KEYWORDS_EXCLUDE` | czarna lista slow, po przecinku | brak |
+| `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na pierwszym uruchomieniu | `false` |
 
-- `STORE_IDS` - lista numerow sklepow IKEA do monitorowania, np.
-  `["294", "307"]`. Numer znajdziesz w devtoolsach po wybraniu sklepu na
-  stronie "Okazje na okraglo", parametr `storeIds` w zapytaniu do API.
-  Miedzy kolejnymi sklepami skrypt robi krotka, losowa przerwe.
-- `SEARCH_TERMS` - lista fraz do wyszukania. Dopasowanie ignoruje
-  wielkosc liter i akcenty/ogonki, wiec `"Stall"` zlapie tez `"STÄLL"`.
-  Szuka jako podciag, wiec krotki rdzen zlapie odmiany slowa - np.
-  `"poscie"` zlapie `posciel`, `pościeli`, `pościelowy` itd.
-- `SEARCH_ARTICLE_NUMBERS` - jesli wolisz sledzic konkretny numer
-  artykulu, a nie tekst.
-- `SMTP_MODE` - `"gmail"`, `"local587"` (wlasny serwer, port 587 ze
-  STARTTLS+login) albo `"exim"` (wlasny serwer, port 25, bez logowania -
-  dziala tylko jesli Twoj MTA juz jest skonfigurowany jako relay).
+Wartosci z przecinkiem (np. `SEARCH_TERMS=Stall,poscie`) skrypt sam
+rozbija na liste - nie potrzeba nawiasow czy cudzoslowow, jak w Pythonie.
+
+Jesli uzywasz Gmaila, `SMTP_PASS` to haslo aplikacji (16 znakow), nie
+zwykle haslo do konta - trzeba wlaczyc weryfikacje dwuetapowa i
+wygenerowac je w ustawieniach konta Google.
 
 ### Filtry (domyslnie wylaczone)
 
-Trzy niezalezne filtry, kazdy mozesz wlaczyc osobno - domyslnie sa
-wylaczone (`None` / pusta lista), zeby nie odsiewaly nic, dopoki sam nie
-zdecydujesz, ze ich potrzebujesz:
+Trzy niezalezne filtry w `.env` - kazdy mozesz wlaczyc osobno, wpisujac
+wartosc:
 
-```python
-MIN_DISCOUNT_PERCENT = None   # np. 30 - tylko oferty z rabatem >= 30%
-MAX_PRICE = None               # np. 300 - tylko oferty do 300 (w walucie sklepu)
-KEYWORDS_EXCLUDE = []          # np. ["front", "uchwyt", "noga", "sruba"]
+```
+MIN_DISCOUNT_PERCENT=30
+MAX_PRICE=300
+KEYWORDS_EXCLUDE=front,uchwyt,noga,sruba
 ```
 
 `KEYWORDS_EXCLUDE` dziala jak czarna lista - jesli tytul/opis produktu
@@ -109,6 +124,9 @@ Jak zalozyc bota (2 minuty, jesli masz juz konto Telegram):
    do bota odswiez ta strone - w odpowiedzi JSON znajdziesz
    `"chat":{"id": 123456789, ...}` - to jest Twoj chat_id.
 
+Jesli `getUpdates` zwraca `{"ok":true,"result":[]}`, to najczesciej znak,
+ze jeszcze nie wyslales wiadomosci do bota - zrob to i odswiez ponownie.
+
 Wpisz oba do `~/.config/ikea-okazje.env`:
 
 ```
@@ -129,13 +147,16 @@ Pierwsze uruchomienie nie wysle powiadomienia, nawet jesli od razu
 znajdzie dopasowanie - zapisuje aktualny stan jako "juz znany" i czeka
 na kolejne, nowe oferty. To zabezpieczenie przed zalewem powiadomien po
 pierwszym teście albo po przywroceniu serwera z backupu. Jesli akurat
-chcesz alert od razu, ustaw `ALERT_EXISTING_ON_FIRST_RUN = True`.
+chcesz alert od razu, ustaw `ALERT_EXISTING_ON_FIRST_RUN=true` w `.env`.
 
 Kolejne uruchomienia wysylaja powiadomienie tylko dla **nowych** ofert
 (sledzone po `offerUuid`), wiec nie dostaniesz spamu o tym samym
 egzemplarzu co kilka minut. Kazde powiadomienie zawiera cene, procent
 rabatu wzgledem ceny wyjsciowej, stan produktu, numer artykulu i link do
 wyszukania go na stronie IKEA.
+
+Logi maja teraz znacznik czasu (`[2026-09-01 11:14:03] ...`), zeby latwiej
+bylo czytac historie w logu crona.
 
 Jesli zapytanie do API dostanie tymczasowy blad (429 albo 5xx), skrypt
 probuje ponownie z rosnaca przerwa (2s, 4s, 8s) przed poddaniem sie -
@@ -164,6 +185,18 @@ HOME=/home/twoj_user
 PYTHONPATH=/home/twoj_user/.local/lib/python3.9/site-packages
 ```
 
+## Aktualizacja skryptu
+
+```
+git pull
+```
+
+albo po prostu pobierz najnowsza wersje `ikea_okazje.py` z GitHuba i
+podmien plik na serwerze. Twoje ustawienia w `~/.config/ikea-okazje.env`
+zostana nietkniete - nowa wersja kodu przeczyta je normalnie, o ile
+struktura pol nie zmienila sie (a jesli tak, bede to zawsze opisywal w
+historii commitow).
+
 ## Typowe problemy
 
 **Blokada Cloudflare / 403.** Zwykle oznacza, ze naglowki nie sa
@@ -182,6 +215,12 @@ Twoj MTA, jest aktualny i wystawiony na nazwe hosta, z ktora sie laczysz.
 wyslales jeszcze zadnej wiadomosci do swojego bota. `getUpdates` zwraca
 pusta liste, dopoki bot nie dostanie od Ciebie choc jednej wiadomosci -
 Telegram wymaga, zeby rozmowe zaczynal czlowiek, nie bot.
+
+**Po aktualizacji skryptu zniknely moje szukane produkty.** To byl bug
+w starszej wersji, gdzie `SEARCH_TERMS` i inne ustawienia byly na sztywno
+w kodzie - kopiowanie nowej wersji z GitHuba nadpisywalo je domyslnymi
+wartosciami. Od wersji z plikiem `.env` to sie nie powtorzy, bo
+ustawienia zyja poza repozytorium.
 
 ## Licencja
 

@@ -13,15 +13,20 @@ ktore trzeba "podszyc" pod prawdziwa przegladarke, bo inaczej Cloudflare
 odrzuca zapytanie na poziomie TLS/fingerprintu, zanim nawet dojdzie do
 naglowkow HTTP. Stad curl_cffi, a nie zwykle requests.
 
+WAZNE: wszystkie ustawienia, ktore chcesz zmieniac (sklepy, szukane
+produkty, filtry, sposob wysylki maila, Telegram) sa w pliku
+~/.config/ikea-okazje.env, NIE w tym skrypcie. Dzieki temu aktualizacja
+skryptu (np. z GitHuba) nigdy nie nadpisze Twoich osobistych ustawien -
+edytuj plik .env, nie ten kod. Zobacz .env.example.
+
 Wymagania:
     pip install curl_cffi
 
 Uzycie:
     1. Skopiuj .env.example do ~/.config/ikea-okazje.env i wypelnij.
-    2. Ustaw SEARCH_TERMS / SEARCH_ARTICLE_NUMBERS i STORE_IDS nizej.
-    3. Odpal recznie raz, zeby sprawdzic ze dziala:
+    2. Odpal recznie raz, zeby sprawdzic ze dziala:
            python3 ikea_okazje.py
-    4. Wrzuc do crona, np. co 7 minut, z flockiem (patrz README).
+    3. Wrzuc do crona, np. co 7 minut, z flockiem (patrz README).
 """
 
 import json
@@ -39,15 +44,8 @@ from email.message import EmailMessage
 
 from curl_cffi import requests
 
-# ---------------- KONFIGURACJA ----------------
+# ---------------- KONFIGURACJA TECHNICZNA (nie zmieniaj tego przez .env) ----------------
 API_URL = "https://web-api.ikea.com/circular/circular-asis/offers/grouped/search"
-
-# Numery sklepow IKEA do monitorowania. Znajdziesz je w devtoolsach
-# przegladarki (zakladka Network) po otwarciu strony "Okazje na okraglo"
-# i wybraniu sklepu - parametr storeIds w zapytaniu do API. Mozna podac
-# kilka - skrypt sprawdzi kazdy po kolei, z krotka przerwa (jitter)
-# miedzy nimi, zamiast odpytywac wszystkie naraz.
-STORE_IDS = ["294"]
 
 PAGE_SIZE = "64"   # API ogranicza max rozmiar strony do 64
 MAX_PAGES = 20      # zabezpieczenie przed niekonczaca sie paginacja
@@ -83,68 +81,17 @@ HEADERS = {
     ),
 }
 # Musi byc zgodne z wersja Chrome zadeklarowana w naglowkach powyzej -
-# curl_cffi ma tez nowsze targety (np. chrome131), ale trzymam sie tego,
-# co u mnie dziala stabilnie. NIE zmieniaj tego przez .env - to musi byc
-# jeden, wewnetrznie spojny zestaw, inaczej Cloudflare znowu zaczyna
-# blokowac zapytania.
+# to jest zestaw sprawdzony jako dzialajacy z Cloudflare. Nie przenosze
+# tego do .env - latwo tu wprowadzic niespojnosc i wywolac blokade.
 IMPERSONATE = "chrome124"
-
-# Szukane frazy - dopasowanie ignoruje wielkosc liter i akcenty, oraz
-# szuka jako podciag, wiec krotki rdzen wylapie tez odmiany slowa, np.
-# "poscie" zlapie "poscielp", "poscieli", "poscielowy" itd.
-SEARCH_TERMS = ["Stall"]
-
-# Numery artykulu do dopasowania 1:1 (dokladne, bez normalizacji) -
-# przydatne jak juz wiesz konkretny numer produktu i chcesz go pilnowac
-# niezaleznie od tego, jak IKEA go akurat nazwie/opisze.
-SEARCH_ARTICLE_NUMBERS = []
-
-# --- Filtry (wszystkie domyslnie WYLACZONE - None/pusta lista = brak
-# filtrowania po tym kryterium) ---
-
-# Minimalny rabat w procentach wzgledem ceny wyjsciowej produktu.
-# Przyklad: MIN_DISCOUNT_PERCENT = 30 odrzuci oferty z rabatem mniejszym
-# niz 30%. None = nie filtruj.
-MIN_DISCOUNT_PERCENT = None
-
-# Maksymalna cena oferty (w walucie sklepu, zwykle PLN).
-# Przyklad: MAX_PRICE = 300 odrzuci oferty drozsze niz 300.
-# None = nie filtruj.
-MAX_PRICE = None
-
-# Czarna lista slow-kluczowych - jesli tytul/opis produktu zawiera
-# ktorekolwiek z tych slow (po normalizacji, jak w SEARCH_TERMS), oferta
-# jest calkowicie ignorowana, nawet jesli dopasowuje sie do SEARCH_TERMS.
-# Przydatne np. do odsiewania czesci zamiennych: ["front", "uchwyt",
-# "noga", "sruba"]. Pusta lista = brak filtrowania.
-KEYWORDS_EXCLUDE = []
 
 STATE_FILE = os.path.expanduser("~/.ikea_okazje_seen_offers.json")
 RAW_DUMP_FILE = os.path.expanduser("~/.ikea_okazje_last_raw.json")
-
-# Przy pierwszym uruchomieniu (brak pliku stanu) nie chcemy alertu dla
-# wszystkiego, co jest widoczne w tej chwili - zapisujemy to jako
-# "juz znane" i czekamy na kolejne, nowe oferty.
-ALERT_EXISTING_ON_FIRST_RUN = False
-
-# --- E-MAIL ---
-# "gmail"    -> smtp.gmail.com:587, STARTTLS + login (haslo aplikacji)
-# "local587" -> localhost:587, STARTTLS + login (Twoje lokalne konto
-#               pocztowe, jesli masz wlasny serwer z MTA)
-# "exim"     -> localhost:25, bez logowania (tylko jesli Twoj lokalny
-#               MTA jest juz skonfigurowany do relay'owania na zewnatrz)
-SMTP_MODE = "gmail"
-
-# Jesli Twoj lokalny serwer poczty ma certyfikat na inna nazwe albo
-# akurat wygasl (zdarza sie), a i tak ufasz temu polaczeniu, bo nie
-# wychodzi poza Twoj wlasny serwer - ustaw na False.
-VERIFY_TLS = True
-
-SMTP_TIMEOUT = 30
 CONFIG_FILE = os.path.expanduser("~/.config/ikea-okazje.env")
 
+SMTP_TIMEOUT = 30
 REQUEST_TIMEOUT = 15
-# ------------------------------------------------
+# ------------------------------------------------------------------------
 
 
 def log(message: str, to_stderr: bool = False) -> None:
@@ -177,7 +124,63 @@ def load_env_file(path: str) -> dict:
     return values
 
 
+def parse_list(raw, default):
+    """'a, b ,c' -> ['a', 'b', 'c']. Brak wartosci w .env = uzyj default."""
+    if raw is None or raw.strip() == "":
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def parse_optional_number(raw):
+    """Puste/brakujace = None (filtr wylaczony). Inaczej int albo float."""
+    if raw is None or raw.strip() == "":
+        return None
+    raw = raw.strip()
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+
+def parse_bool(raw, default):
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "tak")
+
+
 ENV = load_env_file(CONFIG_FILE)
+
+# ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
+# Kazda z tych wartosci ma sensowny domyslny fallback (jesli .env jej nie
+# definiuje), zeby swiezo sklonowane repo dzialalo "z pudelka" - ale to
+# .env jest miejscem, w ktorym normalnie te ustawienia trzymasz i
+# zmieniasz, NIE ten plik.
+
+STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
+SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
+SEARCH_ARTICLE_NUMBERS = parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
+
+MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
+MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
+KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
+
+ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
+
+# "gmail"    -> smtp.gmail.com:587, STARTTLS + login (haslo aplikacji)
+# "local587" -> localhost:587, STARTTLS + login (Twoje lokalne konto
+#               pocztowe, jesli masz wlasny serwer z MTA)
+# "exim"     -> localhost:25, bez logowania (tylko jesli Twoj lokalny
+#               MTA jest juz skonfigurowany do relay'owania na zewnatrz)
+SMTP_MODE = ENV.get("SMTP_MODE", "gmail")
+
+# Jesli Twoj lokalny serwer poczty ma certyfikat na inna nazwe albo
+# akurat wygasl (zdarza sie), a i tak ufasz temu polaczeniu, bo nie
+# wychodzi poza Twoj wlasny serwer - ustaw VERIFY_TLS='false' w .env.
+VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
+# ----------------------------------------------------------------------------------------
 
 if SMTP_MODE == "gmail":
     SMTP_HOST = "smtp.gmail.com"
@@ -212,8 +215,6 @@ else:  # "exim" - lokalny MTA bez uwierzytelniania
 EMAIL_TO = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO") or EMAIL_FROM
 
 # --- TELEGRAM (opcjonalny drugi kanal powiadomien) ---
-# Wypelnij TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID w .env, zeby wlaczyc -
-# jesli oba sa puste, ten kanal jest po prostu pomijany.
 TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
