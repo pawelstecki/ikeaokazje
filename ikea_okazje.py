@@ -27,6 +27,7 @@ Uzycie:
 import json
 import os
 import random
+from datetime import datetime
 import smtplib
 import ssl
 import sys
@@ -144,6 +145,14 @@ CONFIG_FILE = os.path.expanduser("~/.config/ikea-okazje.env")
 
 REQUEST_TIMEOUT = 15
 # ------------------------------------------------
+
+
+def log(message: str, to_stderr: bool = False) -> None:
+    """Print z dopisanym znacznikiem czasu - przydatne w logach crona,
+    gdzie kolejne linie inaczej wygladaja identycznie."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    print(line, file=sys.stderr if to_stderr else sys.stdout)
 
 
 def load_env_file(path: str) -> dict:
@@ -534,7 +543,7 @@ def main() -> int:
     try:
         content = fetch_all_offers()
     except Exception as exc:
-        print(f"Blad zapytania do API: {exc}", file=sys.stderr)
+        log(f"Blad zapytania do API: {exc}", to_stderr=True)
         return 1
 
     matching_offers = flatten_matching_offers(content)
@@ -543,7 +552,7 @@ def main() -> int:
     try:
         seen_uuids = load_seen_uuids()
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"Blad odczytu pliku stanu: {exc}", file=sys.stderr)
+        log(f"Blad odczytu pliku stanu: {exc}", to_stderr=True)
         return 1
 
     first_run = not os.path.exists(STATE_FILE)
@@ -551,9 +560,9 @@ def main() -> int:
         try:
             save_seen_uuids(current_uuids)
         except OSError as exc:
-            print(f"Blad zapisu pliku stanu: {exc}", file=sys.stderr)
+            log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
             return 3
-        print(
+        log(
             "Pierwsze uruchomienie: zapisano stan bez wysylania alertu. "
             f"Znaleziono dopasowan: {len(matching_offers)}."
         )
@@ -568,7 +577,7 @@ def main() -> int:
         errors = notify(new_offers)
         if errors:
             for err in errors:
-                print(f"Blad wysylki powiadomienia ({err})", file=sys.stderr)
+                log(f"Blad wysylki powiadomienia ({err})", to_stderr=True)
             if len(errors) == (1 + (1 if TELEGRAM_ENABLED else 0)):
                 return 2
 
@@ -576,19 +585,19 @@ def main() -> int:
         try:
             save_seen_uuids(seen_uuids | sent_uuids)
         except OSError as exc:
-            print(f"Powiadomienie wyslane, ale nie udalo sie zapisac stanu: {exc}", file=sys.stderr)
+            log(f"Powiadomienie wyslane, ale nie udalo sie zapisac stanu: {exc}", to_stderr=True)
             return 3
 
-        print(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
+        log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
         return 0
 
     try:
         save_seen_uuids(seen_uuids | current_uuids)
     except OSError as exc:
-        print(f"Blad zapisu pliku stanu: {exc}", file=sys.stderr)
+        log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
         return 3
 
-    print(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
+    log(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
     return 0
 
 
