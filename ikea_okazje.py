@@ -6,27 +6,29 @@ Male narzedzie, ktore sprawdza dzial "Okazje na okraglo" (second-hand /
 buy-from-ikea) w wybranych sklepach IKEA i wysyla powiadomienie (e-mail
 i/albo Telegram), kiedy pojawi sie produkt, ktorego szukasz.
 
-Powstalo, bo czekalem na konkretny regal (STALL) i nie chcialem co
-wieczor wchodzic na strone recznie. Strona jest zbudowana jako SPA i
-caly ruch idzie do prywatnego API IKEA (web-api.ikea.com/circular/...),
-ktore trzeba "podszyc" pod prawdziwa przegladarke, bo inaczej Cloudflare
-odrzuca zapytanie na poziomie TLS/fingerprintu, zanim nawet dojdzie do
-naglowkow HTTP. Stad curl_cffi, a nie zwykle requests.
+Jesli Telegram jest skonfigurowany, mozesz zarzadzac lista szukanych
+slow i numerow artykulu komendami w czacie z botem:
+    /dodaj <slowo>        - dodaj slowo kluczowe
+    /usun <slowo>         - usun slowo kluczowe
+    /numer <nr>           - dodaj numer artykulu
+    /usunnumer <nr>        - usun numer artykulu
+    /status               - pokaz aktualnie monitorowane slowa/numery/sklepy
+    /pomoc                - lista komend
+
+Dwa tryby pracy (RUN_MODE w .env):
+    "cron"   (domyslny) - jedno przejscie i wyjscie, do uzycia z crona.
+    "daemon" - dziala w petli w tle (np. jako usluga systemd), sprawdza
+               komendy Telegrama czesto (TELEGRAM_POLL_INTERVAL_SECONDS),
+               a oferty IKEA rzadziej (CHECK_INTERVAL_SECONDS).
 
 WAZNE: wszystkie ustawienia, ktore chcesz zmieniac (sklepy, szukane
-produkty, filtry, sposob wysylki maila, Telegram) sa w pliku
+produkty, filtry, sposob wysylki maila, Telegram, tryb pracy) sa w pliku
 ~/.config/ikea-okazje.env, NIE w tym skrypcie. Dzieki temu aktualizacja
 skryptu (np. z GitHuba) nigdy nie nadpisze Twoich osobistych ustawien -
 edytuj plik .env, nie ten kod. Zobacz .env.example.
 
 Wymagania:
     pip install curl_cffi
-
-Uzycie:
-    1. Skopiuj .env.example do ~/.config/ikea-okazje.env i wypelnij.
-    2. Odpal recznie raz, zeby sprawdzic ze dziala:
-           python3 ikea_okazje.py
-    3. Wrzuc do crona, np. co 7 minut, z flockiem (patrz README).
 """
 
 import json
@@ -38,6 +40,7 @@ import ssl
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.message import EmailMessage
@@ -50,16 +53,9 @@ API_URL = "https://web-api.ikea.com/circular/circular-asis/offers/grouped/search
 PAGE_SIZE = "64"   # API ogranicza max rozmiar strony do 64
 MAX_PAGES = 20      # zabezpieczenie przed niekonczaca sie paginacja
 
-# Retry z backoffem - IKEA/Cloudflare czasem odpowiada 429 albo 5xx pod
-# obciazeniem. Przy takich kodach (i przy bledach polaczenia) skrypt
-# probuje ponownie z rosnacym odczekaniem, zamiast od razu sie poddawac.
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0   # sekundy, mnozone x2 przy kazdej kolejnej probie
+RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-
-# Krotka, losowa przerwa miedzy odpytywaniem kolejnych sklepow z listy
-# STORE_IDS - zmniejsza szanse, ze wzorzec zapytan bedzie wygladal jak
-# automat.
 STORE_JITTER_RANGE = (1.0, 3.0)
 
 HEADERS = {
@@ -80,14 +76,13 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
 }
-# Musi byc zgodne z wersja Chrome zadeklarowana w naglowkach powyzej -
-# to jest zestaw sprawdzony jako dzialajacy z Cloudflare. Nie przenosze
-# tego do .env - latwo tu wprowadzic niespojnosc i wywolac blokade.
 IMPERSONATE = "chrome124"
 
 STATE_FILE = os.path.expanduser("~/.ikea_okazje_seen_offers.json")
 RAW_DUMP_FILE = os.path.expanduser("~/.ikea_okazje_last_raw.json")
 CONFIG_FILE = os.path.expanduser("~/.config/ikea-okazje.env")
+DYNAMIC_STATE_FILE = os.path.expanduser("~/.ikea_okazje_dynamic.json")
+TELEGRAM_OFFSET_FILE = os.path.expanduser("~/.ikea_okazje_telegram_offset.json")
 
 SMTP_TIMEOUT = 30
 REQUEST_TIMEOUT = 15
@@ -95,8 +90,6 @@ REQUEST_TIMEOUT = 15
 
 
 def log(message: str, to_stderr: bool = False) -> None:
-    """Print z dopisanym znacznikiem czasu - przydatne w logach crona,
-    gdzie kolejne linie inaczej wygladaja identycznie."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     print(line, file=sys.stderr if to_stderr else sys.stdout)
@@ -125,14 +118,12 @@ def load_env_file(path: str) -> dict:
 
 
 def parse_list(raw, default):
-    """'a, b ,c' -> ['a', 'b', 'c']. Brak wartosci w .env = uzyj default."""
     if raw is None or raw.strip() == "":
         return default
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def parse_optional_number(raw):
-    """Puste/brakujace = None (filtr wylaczony). Inaczej int albo float."""
     if raw is None or raw.strip() == "":
         return None
     raw = raw.strip()
@@ -154,14 +145,9 @@ def parse_bool(raw, default):
 ENV = load_env_file(CONFIG_FILE)
 
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
-# Kazda z tych wartosci ma sensowny domyslny fallback (jesli .env jej nie
-# definiuje), zeby swiezo sklonowane repo dzialalo "z pudelka" - ale to
-# .env jest miejscem, w ktorym normalnie te ustawienia trzymasz i
-# zmieniasz, NIE ten plik.
-
 STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
-SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
-SEARCH_ARTICLE_NUMBERS = parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
+BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
+BASE_SEARCH_ARTICLE_NUMBERS = parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
 
 MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
 MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
@@ -169,17 +155,13 @@ KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
 
 ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
 
-# "gmail"    -> smtp.gmail.com:587, STARTTLS + login (haslo aplikacji)
-# "local587" -> localhost:587, STARTTLS + login (Twoje lokalne konto
-#               pocztowe, jesli masz wlasny serwer z MTA)
-# "exim"     -> localhost:25, bez logowania (tylko jesli Twoj lokalny
-#               MTA jest juz skonfigurowany do relay'owania na zewnatrz)
 SMTP_MODE = ENV.get("SMTP_MODE", "gmail")
-
-# Jesli Twoj lokalny serwer poczty ma certyfikat na inna nazwe albo
-# akurat wygasl (zdarza sie), a i tak ufasz temu polaczeniu, bo nie
-# wychodzi poza Twoj wlasny serwer - ustaw VERIFY_TLS='false' w .env.
 VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
+
+# "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
+RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
+CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 420
+TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
 # ----------------------------------------------------------------------------------------
 
 if SMTP_MODE == "gmail":
@@ -204,7 +186,7 @@ elif SMTP_MODE == "local587":
         )
     EMAIL_FROM = SMTP_USER
     USE_AUTH = True
-else:  # "exim" - lokalny MTA bez uwierzytelniania
+else:  # "exim"
     SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
     SMTP_PORT = 25
     SMTP_USER = None
@@ -214,27 +196,66 @@ else:  # "exim" - lokalny MTA bez uwierzytelniania
 
 EMAIL_TO = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO") or EMAIL_FROM
 
-# --- TELEGRAM (opcjonalny drugi kanal powiadomien) ---
 TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
 def normalize_text(s: str) -> str:
-    """Male litery + usuniecie akcentow, np. 'STALL' -> 'stall'.
-    Dodatkowo mapuje polskie 'l' z ogonkiem, ktorego NFKD nie rozklada
-    na zwykle 'l' plus znak diakrytyczny."""
     if not s:
         return ""
-    s = s.replace("\u0142", "l").replace("\u0141", "L")  # l z ogonkiem -> l
+    s = s.replace("\u0142", "l").replace("\u0141", "L")
     decomposed = unicodedata.normalize("NFKD", s)
     without_marks = "".join(c for c in decomposed if not unicodedata.combining(c))
     return without_marks.casefold()
 
 
+# ---------------- DYNAMICZNA LISTA (modyfikowana komendami z Telegrama) ----------------
+
+def load_dynamic_state() -> dict:
+    """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS
+    z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
+    pierwszym razie nie jest juz zrodlem prawdy dla tych dwoch list
+    (zmieniaj je odtad komendami w Telegramie albo edytujac ten plik)."""
+    if os.path.exists(DYNAMIC_STATE_FILE):
+        with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
+            "search_article_numbers": data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS)),
+        }
+    state = {
+        "search_terms": list(BASE_SEARCH_TERMS),
+        "search_article_numbers": list(BASE_SEARCH_ARTICLE_NUMBERS),
+    }
+    save_dynamic_state(state)
+    return state
+
+
+def save_dynamic_state(state: dict) -> None:
+    tmp_path = DYNAMIC_STATE_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, DYNAMIC_STATE_FILE)
+
+
+DYNAMIC_STATE = load_dynamic_state()
+SEARCH_TERMS = DYNAMIC_STATE["search_terms"]
+SEARCH_ARTICLE_NUMBERS = DYNAMIC_STATE["search_article_numbers"]
 NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
 NORMALIZED_EXCLUDE = [normalize_text(t) for t in KEYWORDS_EXCLUDE]
 
+
+def refresh_normalized_terms() -> None:
+    """Wywolaj po kazdej zmianie SEARCH_TERMS przez komende Telegrama."""
+    global NORMALIZED_TERMS
+    NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+
+
+# ---------------- IKEA API ----------------
 
 def dump_raw(data) -> None:
     try:
@@ -245,8 +266,6 @@ def dump_raw(data) -> None:
 
 
 def fetch_page_with_retry(store_id: str, page: int) -> dict:
-    """Pobiera jedna strone wynikow, z retry+backoff na bledach 429/5xx
-    i na bledach polaczenia."""
     params = {
         "languageCode": "pl",
         "size": PAGE_SIZE,
@@ -264,7 +283,7 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
                 timeout=REQUEST_TIMEOUT,
                 impersonate=IMPERSONATE,
             )
-        except Exception as exc:  # blad polaczenia, timeout itp.
+        except Exception as exc:
             last_error = exc
         else:
             if resp.status_code == 200:
@@ -286,7 +305,6 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
 
 
 def fetch_store_offers(store_id: str) -> list:
-    """Pobiera wszystkie strony wynikow dla jednego sklepu."""
     all_content = []
     page = 0
 
@@ -324,8 +342,6 @@ def fetch_store_offers(store_id: str) -> list:
 
 
 def fetch_all_offers() -> list:
-    """Pobiera oferty ze wszystkich sklepow z STORE_IDS, z krotka
-    losowa przerwa miedzy kazdym sklepem."""
     all_content = []
     for i, store_id in enumerate(STORE_IDS):
         all_content.extend(fetch_store_offers(store_id))
@@ -492,18 +508,14 @@ def escape_html(text: str) -> str:
     )
 
 
-def send_telegram(new_offers) -> None:
-    text = "\n\n".join(format_offer_telegram(o) for o in new_offers)
-    text = f"<b>IKEA Okazje - nowa oferta</b>\n\n{text}"
-
-    # Telegram ma limit ~4096 znakow na wiadomosc - w razie potrzeby
-    # obcinamy, zeby wysylka nie padla.
+def telegram_send_message(text: str, chat_id=None) -> None:
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
     if len(text) > 4000:
         text = text[:3990] + "\n\n(...)"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
@@ -520,10 +532,13 @@ def send_telegram(new_offers) -> None:
             raise RuntimeError(f"Telegram API zwrocilo HTTP {resp.status}")
 
 
+def send_telegram(new_offers) -> None:
+    text = "\n\n".join(format_offer_telegram(o) for o in new_offers)
+    text = f"<b>IKEA Okazje - nowa oferta</b>\n\n{text}"
+    telegram_send_message(text)
+
+
 def notify(new_offers) -> list:
-    """Wysyla powiadomienia wszystkimi skonfigurowanymi kanalami.
-    Zwraca liste bledow (pusta = wszystko OK). Jeden kanal padajac nie
-    blokuje pozostalych."""
     errors = []
 
     try:
@@ -540,7 +555,170 @@ def notify(new_offers) -> list:
     return errors
 
 
-def main() -> int:
+# ---------------- KOMENDY TELEGRAMA ----------------
+
+def load_telegram_offset() -> int:
+    if not os.path.exists(TELEGRAM_OFFSET_FILE):
+        return 0
+    try:
+        with open(TELEGRAM_OFFSET_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("offset", 0)
+    except (OSError, json.JSONDecodeError):
+        return 0
+
+
+def save_telegram_offset(offset: int) -> None:
+    tmp_path = TELEGRAM_OFFSET_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump({"offset": offset}, f)
+    os.replace(tmp_path, TELEGRAM_OFFSET_FILE)
+
+
+def telegram_get_updates(offset: int) -> list:
+    params = urllib.parse.urlencode({"offset": offset, "timeout": 0})
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?{params}"
+    try:
+        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Blad polaczenia z Telegram API: {exc}")
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates zwrocilo blad: {data}")
+    return data.get("result", [])
+
+
+def format_status_message() -> str:
+    lines = [
+        "<b>Aktualny monitoring:</b>",
+        f"Sklepy (storeIds): {', '.join(STORE_IDS)}",
+        f"Slowa kluczowe: {', '.join(SEARCH_TERMS) or '(brak)'}",
+        f"Numery artykulu: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}",
+    ]
+    if KEYWORDS_EXCLUDE:
+        lines.append(f"Czarna lista: {', '.join(KEYWORDS_EXCLUDE)}")
+    if MIN_DISCOUNT_PERCENT is not None:
+        lines.append(f"Min. rabat: {MIN_DISCOUNT_PERCENT}%")
+    if MAX_PRICE is not None:
+        lines.append(f"Maks. cena: {MAX_PRICE}")
+    lines.append(f"Tryb pracy: {RUN_MODE}")
+    return "\n".join(lines)
+
+
+def format_help_message() -> str:
+    return (
+        "<b>Komendy:</b>\n"
+        "/dodaj &lt;slowo&gt; - dodaj slowo kluczowe\n"
+        "/usun &lt;slowo&gt; - usun slowo kluczowe\n"
+        "/numer &lt;nr&gt; - dodaj numer artykulu\n"
+        "/usunnumer &lt;nr&gt; - usun numer artykulu\n"
+        "/status - pokaz aktualny monitoring\n"
+        "/pomoc - ta lista"
+    )
+
+
+def handle_command(cmd: str, arg: str) -> str:
+    """Zwraca tekst odpowiedzi. Modyfikuje globalny SEARCH_TERMS/
+    SEARCH_ARTICLE_NUMBERS i zapisuje DYNAMIC_STATE, jesli trzeba."""
+    global SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS
+
+    arg = arg.strip()
+
+    if cmd in ("/dodaj", "/add"):
+        if not arg:
+            return "Podaj slowo do dodania, np. /dodaj stall"
+        if normalize_text(arg) in NORMALIZED_TERMS:
+            return f"'{arg}' juz jest na liscie."
+        SEARCH_TERMS.append(arg)
+        refresh_normalized_terms()
+        DYNAMIC_STATE["search_terms"] = SEARCH_TERMS
+        save_dynamic_state(DYNAMIC_STATE)
+        return f"Dodano '{arg}'. Aktualna lista: {', '.join(SEARCH_TERMS)}"
+
+    if cmd in ("/usun", "/remove"):
+        if not arg:
+            return "Podaj slowo do usuniecia, np. /usun stall"
+        norm_arg = normalize_text(arg)
+        new_terms = [t for t in SEARCH_TERMS if normalize_text(t) != norm_arg]
+        if len(new_terms) == len(SEARCH_TERMS):
+            return f"'{arg}' nie bylo na liscie."
+        SEARCH_TERMS = new_terms
+        refresh_normalized_terms()
+        DYNAMIC_STATE["search_terms"] = SEARCH_TERMS
+        save_dynamic_state(DYNAMIC_STATE)
+        return f"Usunieto '{arg}'. Aktualna lista: {', '.join(SEARCH_TERMS) or '(brak)'}"
+
+    if cmd == "/numer":
+        if not arg:
+            return "Podaj numer artykulu, np. /numer 90557419"
+        if arg in SEARCH_ARTICLE_NUMBERS:
+            return f"Numer '{arg}' juz jest na liscie."
+        SEARCH_ARTICLE_NUMBERS.append(arg)
+        DYNAMIC_STATE["search_article_numbers"] = SEARCH_ARTICLE_NUMBERS
+        save_dynamic_state(DYNAMIC_STATE)
+        return f"Dodano numer '{arg}'. Aktualna lista: {', '.join(SEARCH_ARTICLE_NUMBERS)}"
+
+    if cmd == "/usunnumer":
+        if not arg:
+            return "Podaj numer artykulu do usuniecia, np. /usunnumer 90557419"
+        if arg not in SEARCH_ARTICLE_NUMBERS:
+            return f"Numeru '{arg}' nie bylo na liscie."
+        SEARCH_ARTICLE_NUMBERS = [n for n in SEARCH_ARTICLE_NUMBERS if n != arg]
+        DYNAMIC_STATE["search_article_numbers"] = SEARCH_ARTICLE_NUMBERS
+        save_dynamic_state(DYNAMIC_STATE)
+        return f"Usunieto numer '{arg}'. Aktualna lista: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}"
+
+    if cmd in ("/status", "/lista"):
+        return format_status_message()
+
+    if cmd in ("/pomoc", "/help", "/start"):
+        return format_help_message()
+
+    return f"Nieznana komenda: {cmd}\n\n{format_help_message()}"
+
+
+def handle_telegram_updates() -> None:
+    """Sprawdza nowe wiadomosci od ostatniego razu i wykonuje komendy.
+    Ignoruje wiadomosci od kogokolwiek innego niz TELEGRAM_CHAT_ID."""
+    offset = load_telegram_offset()
+    updates = telegram_get_updates(offset)
+
+    max_update_id = offset - 1
+    for update in updates:
+        max_update_id = max(max_update_id, update.get("update_id", max_update_id))
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+
+        chat_id = message.get("chat", {}).get("id")
+        if str(chat_id) != str(TELEGRAM_CHAT_ID):
+            continue  # nieautoryzowany nadawca - ignoruj
+
+        text = (message.get("text") or "").strip()
+        if not text.startswith("/"):
+            continue
+
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        try:
+            reply = handle_command(cmd, arg)
+        except Exception as exc:
+            reply = f"Blad przy obsludze komendy: {exc}"
+
+        try:
+            telegram_send_message(reply, chat_id=chat_id)
+        except Exception as exc:
+            log(f"Nie udalo sie odpowiedziec na Telegramie: {exc}", to_stderr=True)
+
+    if updates:
+        save_telegram_offset(max_update_id + 1)
+
+
+# ---------------- GLOWNA LOGIKA (jeden cykl sprawdzenia ofert) ----------------
+
+def run_ikea_check_cycle() -> int:
     try:
         content = fetch_all_offers()
     except Exception as exc:
@@ -600,6 +778,46 @@ def main() -> int:
 
     log(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
     return 0
+
+
+def run_daemon() -> None:
+    """Petla na potrzeby usterk systemd - Telegram sprawdzany czesto,
+    oferty IKEA rzadziej."""
+    log(
+        f"Start w trybie daemon (IKEA co {CHECK_INTERVAL_SECONDS}s, "
+        f"Telegram co {TELEGRAM_POLL_INTERVAL_SECONDS}s)."
+    )
+    last_ikea_check = 0.0
+
+    while True:
+        if TELEGRAM_ENABLED:
+            try:
+                handle_telegram_updates()
+            except Exception as exc:
+                log(f"Blad obslugi komend Telegrama: {exc}", to_stderr=True)
+
+        now = time.time()
+        if now - last_ikea_check >= CHECK_INTERVAL_SECONDS:
+            run_ikea_check_cycle()
+            last_ikea_check = now
+
+        time.sleep(TELEGRAM_POLL_INTERVAL_SECONDS)
+
+
+def main() -> int:
+    if TELEGRAM_ENABLED and RUN_MODE != "daemon":
+        # W trybie cron sprawdzamy komendy raz na starcie, przed
+        # sprawdzeniem ofert - w trybie daemon robi to petla w run_daemon().
+        try:
+            handle_telegram_updates()
+        except Exception as exc:
+            log(f"Blad obslugi komend Telegrama: {exc}", to_stderr=True)
+
+    if RUN_MODE == "daemon":
+        run_daemon()
+        return 0  # nieosiagalne w normalnych warunkach - run_daemon() nie wraca
+
+    return run_ikea_check_cycle()
 
 
 if __name__ == "__main__":

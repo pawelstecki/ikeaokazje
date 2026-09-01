@@ -2,7 +2,8 @@
 
 Skrypt, ktory sprawdza dzial "Okazje na okraglo" (second-hand) w wybranych
 sklepach IKEA i wysyla powiadomienie (e-mail i/albo Telegram), jak pojawi
-sie produkt, na ktory czekasz.
+sie produkt, na ktory czekasz. Jesli skonfigurujesz Telegrama, mozesz
+takze zarzadzac lista szukanych slow/numerow prosto z czatu z botem.
 
 Zrobilem go, bo chcialem regal STALL, ktory rzadko trafia do tego dzialu,
 a reczne odswiezanie strony kilka razy dziennie mi sie po tygodniu
@@ -14,28 +15,19 @@ znalezionego w devtoolsach (zakladka Network) po otwarciu strony.
 
 To API nie jest publicznie dokumentowane. Znalazlem je, bo strona z
 niego korzysta, ale IKEA moze je zmienic albo zablokowac w kazdej chwili,
-bez ostrzezenia. Ten skrypt dziala u mnie, ale nie oczekuj wsparcia od
-IKEA, jesli cos przestanie funkcjonowac po ich update.
+bez ostrzezenia.
 
-Druga rzecz: sam endpoint jest chroniony przez Cloudflare na poziomie
-fingerprintu TLS, nie tylko naglowkow HTTP. Dlatego uzywam `curl_cffi`
-(a nie zwyklego `requests`) - podszywa sie pod prawdziwa przegladarke na
-poziomie handshake'u, bez czego dostajesz czysty 403 zanim serwer nawet
-zobaczy Twoje naglowki. `HEADERS` i `IMPERSONATE` w skrypcie musza sie
-wzajemnie zgadzac (ta sama wersja Chrome) - to jedyne dwie rzeczy w kodzie,
-ktorych bym nie ruszal.
+Endpoint jest chroniony przez Cloudflare na poziomie fingerprintu TLS,
+nie tylko naglowkow HTTP. Dlatego uzywam `curl_cffi` (a nie zwyklego
+`requests`) - `HEADERS` i `IMPERSONATE` w skrypcie musza sie wzajemnie
+zgadzac (ta sama wersja Chrome) - to jedyne dwie rzeczy w kodzie, ktorych
+bym nie ruszal.
 
-## Kod vs ustawienia - waznny podzial
+## Kod vs ustawienia
 
 **Caly kod (`ikea_okazje.py`) mozesz spokojnie aktualizowac z GitHuba** -
-`git pull` albo pobranie nowej wersji nigdy nie nadpisze Twoich osobistych
-ustawien, bo one nie sa w tym pliku. Wszystko, co dotyczy Ciebie - jakich
-produktow szukasz, w jakich sklepach, jak wysylac powiadomienia - jest w
-`~/.config/ikea-okazje.env`.
-
-Wczesniej mialem to pomieszane (ustawienia na sztywno w kodzie), i przez
-to skopiowanie nowej wersji skryptu z repo nadpisywalo mi liste szukanych
-produktow, ktora lokalnie juz rozbudowalem. Stad ten podzial.
+`git pull` nigdy nie nadpisze Twoich osobistych ustawien, bo one nie sa
+w tym pliku - sa w `~/.config/ikea-okazje.env`.
 
 ## Instalacja
 
@@ -43,14 +35,9 @@ produktow, ktora lokalnie juz rozbudowalem. Stad ten podzial.
 pip install curl_cffi
 ```
 
-Dziala tez na starszych Pythonach (testowane od 3.9 wzwyz). Jesli masz
-Pythona 3.6 i pip próbuje sciagnac ancient, wycofana wersje 0.1.5 z
-błędem kompilacji `pyconfig.h` - to znak, że musisz zainstalowac nowszego
-Pythona, `curl_cffi` w wersji obslugujacej impersonacje wymaga 3.8+.
+Dziala od Pythona 3.8+ (curl_cffi z impersonacja tego wymaga).
 
 ## Konfiguracja
-
-Skopiuj przykladowy plik i wypelnij go swoimi ustawieniami:
 
 ```
 mkdir -p ~/.config
@@ -59,35 +46,65 @@ chmod 600 ~/.config/ikea-okazje.env
 nano ~/.config/ikea-okazje.env
 ```
 
-Dostepne pola (wszystkie oprocz danych e-mail sa opcjonalne - jesli ich
-nie ustawisz, skrypt uzyje sensownych domyslnych wartosci):
-
 | Pole | Opis | Domyslnie |
 |---|---|---|
 | `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysylki maila | wymagane |
 | `SMTP_MODE` | `gmail`, `local587` albo `exim` | `gmail` |
 | `SMTP_HOST` | tylko dla `local587`/`exim`, jesli nie `localhost` | `localhost` |
-| `VERIFY_TLS` | `false`, jesli lokalny MTA ma zly/przeterminowany certyfikat | `true` |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | opcjonalny drugi kanal | wylaczone |
-| `STORE_IDS` | numery sklepow IKEA, po przecinku | `294` (Wroclaw) |
-| `SEARCH_TERMS` | szukane frazy, po przecinku | `Stall` |
-| `SEARCH_ARTICLE_NUMBERS` | numery artykulu, po przecinku | brak |
-| `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak (wylaczone) |
-| `MAX_PRICE` | maksymalna cena | brak (wylaczone) |
+| `VERIFY_TLS` | `false`, jesli lokalny MTA ma zly certyfikat | `true` |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanal + komendy | wylaczone |
+| `STORE_IDS` | numery sklepow IKEA, po przecinku | `294` |
+| `SEARCH_TERMS` | szukane frazy - **tylko na starcie**, patrz nizej | `Stall` |
+| `SEARCH_ARTICLE_NUMBERS` | numery artykulu - **tylko na starcie** | brak |
+| `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak |
+| `MAX_PRICE` | maksymalna cena | brak |
 | `KEYWORDS_EXCLUDE` | czarna lista slow, po przecinku | brak |
-| `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na pierwszym uruchomieniu | `false` |
+| `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na starcie | `false` |
+| `RUN_MODE` | `cron` albo `daemon` | `cron` |
+| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzac IKEA | `420` |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzac komendy | `15` |
 
-Wartosci z przecinkiem (np. `SEARCH_TERMS=Stall,poscie`) skrypt sam
-rozbija na liste - nie potrzeba nawiasow czy cudzoslowow, jak w Pythonie.
+### Waznie: SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS dzialaja tylko RAZ
 
-Jesli uzywasz Gmaila, `SMTP_PASS` to haslo aplikacji (16 znakow), nie
-zwykle haslo do konta - trzeba wlaczyc weryfikacje dwuetapowa i
-wygenerowac je w ustawieniach konta Google.
+`SEARCH_TERMS` i `SEARCH_ARTICLE_NUMBERS` z `.env` sa uzywane wylacznie
+do zasiania pliku `~/.ikea_okazje_dynamic.json` **przy pierwszym
+uruchomieniu**. Od tego momentu prawda jest w tym pliku JSON, a nie w
+`.env` - zarzadzasz lista komendami w Telegramie (`/dodaj`, `/usun`,
+`/numer`, `/usunnumer`) albo recznie edytujac ten plik JSON. Jesli
+chcesz zresetowac liste do tego, co masz w `.env`, usun plik:
 
-### Filtry (domyslnie wylaczone)
+```
+rm ~/.ikea_okazje_dynamic.json
+```
 
-Trzy niezalezne filtry w `.env` - kazdy mozesz wlaczyc osobno, wpisujac
-wartosc:
+i uruchom skrypt ponownie - zasieje sie na nowo z `.env`.
+
+### Komendy Telegrama
+
+Jesli skonfigurujesz `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, mozesz
+pisac do bota:
+
+```
+/dodaj stall          - dodaj slowo kluczowe
+/usun stall            - usun slowo kluczowe
+/numer 90557419        - dodaj numer artykulu
+/usunnumer 90557419    - usun numer artykulu
+/status                - pokaz aktualny monitoring (sklepy, slowa, numery, filtry)
+/pomoc                 - lista komend
+```
+
+Bot reaguje tylko na wiadomosci z Twojego `TELEGRAM_CHAT_ID` - komendy
+od kogokolwiek innego sa ignorowane.
+
+**W trybie `cron`** komendy sa sprawdzane raz na starcie kazdego
+przebiegu - czyli reakcja przychodzi w ciagu maks. jednego interwalu
+crona (np. do 7 minut). **W trybie `daemon`** komendy sa sprawdzane co
+`TELEGRAM_POLL_INTERVAL_SECONDS` (domyslnie 15s), niezaleznie od tego,
+jak rzadko sprawdzane sa oferty IKEA - reakcja jest praktycznie od razu.
+
+Jak zalozyc bota - patrz sekcja "Telegram" nizej.
+
+### Filtry
 
 ```
 MIN_DISCOUNT_PERCENT=30
@@ -95,74 +112,23 @@ MAX_PRICE=300
 KEYWORDS_EXCLUDE=front,uchwyt,noga,sruba
 ```
 
-`KEYWORDS_EXCLUDE` dziala jak czarna lista - jesli tytul/opis produktu
-zawiera ktores z tych slow, oferta jest calkowicie ignorowana, nawet
-jesli akurat dopasowuje sie do `SEARCH_TERMS`. Przydatne, jesli szukasz
-np. calego regalu KALLAX, ale nie chcesz dostawac alertow o samych
-polkach czy nozkach do niego sprzedawanych osobno.
+### Telegram - jak zalozyc bota
 
-### Telegram (opcjonalny drugi kanal)
+1. W Telegramie wyszukaj `@BotFather`, wyslij `/newbot`.
+2. Podaj nazwe i login konczacy sie na `bot`.
+3. BotFather odpowie tokenem (`123456789:ABC...`) - to `TELEGRAM_BOT_TOKEN`.
+4. Napisz cokolwiek do swojego nowego bota (musisz zaczac rozmowe pierwszy).
+5. Wejdz na `https://api.telegram.org/bot<TOKEN>/getUpdates`, znajdz
+   `"chat":{"id": ...}` - to `TELEGRAM_CHAT_ID`.
 
-E-mail dziala zawsze. Telegram jest dodatkowy - jesli go skonfigurujesz,
-powiadomienia poleca oboma kanalami rownolegle (jeden nie blokuje
-drugiego, jak jeden padnie).
+Jesli `getUpdates` zwraca `{"ok":true,"result":[]}`, jeszcze nie
+wyslales wiadomosci do bota - zrob to i odswiez ponownie.
 
-Jak zalozyc bota (2 minuty, jesli masz juz konto Telegram):
+## Dwa tryby pracy
 
-1. W aplikacji Telegram wyszukaj `@BotFather` i zacznij z nim rozmowe.
-2. Wyslij komende `/newbot`.
-3. Podaj nazwe wyswietlana bota (np. "Ikea Okazje Monitor") i unikalny
-   login konczacy sie na `bot` (np. `ikea_okazje_monitor_bot`).
-4. BotFather odpowie tokenem w formacie `123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`
-   - to jest Twoj `TELEGRAM_BOT_TOKEN`.
-5. Znajdz swojego nowego bota w wyszukiwarce Telegrama i wyslij mu
-   jakakolwiek wiadomosc (np. "hej") - Telegram nie pozwala botom pisac
-   pierwszym, wiec musisz zainicjowac rozmowe.
-6. Zeby dostac swoj `TELEGRAM_CHAT_ID`, wejdz w przegladarce na:
-   `https://api.telegram.org/bot<TWOJ_TOKEN>/getUpdates`
-   (podmien `<TWOJ_TOKEN>` na token z kroku 4) i po wyslaniu wiadomosci
-   do bota odswiez ta strone - w odpowiedzi JSON znajdziesz
-   `"chat":{"id": 123456789, ...}` - to jest Twoj chat_id.
+### Tryb "cron" (domyslny)
 
-Jesli `getUpdates` zwraca `{"ok":true,"result":[]}`, to najczesciej znak,
-ze jeszcze nie wyslales wiadomosci do bota - zrob to i odswiez ponownie.
-
-Wpisz oba do `~/.config/ikea-okazje.env`:
-
-```
-TELEGRAM_BOT_TOKEN='123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ'
-TELEGRAM_CHAT_ID='123456789'
-```
-
-Jesli zostawisz te pola puste, skrypt po prostu pomija kanal Telegram i
-wysyla tylko maila - nic sie nie wywali.
-
-## Uzycie
-
-```
-python3 ikea_okazje.py
-```
-
-Pierwsze uruchomienie nie wysle powiadomienia, nawet jesli od razu
-znajdzie dopasowanie - zapisuje aktualny stan jako "juz znany" i czeka
-na kolejne, nowe oferty. To zabezpieczenie przed zalewem powiadomien po
-pierwszym teście albo po przywroceniu serwera z backupu. Jesli akurat
-chcesz alert od razu, ustaw `ALERT_EXISTING_ON_FIRST_RUN=true` w `.env`.
-
-Kolejne uruchomienia wysylaja powiadomienie tylko dla **nowych** ofert
-(sledzone po `offerUuid`), wiec nie dostaniesz spamu o tym samym
-egzemplarzu co kilka minut. Kazde powiadomienie zawiera cene, procent
-rabatu wzgledem ceny wyjsciowej, stan produktu, numer artykulu i link do
-wyszukania go na stronie IKEA.
-
-Logi maja teraz znacznik czasu (`[2026-09-01 11:14:03] ...`), zeby latwiej
-bylo czytac historie w logu crona.
-
-Jesli zapytanie do API dostanie tymczasowy blad (429 albo 5xx), skrypt
-probuje ponownie z rosnaca przerwa (2s, 4s, 8s) przed poddaniem sie -
-to lapie wiekszosc chwilowych przeciazen bez Twojej interwencji.
-
-## Cron
+Jedno przejscie i wyjscie - klasyczne uzycie z crona:
 
 ```
 crontab -e
@@ -172,18 +138,45 @@ crontab -e
 */7 * * * * /usr/bin/flock -n ~/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
 ```
 
-`flock -n` blokuje rownolegle uruchomienia - jesli poprzedni przebieg
-sie zawiesi (np. na SMTP), kolejny cykl po prostu poczeka na wolne, a nie
-odpali druga kopie, ktora moglaby wyslac duplikat powiadomienia.
+Prostsze w konfiguracji, ale reakcja na komendy Telegrama i wykrycie
+nowej oferty ograniczone sa do interwalu crona.
 
-Jesli `curl_cffi` zainstalowales z `pip install --user`, a cron zglasza
-`ModuleNotFoundError`, prawdopodobnie problem jest w zmiennej `HOME` w
-środowisku crona. Dodaj na gorze crontaba:
+### Tryb "daemon" (systemd)
+
+Dziala caly czas w tle - sprawdza komendy Telegrama czesto (sekundy), a
+oferty IKEA rzadziej (minuty), bez zaleznosci od crona.
 
 ```
-HOME=/home/twoj_user
-PYTHONPATH=/home/twoj_user/.local/lib/python3.9/site-packages
+RUN_MODE=daemon
 ```
+
+w `.env`, a potem zainstaluj usluge (przykladowy plik `ikea-okazje.service`
+w tym repo - podmien `TWOJ_UZYTKOWNIK` na swojego uzytkownika):
+
+```
+sudo cp ikea-okazje.service /etc/systemd/system/
+sudo nano /etc/systemd/system/ikea-okazje.service   # podmien TWOJ_UZYTKOWNIK
+sudo systemctl daemon-reload
+sudo systemctl enable --now ikea-okazje
+sudo systemctl status ikea-okazje
+journalctl -u ikea-okazje -f
+```
+
+Wybierz jeden z dwoch trybow - nie odpalaj jednoczesnie crona i usterk
+systemd dla tego samego skryptu, bedziesz miec podwojne powiadomienia.
+
+## Uzycie
+
+```
+python3 ikea_okazje.py
+```
+
+Pierwsze uruchomienie nie wysle powiadomienia, nawet jesli od razu
+znajdzie dopasowanie - zapisuje aktualny stan jako "juz znany". Ustaw
+`ALERT_EXISTING_ON_FIRST_RUN=true`, jesli chcesz alert od razu.
+
+Kazde powiadomienie zawiera cene, procent rabatu, stan produktu, numer
+artykulu i link. Logi maja znacznik czasu.
 
 ## Aktualizacja skryptu
 
@@ -191,36 +184,27 @@ PYTHONPATH=/home/twoj_user/.local/lib/python3.9/site-packages
 git pull
 ```
 
-albo po prostu pobierz najnowsza wersje `ikea_okazje.py` z GitHuba i
-podmien plik na serwerze. Twoje ustawienia w `~/.config/ikea-okazje.env`
-zostana nietkniete - nowa wersja kodu przeczyta je normalnie, o ile
-struktura pol nie zmienila sie (a jesli tak, bede to zawsze opisywal w
-historii commitow).
+Twoje ustawienia w `.env` i dynamiczna lista w `~/.ikea_okazje_dynamic.json`
+zostaja nietkniete.
 
 ## Typowe problemy
 
-**Blokada Cloudflare / 403.** Zwykle oznacza, ze naglowki nie sa
-kompletne albo `IMPERSONATE` nie zgadza sie z wersja Chrome zadeklarowana
-w `HEADERS` (user-agent, sec-ch-ua). Musza sie zgadzac.
+**Blokada Cloudflare / 403.** `IMPERSONATE` musi zgadzac sie z wersja
+Chrome w `HEADERS`.
 
-**`Size must be less than or equal to 64`.** API ma sztywny limit
-rozmiaru strony - `PAGE_SIZE` w skrypcie jest juz ustawiony na `64`.
+**`Size must be less than or equal to 64`.** `PAGE_SIZE` juz jest na `64`.
 
-**Certyfikat SSL wygasl / hostname mismatch przy wysylce maila przez
-wlasny serwer.** To akurat nie ma nic wspolnego ze skryptem - sprawdz
-`sudo certbot certificates` i upewnij sie, ze certyfikat, ktorego uzywa
-Twoj MTA, jest aktualny i wystawiony na nazwe hosta, z ktora sie laczysz.
+**Certyfikat SSL wygasl / hostname mismatch.** Sprawdz
+`sudo certbot certificates` i uprawnienia plikow certyfikatu dla Twojego
+MTA.
 
-**Telegram nie wysyla / brak `chat_id`.** Najczestszy powod: nie
-wyslales jeszcze zadnej wiadomosci do swojego bota. `getUpdates` zwraca
-pusta liste, dopoki bot nie dostanie od Ciebie choc jednej wiadomosci -
-Telegram wymaga, zeby rozmowe zaczynal czlowiek, nie bot.
+**Telegram nie wysyla / brak `chat_id`.** Wyslij najpierw jakas
+wiadomosc do bota - Telegram wymaga, zeby rozmowe zaczynal czlowiek.
 
-**Po aktualizacji skryptu zniknely moje szukane produkty.** To byl bug
-w starszej wersji, gdzie `SEARCH_TERMS` i inne ustawienia byly na sztywno
-w kodzie - kopiowanie nowej wersji z GitHuba nadpisywalo je domyslnymi
-wartosciami. Od wersji z plikiem `.env` to sie nie powtorzy, bo
-ustawienia zyja poza repozytorium.
+**Komendy w Telegramie nie dzialaja.** Sprawdz, czy piszesz z tego
+samego konta, ktorego `chat_id` jest w `.env` - bot ignoruje wiadomosci
+od innych nadawcow. W trybie `cron` komenda zadziala dopiero przy
+nastepnym przebiegu (do interwalu crona).
 
 ## Licencja
 
