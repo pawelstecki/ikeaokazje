@@ -142,6 +142,30 @@ def parse_bool(raw, default):
     return raw.strip().lower() in ("1", "true", "yes", "tak")
 
 
+def parse_store_url_slugs(raw: str, default: dict) -> dict:
+    """Parsuje STORE_URL_SLUGS z .env.
+
+    Format: STORE_ID:slug-sklepu,STORE_ID:slug-drugiego-sklepu
+    Zwraca slownik {store_id_str: slug_str}.
+    Ignoruje niepoprawne/puste wpisy.
+    """
+    if not raw or not raw.strip():
+        return default
+    result = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            continue
+        store_id, _, slug = entry.partition(":")
+        store_id = store_id.strip()
+        slug = slug.strip()
+        if store_id and slug:
+            result[store_id] = slug
+    return result if result else default
+
+
 ENV = load_env_file(CONFIG_FILE)
 
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
@@ -160,8 +184,13 @@ VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
 
 # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
 RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 420
+CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 900
 TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
+
+# Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
+# Domyslnie: 294 -> wroclaw (sklep IKEA Wroclaw).
+_DEFAULT_STORE_SLUGS = {"294": "wrocław"}
+STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), _DEFAULT_STORE_SLUGS)
 # ----------------------------------------------------------------------------------------
 
 if SMTP_MODE == "gmail":
@@ -367,11 +396,21 @@ def product_excluded(product: dict) -> bool:
     return any(term in haystack for term in NORMALIZED_EXCLUDE)
 
 
-def build_product_link(article_numbers) -> str:
-    if article_numbers:
-        query = urllib.parse.quote(article_numbers[0])
-        return f"https://www.ikea.com/pl/pl/search/?q={query}"
-    return "https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/"
+def build_offer_reservation_link(store_id, offer_number) -> str | None:
+    """Buduje bezposredni link do konkretnej oferty w dziale 'Okazje na Okraglo'.
+
+    Format: https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/<slug>/<offerNumber>
+
+    Zwraca None, jesli brakuje offer_number lub mapowania storeId -> slug.
+    """
+    if not offer_number:
+        return None
+    slug = STORE_URL_SLUGS.get(str(store_id))
+    if not slug:
+        return None
+    encoded_slug = urllib.parse.quote(str(slug), safe="")
+    encoded_offer = urllib.parse.quote(str(offer_number), safe="")
+    return f"https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/{encoded_slug}/{encoded_offer}"
 
 
 def calc_discount_percent(price, original_price):
@@ -390,6 +429,7 @@ def flatten_matching_offers(content: list) -> list:
 
         original_price = product.get("originalPrice")
         article_numbers = product.get("articleNumbers")
+        store_id = product.get("storeId")
 
         for offer in product.get("offers", []):
             price = offer.get("price")
@@ -402,9 +442,12 @@ def flatten_matching_offers(content: list) -> list:
                 if price is None or price > MAX_PRICE:
                     continue
 
+            offer_number = offer.get("offerNumber")
+            reservation_link = build_offer_reservation_link(store_id, offer_number)
+
             result.append({
                 "offer_uuid": offer.get("offerUuid"),
-                "offer_number": offer.get("offerNumber"),
+                "offer_number": offer_number,
                 "title": product.get("title"),
                 "description": product.get("description"),
                 "article_numbers": article_numbers,
@@ -417,8 +460,8 @@ def flatten_matching_offers(content: list) -> list:
                 "reason_discount": offer.get("reasonDiscount"),
                 "additional_info": offer.get("additionalInfo"),
                 "hero_image": product.get("heroImage"),
-                "store_id": product.get("storeId"),
-                "link": build_product_link(article_numbers),
+                "store_id": store_id,
+                "reservation_link": reservation_link,
             })
     return result
 
@@ -450,10 +493,16 @@ def format_offer_block(o: dict) -> str:
         f"Info: {o['additional_info']}",
         f"Numer artykulu: {', '.join(o['article_numbers'] or [])}",
         f"Numer oferty: {o['offer_number']}",
-        f"Sklep: {o['store_id']}",
-        f"Link: {o['link']}",
+        f"Sklep (storeId): {o['store_id']}",
         f"Zdjecie: {o['hero_image']}",
     ]
+    if o.get("reservation_link"):
+        lines.append(f"Link do rezerwacji: {o['reservation_link']}")
+    else:
+        lines.append(
+            "Rezerwacja: otwórz stronę \"Okazje na Okrągło online\", "
+            "wybierz właściwy sklep i znajdź ofertę po numerze oferty."
+        )
     return "\n".join(lines)
 
 
@@ -491,13 +540,19 @@ def format_offer_telegram(o: dict) -> str:
     discount_txt = f"{o['discount_percent']}%" if o["discount_percent"] is not None else "n/d"
     title = escape_html(o["title"] or "")
     description = escape_html(o["description"] or "")
-    return (
-        f"<b>{title}</b> - {description}\n"
+    offer_number_txt = escape_html(str(o["offer_number"])) if o.get("offer_number") else "brak"
+    store_id_txt = escape_html(str(o["store_id"])) if o.get("store_id") else "brak"
+
+    lines = [
+        f"<b>{title}</b> - {description}",
         f"Cena: <b>{o['price']} {o['currency']}</b> "
-        f"(z {o['original_price']} {o['currency']}, rabat {discount_txt})\n"
-        f"Stan: {o['condition']}\n"
-        f"<a href=\"{o['link']}\">Zobacz produkt</a>"
-    )
+        f"(z {o['original_price']} {o['currency']}, rabat {discount_txt})",
+        f"Stan: {o['condition']}",
+        f"Numer oferty: {offer_number_txt} | Sklep: {store_id_txt}",
+    ]
+    if o.get("reservation_link"):
+        lines.append(f'<a href="{o["reservation_link"]}">Przejdź do rezerwacji oferty</a>')
+    return "\n".join(lines)
 
 
 def escape_html(text: str) -> str:

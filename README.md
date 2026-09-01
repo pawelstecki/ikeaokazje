@@ -52,6 +52,7 @@ nano ~/.config/ikea-okazje.env
 | `VERIFY_TLS` | `false`, jeśli lokalny MTA ma zły certyfikat | `true` |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał + komendy | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku | `294` |
+| `STORE_URL_SLUGS` | mapowanie `storeId:slug` dla linków rezerwacji, po przecinku | `294:wrocław` |
 | `SEARCH_TERMS` | szukane frazy - **tylko na starcie**, patrz niżej | `Stall` |
 | `SEARCH_ARTICLE_NUMBERS` | numery artykułu - **tylko na starcie** | brak |
 | `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak |
@@ -59,8 +60,29 @@ nano ~/.config/ikea-okazje.env
 | `KEYWORDS_EXCLUDE` | czarna lista słów, po przecinku | brak |
 | `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na starcie | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać IKEA | `420` |
-| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać komendy | `15` |
+| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać IKEA (sekundy) | `900` |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać komendy Telegrama (sekundy) | `15` |
+
+### Linki do rezerwacji ofert
+
+Powiadomienia korzystają z `offerNumber` (zwracanego przez API IKEA) oraz
+konfiguracji `STORE_URL_SLUGS`, aby wygenerować bezpośredni link do
+konkretnej oferty w dziale "Okazje na Okrągło online":
+
+```
+https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/<slug-sklepu>/<offerNumber>
+```
+
+**Zachowanie awaryjne:** jeśli oferta nie ma `offerNumber` lub dla danego
+`storeId` nie ma mapowania na slug w `STORE_URL_SLUGS`, skrypt **nie
+generuje** mylącego linku do standardowego produktu IKEA - zamiast tego
+powiadomienie zawiera numer oferty i instrukcję ręcznego wyszukania.
+
+Aby dodać kolejny sklep:
+
+```
+STORE_URL_SLUGS=294:wrocław,145:gdańsk
+```
 
 ### Ważne: SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS działają tylko RAZ
 
@@ -96,9 +118,10 @@ od kogokolwiek innego są ignorowane.
 
 **W trybie `cron`** komendy są sprawdzane raz na starcie każdego
 przebiegu - czyli reakcja przychodzi w ciągu maks. jednego interwału
-crona (np. do 7 minut). **W trybie `daemon`** komendy są sprawdzane co
-`TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie 15s), niezależnie od tego,
-jak rzadko sprawdzane są oferty IKEA - reakcja jest praktycznie od razu.
+crona (np. do 15 minut). **W trybie `daemon`** komendy są sprawdzane co
+`TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie 15 sekund), niezależnie od
+tego, jak rzadko sprawdzane są oferty IKEA - reakcja jest praktycznie
+od razu.
 
 Jak założyć bota - patrz sekcja "Telegram" niżej.
 
@@ -126,14 +149,16 @@ wysłałeś wiadomości do bota - zrób to i odśwież ponownie.
 
 ### Tryb "cron" (domyślny)
 
-Jedno przejście i wyjście - klasyczne użycie z crona:
+Jedno przejście i wyjście - klasyczne użycie z crona.
+
+> **Oferty IKEA są sprawdzane co 15 minut.**
 
 ```
 crontab -e
 ```
 
 ```
-*/7 * * * * /usr/bin/flock -n ~/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
+*/15 * * * * /usr/bin/flock -n ~/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
 ```
 
 Prostsze w konfiguracji, ale reakcja na komendy Telegrama i wykrycie
@@ -141,8 +166,9 @@ nowej oferty ograniczone są do interwału crona.
 
 ### Tryb "daemon" (systemd)
 
-Działa cały czas w tle - sprawdza komendy Telegrama często (sekundy), a
-oferty IKEA rzadziej (minuty), bez zależności od crona.
+Działa cały czas w tle:
+- **oferty IKEA** są sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie **900 sekund = 15 minut**);
+- **komendy Telegrama** są sprawdzane co `TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie **15 sekund**) - reakcja jest praktycznie natychmiastowa.
 
 ```
 RUN_MODE=daemon
@@ -174,7 +200,8 @@ znajdzie dopasowanie - zapisuje aktualny stan jako "już znany". Ustaw
 `ALERT_EXISTING_ON_FIRST_RUN=true`, jeśli chcesz alert od razu.
 
 Każde powiadomienie zawiera cenę, procent rabatu, stan produktu, numer
-artykułu i link. Logi mają znacznik czasu.
+artykułu, numer oferty oraz bezpośredni link do rezerwacji w "Okazje na
+Okrągło" (jeśli dostępny). Logi mają znacznik czasu.
 
 ## Aktualizacja skryptu
 
@@ -203,6 +230,12 @@ wiadomość do bota - Telegram wymaga, żeby rozmowę zaczynał człowiek.
 samego konta, którego `chat_id` jest w `.env` - bot ignoruje wiadomości
 od innych nadawców. W trybie `cron` komenda zadziała dopiero przy
 następnym przebiegu (do interwału crona).
+
+**Link do rezerwacji nie działa / brak linku.** Upewnij się, że
+`STORE_URL_SLUGS` zawiera mapowanie dla Twojego sklepu. Slug sklepu
+znajdziesz w adresie URL strony "Okazje na Okrągło" po wybraniu sklepu
+(fragment `#/nazwa-sklepu/...`). Jeśli `offerNumber` nie jest zwracany
+przez API dla danej oferty, skrypt celowo nie generuje żadnego linku.
 
 ## Licencja
 
