@@ -208,4 +208,10 @@ nastepnym przebiegu (do interwalu crona).
 
 ## Licencja
 
-MIT - rob z tym co chcesz.
+Apache License 2.0 - copyright Pawel Stecki. Zobacz plik [LICENSE](LICENSE)
+w tym repo po pelny tekst.
+
+Mozesz swobodnie kopiowac, modyfikowac i redystrybuowac ten kod, w tym
+komercyjnie. Jedyne wymogi: zachowaj oryginalna notatke o prawach
+autorskich (plik LICENSE i, jesli redystrybuujesz, plik NOTICE) oraz
+jasno oznacz, ktore pliki zmodyfikowales, jesli publikujesz fork.
