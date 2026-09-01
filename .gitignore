@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+*.env
+ikea-okazje.env
+.ikea_okazje_seen_offers.json
+.ikea_okazje_last_raw.json
+*.log
