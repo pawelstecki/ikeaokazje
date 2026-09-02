@@ -738,8 +738,8 @@ def format_stores_message() -> str:
         lines.append(f"- {info['name']} ({sid})")
     lines.append("")
     lines.append(
-        "Uzyj /dodajsklep <ID>, np. /dodajsklep 1224, zeby dodac sklep, "
-        "albo /usunsklep <ID>, np. /usunsklep 294, zeby go usunac."
+        "Uzyj /dodajsklep &lt;ID&gt;, np. /dodajsklep 1224, zeby dodac sklep, "
+        "albo /usunsklep &lt;ID&gt;, np. /usunsklep 294, zeby go usunac."
     )
     return "\n".join(lines)
 
@@ -840,7 +840,7 @@ def handle_command(cmd: str, arg: str) -> str:
             reply += (
                 "\n\nUwaga: nie masz juz zadnych aktywnych sklepow - monitoring "
                 "nie pobierze zadnych ofert, dopoki nie dodasz przynajmniej "
-                "jednego (/dodajsklep <ID>)."
+                "jednego (/dodajsklep &lt;ID&gt;)."
             )
         return reply
 
