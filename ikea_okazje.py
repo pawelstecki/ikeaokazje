@@ -35,6 +35,8 @@ Wymagania:
     pip install curl_cffi
 """
 
+from __future__ import annotations
+
 import json
 import os
 import random
