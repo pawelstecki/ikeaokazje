@@ -97,9 +97,11 @@ REQUEST_TIMEOUT = 15
 # uzywany w adresie strony "Okazje na Okraglo online". Sluzy jako wbudowana
 # baza wiedzy, z ktorej korzystaja komendy /sklepy, /dodajsklep, /usunsklep
 # oraz generator linkow rezerwacji (build_offer_reservation_link), gdy dany
-# storeId nie ma wlasnego wpisu w STORE_URL_SLUGS z .env.
+# storeId nie ma wlasnego wpisu w STORE_URL_SLUGS z .env. Wszystkie "name"
+# zaczynaja sie od "IKEA " dla wewnetrznej konsystencji mapy - store_display_name()
+# usuwa ten przedrostek przy wyswietlaniu (zbedny, tylko wydluza wiadomosci).
 KNOWN_STORES = {
-    "1224": {"name": "Bielsko-Biala", "slug": "bielsko+biala"},
+    "1224": {"name": "IKEA Bielsko-Biala", "slug": "bielsko+biala"},
     "429": {"name": "IKEA Bydgoszcz", "slug": "bydgoszcz"},
     "203": {"name": "IKEA Gdansk", "slug": "gdańsk"},
     "306": {"name": "IKEA Katowice", "slug": "katowice"},
@@ -324,11 +326,17 @@ def refresh_normalized_terms() -> None:
 
 
 def store_display_name(store_id) -> str:
-    """Zwraca czytelna nazwe sklepu z KNOWN_STORES, albo "Sklep <ID>",
+    """Zwraca czytelna nazwe sklepu z KNOWN_STORES (bez zbednego przedrostka
+    "IKEA " - skraca to wiadomosci e-mail/Telegram), albo "Sklep <ID>",
     jesli ID nie jest w wbudowanej mapie (np. rowny wpis dodany recznie
     przez STORE_IDS w .env)."""
     info = KNOWN_STORES.get(str(store_id))
-    return info["name"] if info else f"Sklep {store_id}"
+    if not info:
+        return f"Sklep {store_id}"
+    name = info["name"]
+    if name.startswith("IKEA "):
+        name = name[len("IKEA "):]
+    return name
 
 
 # ---------------- IKEA API ----------------
@@ -555,7 +563,7 @@ def format_offer_block(o: dict) -> str:
         f"Info: {o['additional_info']}",
         f"Numer artykulu: {', '.join(o['article_numbers'] or [])}",
         f"Numer oferty: {o['offer_number']}",
-        f"Sklep (storeId): {o['store_id']}",
+        f"Sklep (storeId): {o['store_id']} - {store_display_name(o['store_id'])}",
         f"Zdjecie: {o['hero_image']}",
     ]
     if o.get("reservation_link"):
@@ -603,7 +611,10 @@ def format_offer_telegram(o: dict) -> str:
     title = escape_html(o["title"] or "")
     description = escape_html(o["description"] or "")
     offer_number_txt = escape_html(str(o["offer_number"])) if o.get("offer_number") else "brak"
-    store_id_txt = escape_html(str(o["store_id"])) if o.get("store_id") else "brak"
+    if o.get("store_id"):
+        store_id_txt = escape_html(f"{o['store_id']} - {store_display_name(o['store_id'])}")
+    else:
+        store_id_txt = "brak"
 
     lines = [
         f"<b>{title}</b> - {description}",
@@ -734,8 +745,8 @@ def format_stores_message() -> str:
         lines.append("(brak - monitoring nie pobierze zadnych ofert)")
     lines.append("")
     lines.append("<b>Wszystkie dostepne sklepy:</b>")
-    for sid, info in KNOWN_STORES.items():
-        lines.append(f"- {info['name']} ({sid})")
+    for sid in KNOWN_STORES:
+        lines.append(f"- {store_display_name(sid)} ({sid})")
     lines.append("")
     lines.append(
         "Uzyj /dodajsklep &lt;ID&gt;, np. /dodajsklep 1224, zeby dodac sklep, "
