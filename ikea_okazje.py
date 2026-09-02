@@ -7,11 +7,15 @@ buy-from-ikea) w wybranych sklepach IKEA i wysyla powiadomienie (e-mail
 i/albo Telegram), kiedy pojawi sie produkt, ktorego szukasz.
 
 Jesli Telegram jest skonfigurowany, mozesz zarzadzac lista szukanych
-slow i numerow artykulu komendami w czacie z botem:
+slow, numerow artykulu i monitorowanych sklepow komendami w czacie z
+botem:
     /dodaj <slowo>        - dodaj slowo kluczowe
     /usun <slowo>         - usun slowo kluczowe
     /numer <nr>           - dodaj numer artykulu
     /usunnumer <nr>        - usun numer artykulu
+    /sklepy               - pokaz aktywne i dostepne sklepy
+    /dodajsklep <ID>       - dodaj sklep do monitoringu
+    /usunsklep <ID>        - usun sklep z monitoringu
     /status               - pokaz aktualnie monitorowane slowa/numery/sklepy
     /pomoc                - lista komend
 
@@ -86,6 +90,26 @@ TELEGRAM_OFFSET_FILE = os.path.expanduser("~/.ikea_okazje_telegram_offset.json")
 
 SMTP_TIMEOUT = 30
 REQUEST_TIMEOUT = 15
+
+# Pelna, potwierdzona mapa sklepow IKEA w Polsce: storeId -> nazwa + slug
+# uzywany w adresie strony "Okazje na Okraglo online". Sluzy jako wbudowana
+# baza wiedzy, z ktorej korzystaja komendy /sklepy, /dodajsklep, /usunsklep
+# oraz generator linkow rezerwacji (build_offer_reservation_link), gdy dany
+# storeId nie ma wlasnego wpisu w STORE_URL_SLUGS z .env.
+KNOWN_STORES = {
+    "1224": {"name": "Bielsko-Biala", "slug": "bielsko+biala"},
+    "429": {"name": "IKEA Bydgoszcz", "slug": "bydgoszcz"},
+    "203": {"name": "IKEA Gdansk", "slug": "gdańsk"},
+    "306": {"name": "IKEA Katowice", "slug": "katowice"},
+    "204": {"name": "IKEA Krakow", "slug": "kraków"},
+    "329": {"name": "IKEA Lodz", "slug": "łódź"},
+    "311": {"name": "IKEA Lublin", "slug": "lublin"},
+    "205": {"name": "IKEA Poznan", "slug": "poznań"},
+    "583": {"name": "IKEA Szczecin", "slug": "szczecin"},
+    "188": {"name": "IKEA Warszawa Janki", "slug": "warszawa+janki"},
+    "307": {"name": "IKEA Warszawa Targowek", "slug": "warszawa+targówek"},
+    "294": {"name": "IKEA Wroclaw", "slug": "wrocław"},
+}
 # ------------------------------------------------------------------------
 
 
@@ -169,7 +193,10 @@ def parse_store_url_slugs(raw: str, default: dict) -> dict:
 ENV = load_env_file(CONFIG_FILE)
 
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
-STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
+# BASE_STORE_IDS/BASE_SEARCH_TERMS/BASE_SEARCH_ARTICLE_NUMBERS sluza wylacznie
+# do zasiania dynamicznego stanu (patrz DYNAMICZNA LISTA nizej) - po pierwszym
+# uruchomieniu zrodlem prawdy jest ~/.ikea_okazje_dynamic.json, a nie .env.
+BASE_STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
 BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
 BASE_SEARCH_ARTICLE_NUMBERS = parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
 
@@ -188,9 +215,10 @@ CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")
 TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
 
 # Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
-# Domyslnie: 294 -> wroclaw (sklep IKEA Wroclaw).
-_DEFAULT_STORE_SLUGS = {"294": "wrocław"}
-STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), _DEFAULT_STORE_SLUGS)
+# Ma pierwszenstwo nad wbudowana mapa KNOWN_STORES (pozwala obsluzyc nowe
+# sklepy albo zmiane routingu IKEA bez aktualizacji kodu). Jesli puste/brak
+# w .env, uzywana jest wylacznie KNOWN_STORES.
+STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
 # ----------------------------------------------------------------------------------------
 
 if SMTP_MODE == "gmail":
@@ -242,20 +270,28 @@ def normalize_text(s: str) -> str:
 # ---------------- DYNAMICZNA LISTA (modyfikowana komendami z Telegrama) ----------------
 
 def load_dynamic_state() -> dict:
-    """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS
-    z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
-    pierwszym razie nie jest juz zrodlem prawdy dla tych dwoch list
-    (zmieniaj je odtad komendami w Telegramie albo edytujac ten plik)."""
+    """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/
+    STORE_IDS z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
+    pierwszym razie nie jest juz zrodlem prawdy dla tych list (zmieniaj je
+    odtad komendami w Telegramie albo edytujac ten plik). Jesli plik juz
+    istnieje, ale nie ma jeszcze klucza "store_ids" (starsza wersja stanu),
+    dopisujemy go z .env jako fallback i zapisujemy z powrotem na dysk."""
     if os.path.exists(DYNAMIC_STATE_FILE):
         with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {
+        had_store_ids = "store_ids" in data
+        state = {
             "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
             "search_article_numbers": data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS)),
+            "store_ids": data.get("store_ids", list(BASE_STORE_IDS)),
         }
+        if not had_store_ids:
+            save_dynamic_state(state)
+        return state
     state = {
         "search_terms": list(BASE_SEARCH_TERMS),
         "search_article_numbers": list(BASE_SEARCH_ARTICLE_NUMBERS),
+        "store_ids": list(BASE_STORE_IDS),
     }
     save_dynamic_state(state)
     return state
@@ -274,6 +310,7 @@ def save_dynamic_state(state: dict) -> None:
 DYNAMIC_STATE = load_dynamic_state()
 SEARCH_TERMS = DYNAMIC_STATE["search_terms"]
 SEARCH_ARTICLE_NUMBERS = DYNAMIC_STATE["search_article_numbers"]
+STORE_IDS = DYNAMIC_STATE["store_ids"]
 NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
 NORMALIZED_EXCLUDE = [normalize_text(t) for t in KEYWORDS_EXCLUDE]
 
@@ -282,6 +319,14 @@ def refresh_normalized_terms() -> None:
     """Wywolaj po kazdej zmianie SEARCH_TERMS przez komende Telegrama."""
     global NORMALIZED_TERMS
     NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+
+
+def store_display_name(store_id) -> str:
+    """Zwraca czytelna nazwe sklepu z KNOWN_STORES, albo "Sklep <ID>",
+    jesli ID nie jest w wbudowanej mapie (np. rowny wpis dodany recznie
+    przez STORE_IDS w .env)."""
+    info = KNOWN_STORES.get(str(store_id))
+    return info["name"] if info else f"Sklep {store_id}"
 
 
 # ---------------- IKEA API ----------------
@@ -396,20 +441,35 @@ def product_excluded(product: dict) -> bool:
     return any(term in haystack for term in NORMALIZED_EXCLUDE)
 
 
+def resolve_store_slug(store_id) -> str | None:
+    """Zwraca slug sklepu dla linku rezerwacji. STORE_URL_SLUGS z .env ma
+    pierwszenstwo nad wbudowana mapa KNOWN_STORES."""
+    slug = STORE_URL_SLUGS.get(str(store_id))
+    if slug:
+        return slug
+    info = KNOWN_STORES.get(str(store_id))
+    return info["slug"] if info else None
+
+
 def build_offer_reservation_link(store_id, offer_number) -> str | None:
     """Buduje bezposredni link do konkretnej oferty w dziale 'Okazje na Okraglo'.
 
     Format: https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/<slug>/<offerNumber>
 
-    Zwraca None, jesli brakuje offer_number lub mapowania storeId -> slug.
+    Znak "+" (separator spacji w slugach typu "bielsko+biala") jest celowo
+    pozostawiony niezakodowany (safe="+") - polskie znaki (np. "l" w
+    "wroclaw") sa nadal URL-encoded normalnie.
+
+    Zwraca None, jesli brakuje offer_number lub mapowania storeId -> slug -
+    zamiast generowac mylacy link do zwyklego katalogu produktow IKEA.
     """
     if not offer_number:
         return None
-    slug = STORE_URL_SLUGS.get(str(store_id))
+    slug = resolve_store_slug(store_id)
     if not slug:
         return None
-    encoded_slug = urllib.parse.quote(str(slug), safe="")
-    encoded_offer = urllib.parse.quote(str(offer_number), safe="")
+    encoded_slug = urllib.parse.quote(str(slug), safe="+")
+    encoded_offer = urllib.parse.quote(str(offer_number), safe="+")
     return f"https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/{encoded_slug}/{encoded_offer}"
 
 
@@ -644,12 +704,15 @@ def telegram_get_updates(offset: int) -> list:
 
 
 def format_status_message() -> str:
-    lines = [
-        "<b>Aktualny monitoring:</b>",
-        f"Sklepy (storeIds): {', '.join(STORE_IDS)}",
-        f"Slowa kluczowe: {', '.join(SEARCH_TERMS) or '(brak)'}",
-        f"Numery artykulu: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}",
-    ]
+    lines = ["<b>Aktualny monitoring:</b>", "", "Aktywne sklepy:"]
+    if STORE_IDS:
+        for sid in STORE_IDS:
+            lines.append(f"- {store_display_name(sid)} ({sid})")
+    else:
+        lines.append("(brak - monitoring nie pobierze zadnych ofert)")
+    lines.append("")
+    lines.append(f"Slowa kluczowe: {', '.join(SEARCH_TERMS) or '(brak)'}")
+    lines.append(f"Numery artykulu: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}")
     if KEYWORDS_EXCLUDE:
         lines.append(f"Czarna lista: {', '.join(KEYWORDS_EXCLUDE)}")
     if MIN_DISCOUNT_PERCENT is not None:
@@ -660,6 +723,25 @@ def format_status_message() -> str:
     return "\n".join(lines)
 
 
+def format_stores_message() -> str:
+    lines = ["<b>Aktywne sklepy:</b>"]
+    if STORE_IDS:
+        for sid in STORE_IDS:
+            lines.append(f"- {store_display_name(sid)} ({sid})")
+    else:
+        lines.append("(brak - monitoring nie pobierze zadnych ofert)")
+    lines.append("")
+    lines.append("<b>Wszystkie dostepne sklepy:</b>")
+    for sid, info in KNOWN_STORES.items():
+        lines.append(f"- {info['name']} ({sid})")
+    lines.append("")
+    lines.append(
+        "Uzyj /dodajsklep <ID>, np. /dodajsklep 1224, zeby dodac sklep, "
+        "albo /usunsklep <ID>, np. /usunsklep 294, zeby go usunac."
+    )
+    return "\n".join(lines)
+
+
 def format_help_message() -> str:
     return (
         "<b>Komendy:</b>\n"
@@ -667,6 +749,9 @@ def format_help_message() -> str:
         "/usun &lt;slowo&gt; - usun slowo kluczowe\n"
         "/numer &lt;nr&gt; - dodaj numer artykulu\n"
         "/usunnumer &lt;nr&gt; - usun numer artykulu\n"
+        "/sklepy - pokaz aktywne i dostepne sklepy\n"
+        "/dodajsklep &lt;ID&gt; - dodaj sklep do monitoringu\n"
+        "/usunsklep &lt;ID&gt; - usun sklep z monitoringu\n"
         "/status - pokaz aktualny monitoring\n"
         "/pomoc - ta lista"
     )
@@ -674,8 +759,8 @@ def format_help_message() -> str:
 
 def handle_command(cmd: str, arg: str) -> str:
     """Zwraca tekst odpowiedzi. Modyfikuje globalny SEARCH_TERMS/
-    SEARCH_ARTICLE_NUMBERS i zapisuje DYNAMIC_STATE, jesli trzeba."""
-    global SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS
+    SEARCH_ARTICLE_NUMBERS/STORE_IDS i zapisuje DYNAMIC_STATE, jesli trzeba."""
+    global SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS, STORE_IDS
 
     arg = arg.strip()
 
@@ -722,6 +807,40 @@ def handle_command(cmd: str, arg: str) -> str:
         DYNAMIC_STATE["search_article_numbers"] = SEARCH_ARTICLE_NUMBERS
         save_dynamic_state(DYNAMIC_STATE)
         return f"Usunieto numer '{arg}'. Aktualna lista: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}"
+
+    if cmd in ("/sklepy", "/stores"):
+        return format_stores_message()
+
+    if cmd in ("/dodajsklep", "/addstore"):
+        if not arg:
+            return "Podaj ID sklepu, np. /dodajsklep 1224\n\n" + format_stores_message()
+        store_id = arg
+        if store_id not in KNOWN_STORES:
+            return f"Nieznany ID sklepu '{store_id}'.\n\n" + format_stores_message()
+        if store_id in STORE_IDS:
+            return f"{store_display_name(store_id)} ({store_id}) juz jest aktywny."
+        STORE_IDS.append(store_id)
+        DYNAMIC_STATE["store_ids"] = STORE_IDS
+        save_dynamic_state(DYNAMIC_STATE)
+        return f"Dodano sklep {store_display_name(store_id)} ({store_id}) do monitoringu."
+
+    if cmd in ("/usunsklep", "/removestore"):
+        if not arg:
+            return "Podaj ID sklepu do usuniecia, np. /usunsklep 294"
+        store_id = arg
+        if store_id not in STORE_IDS:
+            return f"Sklep '{store_id}' nie jest aktywny."
+        STORE_IDS = [s for s in STORE_IDS if s != store_id]
+        DYNAMIC_STATE["store_ids"] = STORE_IDS
+        save_dynamic_state(DYNAMIC_STATE)
+        reply = f"Usunieto sklep {store_display_name(store_id)} ({store_id}) z monitoringu."
+        if not STORE_IDS:
+            reply += (
+                "\n\nUwaga: nie masz juz zadnych aktywnych sklepow - monitoring "
+                "nie pobierze zadnych ofert, dopoki nie dodasz przynajmniej "
+                "jednego (/dodajsklep <ID>)."
+            )
+        return reply
 
     if cmd in ("/status", "/lista"):
         return format_status_message()

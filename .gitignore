@@ -5,4 +5,7 @@ __pycache__/
 ikea-okazje.env
 .ikea_okazje_seen_offers.json
 .ikea_okazje_last_raw.json
+.ikea_okazje_dynamic.json
+.ikea_okazje_telegram_offset.json
+*.lock
 *.log
