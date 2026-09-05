@@ -194,6 +194,40 @@ def parse_store_url_slugs(raw: str, default: dict) -> dict:
     return result if result else default
 
 
+def normalize_article_number(value) -> str:
+    """Normalizuje numer artykulu IKEA do samych cyfr, np. '905.574.19',
+    '905 574 19' oraz int 90557419 staja sie '90557419'. Numery artykulu
+    moga trafiac do skryptu z .env, dynamicznego stanu, komend Telegrama
+    albo z API IKEA (jako int albo str, czasem z separatorami) - ta funkcja
+    pozwala je porownywac niezaleznie od formatu wejsciowego."""
+    return "".join(char for char in str(value) if char.isdigit())
+
+
+def normalize_article_numbers(values) -> list:
+    """Normalizuje liste numerow artykulu (patrz normalize_article_number)
+    i usuwa duplikaty, zachowujac kolejnosc pierwszego wystapienia. Wpisy,
+    ktore po normalizacji nie zawieraja zadnej cyfry, sa ignorowane."""
+    result = []
+    for value in values:
+        normalized = normalize_article_number(value)
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def parse_smtp_mode(raw) -> str:
+    """Normalizuje i waliduje SMTP_MODE. Literowka albo niepoprawna wartosc
+    (np. 'smtp') NIE jest tolerowana i nie ma wpadac przypadkiem w galaz
+    trybu 'exim' - konczy dzialanie skryptu czytelnym RuntimeError."""
+    value = ("" if raw is None else raw).strip()
+    mode = value.lower()
+    if mode not in ("gmail", "local587", "exim"):
+        raise RuntimeError(
+            f"Nieprawidlowe SMTP_MODE: '{value}'. Dozwolone wartosci: gmail, local587, exim."
+        )
+    return mode
+
+
 ENV = load_env_file(CONFIG_FILE)
 
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
@@ -202,7 +236,9 @@ ENV = load_env_file(CONFIG_FILE)
 # uruchomieniu zrodlem prawdy jest ~/.ikea_okazje_dynamic.json, a nie .env.
 BASE_STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
 BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
-BASE_SEARCH_ARTICLE_NUMBERS = parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
+BASE_SEARCH_ARTICLE_NUMBERS = normalize_article_numbers(
+    parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
+)
 
 MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
 MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
@@ -210,7 +246,7 @@ KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
 
 ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
 
-SMTP_MODE = ENV.get("SMTP_MODE", "gmail")
+SMTP_MODE = parse_smtp_mode(ENV.get("SMTP_MODE", "gmail"))
 VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
 
 # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
@@ -284,12 +320,14 @@ def load_dynamic_state() -> dict:
         with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         had_store_ids = "store_ids" in data
+        raw_article_numbers = data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS))
+        normalized_article_numbers = normalize_article_numbers(raw_article_numbers)
         state = {
             "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
-            "search_article_numbers": data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS)),
+            "search_article_numbers": normalized_article_numbers,
             "store_ids": data.get("store_ids", list(BASE_STORE_IDS)),
         }
-        if not had_store_ids:
+        if not had_store_ids or normalized_article_numbers != raw_article_numbers:
             save_dynamic_state(state)
         return state
     state = {
@@ -425,21 +463,32 @@ def fetch_store_offers(store_id: str) -> list:
     return all_content
 
 
-def fetch_all_offers() -> list:
+def fetch_all_offers() -> tuple:
+    """Pobiera oferty ze wszystkich STORE_IDS. Blad pobrania jednego sklepu
+    nie przerywa calego cyklu - jest logowany i zapamietywany w
+    store_errors, a pobieranie kontynuowane dla pozostalych sklepow.
+    Zwraca (all_content, store_errors), gdzie store_errors to slownik
+    {store_id: opis_bledu} dla sklepow, ktore nie udalo sie pobrac."""
     all_content = []
+    store_errors = {}
     for i, store_id in enumerate(STORE_IDS):
-        all_content.extend(fetch_store_offers(store_id))
+        try:
+            all_content.extend(fetch_store_offers(store_id))
+        except Exception as exc:
+            log(f"Blad pobierania sklepu {store_id}: {exc}", to_stderr=True)
+            store_errors[store_id] = str(exc)
         if i < len(STORE_IDS) - 1:
             time.sleep(random.uniform(*STORE_JITTER_RANGE))
-    return all_content
+    return all_content, store_errors
 
 
 def product_matches(product: dict) -> bool:
     haystack = normalize_text(f"{product.get('title', '')} {product.get('description', '')}")
     text_match = any(term in haystack for term in NORMALIZED_TERMS)
 
-    article_numbers = product.get("articleNumbers") or []
-    article_match = any(an in article_numbers for an in SEARCH_ARTICLE_NUMBERS)
+    raw_article_numbers = product.get("articleNumbers") or []
+    normalized_article_numbers = {normalize_article_number(an) for an in raw_article_numbers}
+    article_match = any(an in normalized_article_numbers for an in SEARCH_ARTICLE_NUMBERS)
 
     return text_match or article_match
 
@@ -610,21 +659,27 @@ def format_offer_telegram(o: dict) -> str:
     discount_txt = f"{o['discount_percent']}%" if o["discount_percent"] is not None else "n/d"
     title = escape_html(o["title"] or "")
     description = escape_html(o["description"] or "")
+    currency = escape_html(str(o["currency"])) if o.get("currency") is not None else ""
+    condition = escape_html(str(o["condition"])) if o.get("condition") is not None else "n/d"
     offer_number_txt = escape_html(str(o["offer_number"])) if o.get("offer_number") else "brak"
     if o.get("store_id"):
         store_id_txt = escape_html(f"{o['store_id']} - {store_display_name(o['store_id'])}")
     else:
         store_id_txt = "brak"
 
+    price_txt = escape_html(str(o["price"])) if o.get("price") is not None else "n/d"
+    original_price_txt = escape_html(str(o["original_price"])) if o.get("original_price") is not None else "n/d"
+
     lines = [
         f"<b>{title}</b> - {description}",
-        f"Cena: <b>{o['price']} {o['currency']}</b> "
-        f"(z {o['original_price']} {o['currency']}, rabat {discount_txt})",
-        f"Stan: {o['condition']}",
+        f"Cena: <b>{price_txt} {currency}</b> "
+        f"(z {original_price_txt} {currency}, rabat {discount_txt})",
+        f"Stan: {condition}",
         f"Numer oferty: {offer_number_txt} | Sklep: {store_id_txt}",
     ]
     if o.get("reservation_link"):
-        lines.append(f'<a href="{o["reservation_link"]}">Przejdź do rezerwacji oferty</a>')
+        safe_link = escape_html_attr(o["reservation_link"])
+        lines.append(f'<a href="{safe_link}">Przejdź do rezerwacji oferty</a>')
     return "\n".join(lines)
 
 
@@ -634,6 +689,12 @@ def escape_html(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def escape_html_attr(text: str) -> str:
+    """Jak escape_html(), ale dodatkowo escapuje cudzyslowy - do uzycia w
+    atrybutach HTML (np. href="...")."""
+    return escape_html(text).replace('"', "&quot;").replace("'", "&#39;")
 
 
 def telegram_send_message(text: str, chat_id=None) -> None:
@@ -720,19 +781,19 @@ def format_status_message() -> str:
     lines = ["<b>Aktualny monitoring:</b>", "", "Aktywne sklepy:"]
     if STORE_IDS:
         for sid in STORE_IDS:
-            lines.append(f"- {store_display_name(sid)} ({sid})")
+            lines.append(f"- {escape_html(store_display_name(sid))} ({escape_html(str(sid))})")
     else:
         lines.append("(brak - monitoring nie pobierze zadnych ofert)")
     lines.append("")
-    lines.append(f"Slowa kluczowe: {', '.join(SEARCH_TERMS) or '(brak)'}")
-    lines.append(f"Numery artykulu: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}")
+    lines.append(f"Slowa kluczowe: {escape_html(', '.join(SEARCH_TERMS)) or '(brak)'}")
+    lines.append(f"Numery artykulu: {escape_html(', '.join(SEARCH_ARTICLE_NUMBERS)) or '(brak)'}")
     if KEYWORDS_EXCLUDE:
-        lines.append(f"Czarna lista: {', '.join(KEYWORDS_EXCLUDE)}")
+        lines.append(f"Czarna lista: {escape_html(', '.join(KEYWORDS_EXCLUDE))}")
     if MIN_DISCOUNT_PERCENT is not None:
         lines.append(f"Min. rabat: {MIN_DISCOUNT_PERCENT}%")
     if MAX_PRICE is not None:
         lines.append(f"Maks. cena: {MAX_PRICE}")
-    lines.append(f"Tryb pracy: {RUN_MODE}")
+    lines.append(f"Tryb pracy: {escape_html(RUN_MODE)}")
     return "\n".join(lines)
 
 
@@ -740,7 +801,7 @@ def format_stores_message() -> str:
     lines = ["<b>Aktywne sklepy:</b>"]
     if STORE_IDS:
         for sid in STORE_IDS:
-            lines.append(f"- {store_display_name(sid)} ({sid})")
+            lines.append(f"- {escape_html(store_display_name(sid))} ({escape_html(str(sid))})")
     else:
         lines.append("(brak - monitoring nie pobierze zadnych ofert)")
     lines.append("")
@@ -780,46 +841,54 @@ def handle_command(cmd: str, arg: str) -> str:
     if cmd in ("/dodaj", "/add"):
         if not arg:
             return "Podaj slowo do dodania, np. /dodaj stall"
+        safe_arg = escape_html(arg)
         if normalize_text(arg) in NORMALIZED_TERMS:
-            return f"'{arg}' juz jest na liscie."
+            return f"'{safe_arg}' juz jest na liscie."
         SEARCH_TERMS.append(arg)
         refresh_normalized_terms()
         DYNAMIC_STATE["search_terms"] = SEARCH_TERMS
         save_dynamic_state(DYNAMIC_STATE)
-        return f"Dodano '{arg}'. Aktualna lista: {', '.join(SEARCH_TERMS)}"
+        return f"Dodano '{safe_arg}'. Aktualna lista: {escape_html(', '.join(SEARCH_TERMS))}"
 
     if cmd in ("/usun", "/remove"):
         if not arg:
             return "Podaj slowo do usuniecia, np. /usun stall"
+        safe_arg = escape_html(arg)
         norm_arg = normalize_text(arg)
         new_terms = [t for t in SEARCH_TERMS if normalize_text(t) != norm_arg]
         if len(new_terms) == len(SEARCH_TERMS):
-            return f"'{arg}' nie bylo na liscie."
+            return f"'{safe_arg}' nie bylo na liscie."
         SEARCH_TERMS = new_terms
         refresh_normalized_terms()
         DYNAMIC_STATE["search_terms"] = SEARCH_TERMS
         save_dynamic_state(DYNAMIC_STATE)
-        return f"Usunieto '{arg}'. Aktualna lista: {', '.join(SEARCH_TERMS) or '(brak)'}"
+        return f"Usunieto '{safe_arg}'. Aktualna lista: {escape_html(', '.join(SEARCH_TERMS)) or '(brak)'}"
 
     if cmd == "/numer":
         if not arg:
             return "Podaj numer artykulu, np. /numer 90557419"
-        if arg in SEARCH_ARTICLE_NUMBERS:
-            return f"Numer '{arg}' juz jest na liscie."
-        SEARCH_ARTICLE_NUMBERS.append(arg)
+        normalized_arg = normalize_article_number(arg)
+        safe_arg = escape_html(arg)
+        if not normalized_arg:
+            return f"'{safe_arg}' nie zawiera zadnej cyfry - podaj poprawny numer artykulu."
+        if normalized_arg in SEARCH_ARTICLE_NUMBERS:
+            return f"Numer '{safe_arg}' juz jest na liscie."
+        SEARCH_ARTICLE_NUMBERS.append(normalized_arg)
         DYNAMIC_STATE["search_article_numbers"] = SEARCH_ARTICLE_NUMBERS
         save_dynamic_state(DYNAMIC_STATE)
-        return f"Dodano numer '{arg}'. Aktualna lista: {', '.join(SEARCH_ARTICLE_NUMBERS)}"
+        return f"Dodano numer '{safe_arg}'. Aktualna lista: {escape_html(', '.join(SEARCH_ARTICLE_NUMBERS))}"
 
     if cmd == "/usunnumer":
         if not arg:
             return "Podaj numer artykulu do usuniecia, np. /usunnumer 90557419"
-        if arg not in SEARCH_ARTICLE_NUMBERS:
-            return f"Numeru '{arg}' nie bylo na liscie."
-        SEARCH_ARTICLE_NUMBERS = [n for n in SEARCH_ARTICLE_NUMBERS if n != arg]
+        normalized_arg = normalize_article_number(arg)
+        safe_arg = escape_html(arg)
+        if not normalized_arg or normalized_arg not in SEARCH_ARTICLE_NUMBERS:
+            return f"Numeru '{safe_arg}' nie bylo na liscie."
+        SEARCH_ARTICLE_NUMBERS = [n for n in SEARCH_ARTICLE_NUMBERS if n != normalized_arg]
         DYNAMIC_STATE["search_article_numbers"] = SEARCH_ARTICLE_NUMBERS
         save_dynamic_state(DYNAMIC_STATE)
-        return f"Usunieto numer '{arg}'. Aktualna lista: {', '.join(SEARCH_ARTICLE_NUMBERS) or '(brak)'}"
+        return f"Usunieto numer '{safe_arg}'. Aktualna lista: {escape_html(', '.join(SEARCH_ARTICLE_NUMBERS)) or '(brak)'}"
 
     if cmd in ("/sklepy", "/stores"):
         return format_stores_message()
@@ -828,25 +897,27 @@ def handle_command(cmd: str, arg: str) -> str:
         if not arg:
             return "Podaj ID sklepu, np. /dodajsklep 1224\n\n" + format_stores_message()
         store_id = arg
+        safe_store_id = escape_html(store_id)
         if store_id not in KNOWN_STORES:
-            return f"Nieznany ID sklepu '{store_id}'.\n\n" + format_stores_message()
+            return f"Nieznany ID sklepu '{safe_store_id}'.\n\n" + format_stores_message()
         if store_id in STORE_IDS:
-            return f"{store_display_name(store_id)} ({store_id}) juz jest aktywny."
+            return f"{escape_html(store_display_name(store_id))} ({safe_store_id}) juz jest aktywny."
         STORE_IDS.append(store_id)
         DYNAMIC_STATE["store_ids"] = STORE_IDS
         save_dynamic_state(DYNAMIC_STATE)
-        return f"Dodano sklep {store_display_name(store_id)} ({store_id}) do monitoringu."
+        return f"Dodano sklep {escape_html(store_display_name(store_id))} ({safe_store_id}) do monitoringu."
 
     if cmd in ("/usunsklep", "/removestore"):
         if not arg:
             return "Podaj ID sklepu do usuniecia, np. /usunsklep 294"
         store_id = arg
+        safe_store_id = escape_html(store_id)
         if store_id not in STORE_IDS:
-            return f"Sklep '{store_id}' nie jest aktywny."
+            return f"Sklep '{safe_store_id}' nie jest aktywny."
         STORE_IDS = [s for s in STORE_IDS if s != store_id]
         DYNAMIC_STATE["store_ids"] = STORE_IDS
         save_dynamic_state(DYNAMIC_STATE)
-        reply = f"Usunieto sklep {store_display_name(store_id)} ({store_id}) z monitoringu."
+        reply = f"Usunieto sklep {escape_html(store_display_name(store_id))} ({safe_store_id}) z monitoringu."
         if not STORE_IDS:
             reply += (
                 "\n\nUwaga: nie masz juz zadnych aktywnych sklepow - monitoring "
@@ -861,7 +932,7 @@ def handle_command(cmd: str, arg: str) -> str:
     if cmd in ("/pomoc", "/help", "/start"):
         return format_help_message()
 
-    return f"Nieznana komenda: {cmd}\n\n{format_help_message()}"
+    return f"Nieznana komenda: {escape_html(cmd)}\n\n{format_help_message()}"
 
 
 def handle_telegram_updates() -> None:
@@ -906,11 +977,33 @@ def handle_telegram_updates() -> None:
 # ---------------- GLOWNA LOGIKA (jeden cykl sprawdzenia ofert) ----------------
 
 def run_ikea_check_cycle() -> int:
+    if not SEARCH_TERMS and not SEARCH_ARTICLE_NUMBERS:
+        log(
+            "Brak aktywnych slow kluczowych i numerow artykulow - "
+            "monitoring ofert jest wstrzymany."
+        )
+        return 0
+
     try:
-        content = fetch_all_offers()
+        content, store_errors = fetch_all_offers()
     except Exception as exc:
         log(f"Blad zapytania do API: {exc}", to_stderr=True)
         return 1
+
+    if store_errors and len(store_errors) >= len(STORE_IDS):
+        log(
+            "Nie udalo sie pobrac ofert z zadnego sklepu "
+            f"({len(store_errors)}/{len(STORE_IDS)}). Przerywam cykl.",
+            to_stderr=True,
+        )
+        return 1
+
+    if store_errors:
+        log(
+            f"Nie udalo sie pobrac {len(store_errors)}/{len(STORE_IDS)} sklepow "
+            f"({', '.join(str(sid) for sid in store_errors)}) - kontynuuje z pozostalymi.",
+            to_stderr=True,
+        )
 
     matching_offers = flatten_matching_offers(content)
     current_uuids = {o["offer_uuid"] for o in matching_offers if o.get("offer_uuid")}

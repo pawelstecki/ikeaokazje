@@ -48,14 +48,14 @@ nano ~/.config/ikea-okazje.env
 | Pole | Opis | Domyślnie |
 |---|---|---|
 | `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysyłki maila | wymagane |
-| `SMTP_MODE` | `gmail`, `local587` albo `exim` | `gmail` |
+| `SMTP_MODE` | `gmail`, `local587` albo `exim` (dowolna inna wartosc konczy dzialanie skryptu czytelnym bledem) | `gmail` |
 | `SMTP_HOST` | tylko dla `local587`/`exim`, jeśli nie `localhost` | `localhost` |
 | `VERIFY_TLS` | `false`, jeśli lokalny MTA ma zły certyfikat | `true` |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał + komendy | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - **tylko na starcie**, patrz niżej | `294` |
 | `STORE_URL_SLUGS` | opcjonalne nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji | wbudowana mapa `KNOWN_STORES` |
 | `SEARCH_TERMS` | szukane frazy - **tylko na starcie**, patrz niżej | `Stall` |
-| `SEARCH_ARTICLE_NUMBERS` | numery artykułu - **tylko na starcie** | brak |
+| `SEARCH_ARTICLE_NUMBERS` | numery artykułu - **tylko na starcie**, normalizowane do samych cyfr (można wpisywać z kropkami/spacjami, np. `905.574.19`) | brak |
 | `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak |
 | `MAX_PRICE` | maksymalna cena | brak |
 | `KEYWORDS_EXCLUDE` | czarna lista słów, po przecinku | brak |
@@ -169,8 +169,8 @@ pisać do bota:
 ```
 /dodaj stall          - dodaj słowo kluczowe
 /usun stall            - usuń słowo kluczowe
-/numer 90557419        - dodaj numer artykułu
-/usunnumer 90557419    - usuń numer artykułu
+/numer 90557419        - dodaj numer artykułu (można też z kropkami/spacjami, np. 905.574.19)
+/usunnumer 90557419    - usuń numer artykułu (również z kropkami/spacjami)
 /sklepy                - pokaż aktywne i dostępne sklepy
 /dodajsklep 1224        - dodaj sklep do monitoringu (po ID)
 /usunsklep 294          - usuń sklep z monitoringu (po ID)
@@ -301,8 +301,11 @@ python3 -m unittest tests/test_ikea_okazje.py
 
 Testy sprawdzają m.in. mapowanie `storeId -> slug` w `KNOWN_STORES`,
 poprawność generowania linków rezerwacji (w tym kodowanie polskich
-znaków i pozostawienie `+` bez zmian) oraz dodawanie/usuwanie sklepów
-komendami Telegrama (bez duplikatów, odrzucanie nieznanych ID).
+znaków i pozostawienie `+` bez zmian), dodawanie/usuwanie sklepów
+komendami Telegrama (bez duplikatów, odrzucanie nieznanych ID), walidację
+`SMTP_MODE`, escapowanie HTML w odpowiedziach Telegrama, normalizację
+numerów artykułu oraz odporność cyklu sprawdzania ofert na błąd
+pojedynczego sklepu.
 
 ## Aktualizacja skryptu
 
