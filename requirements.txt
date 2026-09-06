@@ -1,0 +1,8 @@
+# Jedyna zewnetrzna zaleznosc tego projektu (wszystko inne w
+# ikea_okazje.py to standardowa biblioteka Pythona).
+#
+# curl_cffi >= 0.7.0 - ta wersja dodala wsparcie impersonacji do Chrome 124
+# (IMPERSONATE="chrome124" w ikea_okazje.py), co jest wymagane, zeby
+# fingerprint TLS zgadzal sie z naglowkami HEADERS w skrypcie. Nie zmieniaj
+# tego pinning'u "na wszelki wypadek" - patrz README.
+curl_cffi>=0.7.0
