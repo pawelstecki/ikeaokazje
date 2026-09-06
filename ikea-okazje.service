@@ -7,9 +7,29 @@ Wants=network-online.target
 Type=simple
 User=TWOJ_UZYTKOWNIK
 WorkingDirectory=/home/TWOJ_UZYTKOWNIK
-ExecStart=/usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+# WAZNE: ten sam plik blokady /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock musi
+# byc uzywany przez usluge systemd, cron i ewentualne reczne odpalenie
+# skryptu - patrz README ("Ochrona przed rownoleglymi procesami"). "-n"
+# oznacza, ze flock NIE czeka: jesli blokada jest juz zajeta, ta kopia
+# procesu po prostu nic nie robi i wychodzi - dwie kopie monitoringu
+# nigdy nie dzialaja naraz, a stare cykle sie nie kolejkuja.
+# "-E 75" ustawia DEDYKOWANY kod wyjscia (75) na sytuacje "blokada byla
+# juz zajeta" - odrozniamy go od prawdziwych bledow skryptu (kody 1-3,
+# patrz main()/run_ikea_check_cycle()). RestartPreventExitStatus=75
+# nizej mowi systemd, zeby NIE restartowal uslugi w tym konkretnym
+# przypadku (to jest zamierzone, "cudze" wykonanie cyklu, a nie
+# awaria) - bez tego Restart=on-failure wchodziloby w petle restartow
+# co RestartSec, gdy blokada jest zajeta przez inny proces. Prawdziwe
+# awarie skryptu/API (kody wyjscia inne niz 75) sa wciaz restartowane
+# normalnie.
+# WAZNE: RUN_MODE=daemon ustawiasz w prywatnym pliku .env
+# (~/.config/ikea-okazje.env), NIE tutaj jako Environment= - kod nie daje
+# zmiennym srodowiskowym systemd priorytetu nad .env, wiec Environment=
+# tutaj by nic nie zmienil. Patrz README.
+ExecStart=/usr/bin/flock -n -E 75 /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
 Restart=on-failure
 RestartSec=15
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=multi-user.target
