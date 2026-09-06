@@ -218,14 +218,84 @@ def normalize_article_numbers(values) -> list:
 def parse_smtp_mode(raw) -> str:
     """Normalizuje i waliduje SMTP_MODE. Literowka albo niepoprawna wartosc
     (np. 'smtp') NIE jest tolerowana i nie ma wpadac przypadkiem w galaz
-    trybu 'exim' - konczy dzialanie skryptu czytelnym RuntimeError."""
+    trybu 'exim' - konczy dzialanie skryptu czytelnym RuntimeError.
+
+    'disabled' wylacza wysylke e-mail calkowicie (np. gdy uzywasz tylko
+    Telegrama) - patrz validate_notification_config()."""
     value = ("" if raw is None else raw).strip()
     mode = value.lower()
-    if mode not in ("gmail", "local587", "exim"):
+    if mode not in ("gmail", "local587", "exim", "disabled"):
         raise RuntimeError(
-            f"Nieprawidlowe SMTP_MODE: '{value}'. Dozwolone wartosci: gmail, local587, exim."
+            f"Nieprawidlowe SMTP_MODE: '{value}'. "
+            "Dozwolone wartosci: gmail, local587, exim, disabled."
         )
     return mode
+
+
+def validate_notification_config(
+    smtp_mode: str,
+    smtp_user,
+    smtp_pass,
+    use_smtp_auth: bool,
+    email_to,
+    telegram_bot_token,
+    telegram_chat_id,
+) -> None:
+    """Jedyne miejsce, ktore decyduje, czy jest skonfigurowany przynajmniej
+    jeden KOMPLETNY, faktycznie uzywalny kanal powiadomien - zamiast
+    czekac, az pojawi sie dopasowana oferta i wysylka maila/Telegrama
+    zawiedzie w trakcie dzialania skryptu. Poszczegolne galezie SMTP_MODE
+    w kodzie (gmail/local587/exim) NIE robia juz tej walidacji osobno -
+    ta funkcja dostaje efektywne wartosci (po fallbackach) i sprawdza je
+    kompletnie.
+
+    use_smtp_auth musi odpowiadac dokladnie temu, co faktycznie robi
+    send_email() (zmienna USE_AUTH) - tylko gdy send_email() naprawde
+    woluje server.login(), SMTP_USER/SMTP_PASS sa wymagane."""
+    has_token = bool(telegram_bot_token)
+    has_chat_id = bool(telegram_chat_id)
+
+    if has_token != has_chat_id:
+        raise RuntimeError(
+            "Niepelna konfiguracja Telegrama: potrzebujesz jednoczesnie "
+            "TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID (albo obu, albo zadnego z "
+            f"nich). Aktualnie ustawiony jest tylko "
+            f"{'TELEGRAM_BOT_TOKEN' if has_token else 'TELEGRAM_CHAT_ID'}."
+        )
+
+    telegram_enabled = has_token and has_chat_id
+
+    if smtp_mode == "disabled":
+        if not telegram_enabled:
+            raise RuntimeError(
+                "Brak skonfigurowanego kanalu powiadomien: SMTP_MODE='disabled' "
+                "wylacza wysylke e-mail, a Telegram nie jest skonfigurowany "
+                "(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Skonfiguruj albo e-mail "
+                "(ustaw SMTP_MODE na 'gmail', 'local587' albo 'exim' i wypelnij "
+                "wymagane pola SMTP), albo kompletny Telegram - patrz README."
+            )
+        return
+
+    # SMTP_MODE to 'gmail', 'local587' albo 'exim' - e-mail jest wlaczony,
+    # wiec musi byc KOMPLETNY (nie ma sensu czekac, az proba wysylki
+    # zawiedzie przy pierwszej dopasowanej ofercie).
+    missing = []
+    if use_smtp_auth:
+        if not smtp_user:
+            missing.append("SMTP_USER")
+        if not smtp_pass:
+            missing.append("SMTP_PASS")
+    if not email_to:
+        missing.append("EMAIL_TO")
+
+    if missing:
+        raise RuntimeError(
+            f"SMTP_MODE='{smtp_mode}' wymaga uzupelnienia w {CONFIG_FILE} "
+            f"nastepujacych pol: {', '.join(missing)}. Jesli nie chcesz "
+            "uzywac e-maila, ustaw SMTP_MODE=disabled i skonfiguruj "
+            "kompletny Telegram (TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID) - "
+            "patrz README."
+        )
 
 
 ENV = load_env_file(CONFIG_FILE)
@@ -262,14 +332,12 @@ STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
 # ----------------------------------------------------------------------------------------
 
 if SMTP_MODE == "gmail":
+    # Kompletnosc SMTP_USER/SMTP_PASS/EMAIL_TO jest sprawdzana pozniej,
+    # w jednym miejscu, w validate_notification_config() - nie tutaj.
     SMTP_HOST = "smtp.gmail.com"
     SMTP_PORT = 587
     SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
     SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError(
-            f"SMTP_MODE='gmail' wymaga SMTP_USER i SMTP_PASS w {CONFIG_FILE}"
-        )
     EMAIL_FROM = SMTP_USER
     USE_AUTH = True
 elif SMTP_MODE == "local587":
@@ -277,25 +345,53 @@ elif SMTP_MODE == "local587":
     SMTP_PORT = 587
     SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
     SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError(
-            f"SMTP_MODE='local587' wymaga SMTP_USER i SMTP_PASS w {CONFIG_FILE}"
-        )
     EMAIL_FROM = SMTP_USER
     USE_AUTH = True
-else:  # "exim"
+elif SMTP_MODE == "exim":
+    # exim jest w tym skrypcie z definicji niezautentykowany (przekazanie
+    # dalej do lokalnego MTA) - SMTP_USER/SMTP_PASS sa dla niego celowo
+    # nieuzywane, patrz USE_AUTH=False i send_email().
     SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
     SMTP_PORT = 25
     SMTP_USER = None
     SMTP_PASS = None
     EMAIL_FROM = ENV.get("EMAIL_FROM", "ikea-watch@localhost")
     USE_AUTH = False
+else:  # "disabled" - e-mail wylaczony calkowicie, patrz validate_notification_config()
+    SMTP_HOST = None
+    SMTP_PORT = None
+    SMTP_USER = None
+    SMTP_PASS = None
+    EMAIL_FROM = None
+    USE_AUTH = False
 
-EMAIL_TO = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO") or EMAIL_FROM
+EMAIL_ENABLED = SMTP_MODE != "disabled"
+# EMAIL_TO moze spadac (fallback) na EMAIL_FROM (np. SMTP_USER dla
+# gmail/local587, gdzie to naprawde jest ta sama, prawdziwa skrzynka) -
+# to jest istniejace, dokumentowane zachowanie, nie nowosc tego commitu.
+_EXPLICIT_EMAIL_TO = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO")
+EMAIL_TO = _EXPLICIT_EMAIL_TO or EMAIL_FROM
+
+# Do walidacji kompletnosci uzywamy innego efektywnego adresu dla 'exim':
+# EMAIL_FROM dla 'exim' domyslnie spada na placeholder
+# ('ikea-watch@localhost'), ktory NIE jest prawdziwym adresem odbiorcy -
+# w tym trybie EMAIL_TO musi byc jawnie ustawiony w .env, zamiast cicho
+# spadac na ten placeholder.
+_EMAIL_TO_FOR_VALIDATION = _EXPLICIT_EMAIL_TO if SMTP_MODE == "exim" else EMAIL_TO
 
 TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+validate_notification_config(
+    SMTP_MODE,
+    SMTP_USER,
+    SMTP_PASS,
+    USE_AUTH,
+    _EMAIL_TO_FOR_VALIDATION,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+)
 
 
 def normalize_text(s: str) -> str:
@@ -728,12 +824,16 @@ def send_telegram(new_offers) -> None:
 
 
 def notify(new_offers) -> list:
+    """Wysyla powiadomienie tylko przez faktycznie skonfigurowane i wlaczone
+    kanaly. Gdy SMTP_MODE='disabled', e-mail jest calkowicie pomijany (bez
+    inicjowania jakiegokolwiek polaczenia SMTP)."""
     errors = []
 
-    try:
-        send_email(new_offers)
-    except Exception as exc:
-        errors.append(f"e-mail: {exc}")
+    if EMAIL_ENABLED:
+        try:
+            send_email(new_offers)
+        except Exception as exc:
+            errors.append(f"e-mail: {exc}")
 
     if TELEGRAM_ENABLED:
         try:
@@ -1037,7 +1137,8 @@ def run_ikea_check_cycle() -> int:
         if errors:
             for err in errors:
                 log(f"Blad wysylki powiadomienia ({err})", to_stderr=True)
-            if len(errors) == (1 + (1 if TELEGRAM_ENABLED else 0)):
+            active_channels = (1 if EMAIL_ENABLED else 0) + (1 if TELEGRAM_ENABLED else 0)
+            if len(errors) == active_channels:
                 return 2
 
         sent_uuids = {o["offer_uuid"] for o in new_offers if o.get("offer_uuid")}
@@ -1084,7 +1185,29 @@ def run_daemon() -> None:
         time.sleep(TELEGRAM_POLL_INTERVAL_SECONDS)
 
 
+def warn_if_systemd_without_daemon_mode() -> None:
+    """Systemd ustawia zmienna srodowiskowa INVOCATION_ID dla kazdej
+    uslugi, ktora odpala. Jesli proces dziala pod systemd, ale RUN_MODE w
+    .env nie jest 'daemon', skrypt wykona jeden cykl typu 'cron' i wyjdzie
+    ze statusem 0 - systemd (Type=simple) moze wtedy nie zrestartowac
+    uslugi, bo z jego perspektywy proces zakonczyl sie poprawnie. To tylko
+    ostrzeznie w logach - RUN_MODE nie jest tu w zaden sposob zmieniane."""
+    if os.environ.get("INVOCATION_ID") and RUN_MODE != "daemon":
+        log(
+            "UWAGA: proces zostal odpalony przez systemd, ale RUN_MODE w "
+            f"{CONFIG_FILE} nie jest ustawiony na 'daemon' (aktualnie: "
+            f"'{RUN_MODE}'). Skrypt wykona jedno przejscie typu 'cron' i "
+            "zakonczy sie ze statusem 0 - systemd (Type=simple) moze uznac "
+            "to za normalne zakonczenie i NIE zrestartuje uslugi. Ustaw "
+            f"RUN_MODE=daemon w {CONFIG_FILE}, jesli chcesz uzywac tego "
+            "skryptu jako usluge systemd.",
+            to_stderr=True,
+        )
+
+
 def main() -> int:
+    warn_if_systemd_without_daemon_mode()
+
     if TELEGRAM_ENABLED and RUN_MODE != "daemon":
         # W trybie cron sprawdzamy komendy raz na starcie, przed
         # sprawdzeniem ofert - w trybie daemon robi to petla w run_daemon().

@@ -31,9 +31,11 @@ w tym pliku - są w `~/.config/ikea-okazje.env`.
 ## Instalacja
 
 ```
-pip install curl_cffi
+python3 -m pip install -r requirements.txt
 ```
 
+Jedyna zewnętrzna zależność to `curl_cffi` (patrz `requirements.txt`) -
+wszystko inne w skrypcie korzysta ze standardowej biblioteki Pythona.
 Działa od Pythona 3.8+ (curl_cffi z impersonacją tego wymaga).
 
 ## Konfiguracja
@@ -47,11 +49,11 @@ nano ~/.config/ikea-okazje.env
 
 | Pole | Opis | Domyślnie |
 |---|---|---|
-| `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysyłki maila | wymagane |
-| `SMTP_MODE` | `gmail`, `local587` albo `exim` (dowolna inna wartosc konczy dzialanie skryptu czytelnym bledem) | `gmail` |
+| `SMTP_MODE` | `gmail`, `local587`, `exim` albo `disabled` (dowolna inna wartosc konczy dzialanie skryptu czytelnym bledem) | `gmail` |
+| `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysyłki maila - **wymagane, jeśli `SMTP_MODE` nie jest `disabled`** | wymagane (poza `disabled`) |
 | `SMTP_HOST` | tylko dla `local587`/`exim`, jeśli nie `localhost` | `localhost` |
 | `VERIFY_TLS` | `false`, jeśli lokalny MTA ma zły certyfikat | `true` |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał + komendy | wyłączone |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał + komendy - **muszą być ustawione oba naraz**, patrz niżej | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - **tylko na starcie**, patrz niżej | `294` |
 | `STORE_URL_SLUGS` | opcjonalne nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji | wbudowana mapa `KNOWN_STORES` |
 | `SEARCH_TERMS` | szukane frazy - **tylko na starcie**, patrz niżej | `Stall` |
@@ -63,6 +65,53 @@ nano ~/.config/ikea-okazje.env
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać IKEA (sekundy) | `900` |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać komendy Telegrama (sekundy) | `15` |
+
+### Kanały powiadomień: e-mail, Telegram albo oba
+
+E-mail nie jest już obowiązkowy - skrypt wymaga **przynajmniej jednego w
+pełni skonfigurowanego kanału powiadomień**, ale to może być tylko
+Telegram.
+
+- **`SMTP_MODE=disabled`** wyłącza wysyłkę e-mail całkowicie - skrypt nie
+  wymaga wtedy `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`, `SMTP_HOST` ani
+  żadnych ustawień TLS, i nie inicjuje żadnego połączenia SMTP.
+- **Jeśli `SMTP_MODE` jest `gmail`, `local587` albo `exim`, e-mail musi
+  być KOMPLETNIE skonfigurowany** - skrypt sprawdza to od razu przy
+  starcie, a nie dopiero przy pierwszej próbie wysyłki:
+  - `gmail`/`local587` wymagają niepustych `SMTP_USER` i `SMTP_PASS`
+    (obie wartości są używane do `server.login()`) oraz działającego
+    adresu odbiorcy;
+  - `exim` (bez autentykacji - patrz `send_email()`) NIE wymaga
+    `SMTP_USER`/`SMTP_PASS`, ale wymaga jawnie ustawionego `EMAIL_TO`
+    w `.env` (dla `exim` `EMAIL_TO` nie ma sensownego automatycznego
+    fallbacku, bo domyślny `EMAIL_FROM` to tylko placeholder
+    `ikea-watch@localhost`, a nie prawdziwy adres);
+  - dla `gmail`/`local587` `EMAIL_TO` może pozostać nieustawiony w
+    `.env` - wtedy skrypt używa `SMTP_USER` jako odbiorcy (to jest
+    istniejące, zamierzone zachowanie: wysyłasz powiadomienia na tę
+    samą skrzynkę, z której są wysyłane).
+  - brakujące pole(-a) powodują czytelny błąd przy starcie z listą
+    tego, co trzeba uzupełnić.
+- Telegram jest traktowany jako aktywny kanał tylko wtedy, gdy **oba**
+  pola są ustawione: `TELEGRAM_BOT_TOKEN` i `TELEGRAM_CHAT_ID`. Ustawienie
+  tylko jednego z nich (np. tokenu bez chat_id) jest odrzucane przy
+  starcie jako niepełna konfiguracja - to dotyczy zarówno wysyłki
+  powiadomień, jak i sprawdzania komend w Telegramie.
+- Jeśli `SMTP_MODE=disabled` **i** Telegram nie jest w pełni
+  skonfigurowany, skrypt odmawia startu z czytelnym błędem - musisz
+  skonfigurować e-mail (jeden z `gmail`/`local587`/`exim`, kompletnie)
+  albo pełny Telegram.
+
+Przykład konfiguracji "tylko Telegram" (bez e-maila) w `.env`:
+
+```ini
+SMTP_MODE=disabled
+TELEGRAM_BOT_TOKEN=123456789:TWOJ-TOKEN-Z-BOTFATHER
+TELEGRAM_CHAT_ID=987654321
+```
+
+Jak założyć bota Telegrama - patrz sekcja "Telegram - jak założyć bota"
+niżej.
 
 ### Mapa sklepów IKEA (storeId i slug)
 
@@ -227,6 +276,46 @@ KEYWORDS_EXCLUDE=front,uchwyt,noga,sruba
 Jeśli `getUpdates` zwraca `{"ok":true,"result":[]}`, jeszcze nie
 wysłałeś wiadomości do bota - zrób to i odśwież ponownie.
 
+## Ochrona przed równoległymi procesami
+
+**Wybierz JEDEN mechanizm trwałego uruchamiania - cron ALBO systemd, nigdy
+oba naraz.** Odpalenie crona i usługi systemd równocześnie dla tego samego
+skryptu powoduje podwójne powiadomienia (dwa niezależne procesy sprawdzają
+te same oferty) oraz podwójne/kolidujące odpowiedzi na te same komendy
+Telegrama.
+
+Niezależnie od wybranego mechanizmu, **wszystkie sposoby odpalania
+skryptu (cron, systemd, ręczne uruchomienie) muszą używać tego samego,
+trwałego pliku blokady** poprzez `flock -n`, np.:
+
+```
+/home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock
+```
+
+Użyj dokładnie tej samej, jawnej ścieżki (w katalogu domowym użytkownika,
+NIE ścieżki względnej zależnej od katalogu roboczego) we wpisie crona,
+w pliku usługi systemd i w każdym ręcznym uruchomieniu.
+
+`flock -n` (flaga `-n` = "nie czekaj") celowo **nie czeka i nie buduje
+kolejki** - jeśli blokada jest już zajęta (bo poprzedni cykl monitoringu
+jeszcze trwa albo działa druga kopia procesu), nowa próba odpalenia po
+prostu nic nie robi i wychodzi. Dzięki temu stare cykle nigdy się nie
+kolejkują i dwie kopie monitoringu nigdy nie działają naraz - to jest
+zamierzone zachowanie, nie błąd.
+
+**Dla usługi systemd** przykładowy plik `ikea-okazje.service` używa
+dodatkowo `flock -n -E 75 ...` w połączeniu z
+`RestartPreventExitStatus=75` w sekcji `[Service]`. Flaga `-E 75` mówi
+`flock`, żeby w sytuacji "blokada jest już zajęta" zakończył się
+dedykowanym kodem wyjścia `75` (a nie standardowym `1`), a
+`RestartPreventExitStatus=75` mówi systemd, żeby **nie** traktował tego
+konkretnego kodu jako awarii i **nie** restartował usługi. Bez tego
+`Restart=on-failure` wchodziłoby w pętlę restartów co `RestartSec`,
+mimo że zajęta blokada jest zamierzonym, a nie błędnym stanem.
+Prawdziwe awarie skryptu (np. błąd zapytania do API IKEA) kończą się
+innymi kodami wyjścia (1, 2 albo 3) i wciąż są normalnie restartowane
+przez systemd.
+
 ## Dwa tryby pracy
 
 ### Tryb "cron" (domyślny)
@@ -240,8 +329,12 @@ crontab -e
 ```
 
 ```
-*/15 * * * * /usr/bin/flock -n ~/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
+*/15 * * * * /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
 ```
+
+Podmień `TWOJ_UZYTKOWNIK` na swojego użytkownika - to musi być **ta sama
+ścieżka pliku blokady**, jaka jest użyta w pliku usługi systemd (patrz
+niżej), jeśli kiedykolwiek przełączysz się między crona a systemd.
 
 Prostsze w konfiguracji, ale reakcja na komendy Telegrama i wykrycie
 nowej oferty ograniczone są do interwału crona - komenda albo nowa oferta
@@ -253,12 +346,29 @@ Działa cały czas w tle:
 - **oferty IKEA** są sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie **900 sekund = 15 minut**);
 - **komendy Telegrama** są sprawdzane co `TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie **15 sekund**) - reakcja jest praktycznie natychmiastowa, niezależnie od tego, jak rzadko sprawdzane są oferty IKEA.
 
+**Przed odpaleniem usługi ustaw w swoim prywatnym pliku `.env`:**
+
 ```
 RUN_MODE=daemon
 ```
 
-w `.env`, a potem zainstaluj usługę (przykładowy plik `ikea-okazje.service`
-w tym repo - podmień `TWOJ_UZYTKOWNIK` na swojego użytkownika):
+**To jest jedyne miejsce, w którym to ustawiasz.** Plik `.env`
+(`~/.config/ikea-okazje.env`) jest jedynym źródłem konfiguracji w tej
+architekturze - przykładowy plik usługi `ikea-okazje.service` w tym repo
+celowo NIE zawiera `Environment=RUN_MODE=daemon`, bo kod nie daje
+zmiennym środowiskowym systemd priorytetu nad `.env`, więc taki wpis nic
+by nie zmienił. Jeśli zapomnisz ustawić `RUN_MODE=daemon` w `.env`,
+skrypt uruchomiony przez systemd wykona jedno przejście typu "cron" i
+wyjdzie ze statusem 0 - a systemd (przy `Type=simple`) może uznać to za
+normalne zakończenie i nie zrestartować usługi. Skrypt wykrywa ten
+przypadek (po zmiennej `INVOCATION_ID`, którą systemd ustawia dla swoich
+usług) i zapisuje w logach ostrzeżenie - ale nie zmienia trybu
+automatycznie, żeby nie maskować błędnej konfiguracji.
+
+Przykładowy plik usługi używa `flock -n` z tym samym, trwałym plikiem
+blokady co przykład crona wyżej - podmień `TWOJ_UZYTKOWNIK` na swojego
+użytkownika (zarówno w ścieżkach, jak i w polu `User=`), a potem
+zainstaluj usługę:
 
 ```
 sudo cp ikea-okazje.service /etc/systemd/system/
@@ -269,16 +379,42 @@ sudo systemctl status ikea-okazje
 journalctl -u ikea-okazje -f
 ```
 
-**Wybierz jeden z dwóch trybów - nie odpalaj jednocześnie crona i usługi
-systemd dla tego samego skryptu.** Uruchomienie obu naraz powoduje
-podwójne powiadomienia (dwa niezależne procesy sprawdzają te same oferty)
-oraz potencjalnie podwójne/kolidujące odpowiedzi na te same komendy
-Telegrama (oba procesy będą próbowały je obsłużyć).
+**Ręczne uruchomienie skryptu musi również przechodzić przez tę samą
+blokadę** - samo `python3 ikea_okazje.py` NIE korzysta z `flock` i może
+więc działać równolegle z usługą systemd albo z cronem, powodując
+podwójne odpytywanie Telegrama i zdublowane odpowiedzi. Użyj zamiast
+tego:
+
+```
+/usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
+  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+```
+
+Podmień `TWOJ_UZYTKOWNIK` na swoją prawdziwą nazwę użytkownika w
+systemie Linux - i użyj **dokładnie tej samej ścieżki pliku blokady**,
+jaka jest skonfigurowana w pliku usługi systemd i w wpisie crontaba
+wyżej. Jeśli ta blokada jest już zajęta (bo usługa systemd albo cron
+właśnie wykonują cykl), `flock -n` celowo **pomija** to ręczne
+uruchomienie - nie czeka i nic nie robi - żeby nie doszło do
+uruchomienia dwóch kopii monitoringu naraz (patrz "Ochrona przed
+równoległymi procesami" wyżej).
 
 ## Użycie
 
 ```
 python3 ikea_okazje.py
+```
+
+**Uwaga:** to proste polecenie nie korzysta z pliku blokady i nie
+powinno być używane, jeśli masz już skonfigurowany cron albo usługę
+systemd (patrz "Ochrona przed równoległymi procesami" oraz sekcja
+"Ręczne uruchomienie" w "Tryb daemon" wyżej) - w takiej sytuacji użyj
+zamiast tego tego samego polecenia z `flock -n` i tym samym plikiem
+blokady co cron/systemd:
+
+```
+/usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
+  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
 ```
 
 Pierwsze uruchomienie nie wyśle powiadomienia, nawet jeśli od razu
@@ -303,9 +439,14 @@ Testy sprawdzają m.in. mapowanie `storeId -> slug` w `KNOWN_STORES`,
 poprawność generowania linków rezerwacji (w tym kodowanie polskich
 znaków i pozostawienie `+` bez zmian), dodawanie/usuwanie sklepów
 komendami Telegrama (bez duplikatów, odrzucanie nieznanych ID), walidację
-`SMTP_MODE`, escapowanie HTML w odpowiedziach Telegrama, normalizację
-numerów artykułu oraz odporność cyklu sprawdzania ofert na błąd
-pojedynczego sklepu.
+`SMTP_MODE` (w tym `disabled`), walidację KOMPLETNOŚCI konfiguracji
+kanałów powiadomień (Telegram-only, odrzucanie niepełnego Telegrama,
+odrzucanie niekompletnego e-maila dla `gmail`/`local587`/`exim`, błąd
+przy braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
+`SMTP_MODE=disabled`, ostrzeżenie o uruchomieniu pod systemd bez
+`RUN_MODE=daemon`, escapowanie HTML w odpowiedziach Telegrama,
+normalizację numerów artykułu oraz odporność cyklu sprawdzania ofert na
+błąd pojedynczego sklepu.
 
 ## Aktualizacja skryptu
 
@@ -317,6 +458,21 @@ Twoje ustawienia w `.env` i dynamiczna lista w `~/.ikea_okazje_dynamic.json`
 zostają nietknięte.
 
 ## Typowe problemy
+
+**Usługa systemd wychodzi natychmiast ze statusem 0 / nie zostaje
+uruchomiona na dłużej.** Najpierw sprawdź, czy `RUN_MODE=daemon` jest
+ustawiony w Twoim prywatnym pliku `.env`
+(`~/.config/ikea-okazje.env`) - bez tego skrypt wykonuje tylko jedno
+przejście typu "cron" i wychodzi, co systemd (przy `Type=simple`) może
+zinterpretować jako normalne zakończenie. Skrypt zapisze w logach
+(`journalctl -u ikea-okazje`) ostrzeżenie o tej sytuacji.
+
+**Odpowiedzi na Telegramie są zduplikowane.** Sprawdź, czy nie działają
+jednocześnie cron, usługa systemd i/albo ręcznie odpalony proces
+skryptu - każdy z nich niezależnie odpytuje Telegrama i wysyła
+odpowiedzi. Wybierz jeden mechanizm trwałego uruchamiania (cron albo
+systemd, patrz "Ochrona przed równoległymi procesami") i upewnij się, że
+wszystkie sposoby odpalania używają tego samego pliku blokady `flock`.
 
 **Blokada Cloudflare / 403.** `IMPERSONATE` musi zgadzać się z wersją
 Chrome w `HEADERS`.
