@@ -47,6 +47,13 @@ chmod 600 ~/.config/ikea-okazje.env
 nano ~/.config/ikea-okazje.env
 ```
 
+**Kiedy konfiguracja jest wczytywana i sprawdzana:** `.env`, walidacja
+kanałów powiadomień i dynamiczny stan monitoringu są wczytywane/tworzone
+przy **starcie programu** (`python3 ikea_okazje.py`), nie przy samym
+zaimportowaniu modułu jako biblioteki (np. w testach) - dzięki temu
+importowanie `ikea_okazje.py` do testów jednostkowych nie wymaga
+żadnego `.env` i nie tworzy żadnych plików stanu.
+
 | Pole | Opis | Domyślnie |
 |---|---|---|
 | `SMTP_MODE` | `gmail`, `local587`, `exim` albo `disabled` (dowolna inna wartosc konczy dzialanie skryptu czytelnym bledem) | `gmail` |
@@ -338,13 +345,23 @@ niżej), jeśli kiedykolwiek przełączysz się między crona a systemd.
 
 Prostsze w konfiguracji, ale reakcja na komendy Telegrama i wykrycie
 nowej oferty ograniczone są do interwału crona - komenda albo nowa oferta
-zostaną obsłużone dopiero przy następnym przebiegu skryptu.
+zostaną obsłużone dopiero przy następnym przebiegu skryptu. Tryb `cron`
+pozostaje jednorazowym przebiegiem - wychodzi po jednym cyklu, tak jak
+dotychczas; łagodne zatrzymanie przez `SIGTERM`/`SIGINT` (patrz tryb
+`daemon` niżej) dotyczy tylko pętli daemona.
 
 ### Tryb "daemon" (systemd)
 
 Działa cały czas w tle:
 - **oferty IKEA** są sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie **900 sekund = 15 minut**);
 - **komendy Telegrama** są sprawdzane co `TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie **15 sekund**) - reakcja jest praktycznie natychmiastowa, niezależnie od tego, jak rzadko sprawdzane są oferty IKEA.
+
+**Zatrzymanie jest łagodne (graceful shutdown).** `systemctl stop`/
+`restart` wysyła do procesu sygnał `SIGTERM` - daemon wychwytuje go (a
+także `SIGINT`, czyli Ctrl+C przy odpalaniu w terminalu), przestaje
+planować nowe sprawdzenia Telegrama/IKEA, loguje jedno podsumowanie i
+kończy się ze statusem 0, bez czekania na koniec aktualnego interwału i
+bez naruszania plików stanu.
 
 **Przed odpaleniem usługi ustaw w swoim prywatnym pliku `.env`:**
 
@@ -445,8 +462,11 @@ odrzucanie niekompletnego e-maila dla `gmail`/`local587`/`exim`, błąd
 przy braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
 `SMTP_MODE=disabled`, ostrzeżenie o uruchomieniu pod systemd bez
 `RUN_MODE=daemon`, escapowanie HTML w odpowiedziach Telegrama,
-normalizację numerów artykułu oraz odporność cyklu sprawdzania ofert na
-błąd pojedynczego sklepu.
+normalizację numerów artykułu, odporność cyklu sprawdzania ofert na
+błąd pojedynczego sklepu, brak efektów pobocznych samego importu modułu
+(`initialize_runtime()` jako jedyne miejsce startu aplikacji, bezpieczne
+do wielokrotnego wywołania) oraz łagodne zatrzymanie pętli daemona po
+`SIGTERM`/`SIGINT`.
 
 ## Aktualizacja skryptu
 

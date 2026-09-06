@@ -7,11 +7,17 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 # Izolowany, tymczasowy HOME - zeby import modulu nie czytal/nie tworzyl
 # prawdziwych plikow stanu ani nie wymagal prawdziwego .env uzytkownika.
+# UWAGA: samo `import ikea_okazje` nie czyta juz .env i nie inicjalizuje
+# aplikacji (patrz initialize_runtime() w ikea_okazje.py) - ten plik .env
+# jest tu przygotowany z gory tylko dlatego, ze wiele istniejacych testow
+# w tym pliku zaklada, ze modul ma juz zaladowana, poprawna konfiguracje
+# (wywolujemy initialize_runtime() explicit nizej, PO imporcie).
 _TEST_HOME = tempfile.mkdtemp(prefix="ikea_okazje_test_home_")
 os.environ["HOME"] = _TEST_HOME
 os.makedirs(os.path.join(_TEST_HOME, ".config"), exist_ok=True)
@@ -26,34 +32,451 @@ sys.path.insert(0, _REPO_ROOT)
 
 import ikea_okazje as ik  # noqa: E402
 
+# Import sam z siebie NIE inicjalizuje aplikacji (patrz TestSideEffectFreeImport
+# nizej) - wiele istniejacych testow w tym pliku zaklada jednak, ze modul ma
+# juz zaladowana konfiguracje (ik.STORE_IDS, ik.SEARCH_TERMS, ik.DYNAMIC_STATE,
+# ik.EMAIL_ENABLED, ...), wiec wywolujemy initialize_runtime() jawnie raz, tutaj,
+# z przygotowanym wyzej testowym .env.
+ik.initialize_runtime()
 
-def _run_module_with_env(env_file_contents: str) -> subprocess.CompletedProcess:
-    """Odpala ikea_okazje.py w osobnym procesie, z wlasnym izolowanym HOME
-    i podanym plikiem ikea-okazje.env - do testowania walidacji, ktora
-    dzieje sie na poziomie modulu (przy imporcie), a nie w funkcji, ktora
-    mozna by importowac i wywolac osobno w tym samym procesie testowym
-    (modul jest juz zaimportowany z inna konfiguracja w tym procesie)."""
+
+def _make_isolated_home(env_file_contents=None):
+    """Tworzy nowy, izolowany katalog HOME (osobny od _TEST_HOME powyzej),
+    opcjonalnie z plikiem ~/.config/ikea-okazje.env. Gdy env_file_contents
+    jest None, katalog .config nawet nie jest tworzony - do testowania
+    zachowania bez zadnej konfiguracji uzytkownika."""
     tmp_home = tempfile.mkdtemp(prefix="ikea_okazje_subproc_home_")
-    config_dir = os.path.join(tmp_home, ".config")
-    os.makedirs(config_dir, exist_ok=True)
-    config_path = os.path.join(config_dir, "ikea-okazje.env")
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(env_file_contents)
-    os.chmod(config_path, 0o600)
+    if env_file_contents is not None:
+        config_dir = os.path.join(tmp_home, ".config")
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "ikea-okazje.env")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(env_file_contents)
+        os.chmod(config_path, 0o600)
+    return tmp_home
 
+
+def _run_python_code(code: str, home_dir: str, extra_env: dict = None) -> subprocess.CompletedProcess:
+    """Odpala krotki fragment kodu Pythona w osobnym procesie, z podanym
+    HOME - do testowania zachowania na poziomie modulu (import,
+    initialize_runtime()) w pelnej izolacji od reszty zestawu testow."""
     env = dict(os.environ)
-    env["HOME"] = tmp_home
-    # Importujemy modul (bez wywolywania main()), zeby uruchomic tylko
-    # walidacje na poziomie modulu (SMTP_MODE/Telegram) - bez faktycznego
-    # sprawdzania ofert IKEA czy odpytywania Telegrama.
+    env["HOME"] = home_dir
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(  # nosec - subprocess used only for isolated startup tests
-        [sys.executable, "-c", "import ikea_okazje"],
+        [sys.executable, "-c", code],
         cwd=_REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
         timeout=30,
     )
+
+
+def _run_module_with_env(env_file_contents: str) -> subprocess.CompletedProcess:
+    """Odpala `import ikea_okazje as ik; ik.initialize_runtime()` w osobnym
+    procesie, z wlasnym izolowanym HOME i podanym plikiem ikea-okazje.env -
+    do testowania walidacji konfiguracji, ktora teraz dzieje sie w
+    initialize_runtime(), NIE przy samym imporcie (patrz TestSideEffectFreeImport
+    i TestExplicitInitialization nizej dla testow tego rozdzielenia)."""
+    tmp_home = _make_isolated_home(env_file_contents)
+    return _run_python_code(
+        "import ikea_okazje as ik; ik.initialize_runtime()", tmp_home
+    )
+
+
+class TestSideEffectFreeImport(unittest.TestCase):
+    """`import ikea_okazje` samo w sobie nie powinno robic NIC poza
+    zdefiniowaniem funkcji/stalych/harmless defaultow - patrz
+    initialize_runtime() w ikea_okazje.py. Te testy odpalaja `import
+    ikea_okazje` (bez wywolania initialize_runtime()) w osobnym procesie,
+    z izolowanym, PUSTYM katalogiem HOME (bez ~/.config/ikea-okazje.env)."""
+
+    def test_import_does_not_fail_without_config_file(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_import_does_not_create_config_file(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        config_path = os.path.join(home_dir, ".config", "ikea-okazje.env")
+        self.assertFalse(os.path.exists(config_path))
+
+    def test_import_does_not_create_dynamic_state_file(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        dynamic_state_path = os.path.join(home_dir, ".ikea_okazje_dynamic.json")
+        self.assertFalse(os.path.exists(dynamic_state_path))
+
+    def test_import_does_not_create_seen_offers_file(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        seen_offers_path = os.path.join(home_dir, ".ikea_okazje_seen_offers.json")
+        self.assertFalse(os.path.exists(seen_offers_path))
+
+    def test_import_succeeds_even_with_invalid_smtp_mode_in_env(self):
+        # Gdyby walidacja SMTP_MODE dzialala jeszcze na poziomie importu,
+        # ten .env (literowka w SMTP_MODE) spowodowalby awarie samego
+        # `import ikea_okazje`. Teraz walidacja jest w initialize_runtime(),
+        # wiec sam import ma sie powiesc niezaleznie od tego, co jest w .env.
+        home_dir = _make_isolated_home("SMTP_MODE=literowka-w-trybie\n")
+        result = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+
+class TestExplicitInitialization(unittest.TestCase):
+    """Testy dla initialize_runtime() wywolanej explicit, z wlasnym
+    izolowanym HOME/.env - w osobnych procesach, zeby nie zanieczyszczac
+    stanu modulu uzywanego przez pozostale testy w tym pliku."""
+
+    def test_initialize_runtime_loads_and_validates_configuration(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=disabled\n"
+            "TELEGRAM_BOT_TOKEN=123:fake-token\n"
+            "TELEGRAM_CHAT_ID=999\n"
+            "STORE_IDS=1224\n"
+            "SEARCH_TERMS=\n"
+            "SEARCH_ARTICLE_NUMBERS=\n"
+        )
+        result = _run_python_code(
+            "import ikea_okazje as ik\n"
+            "ik.initialize_runtime()\n"
+            "assert ik.SMTP_MODE == 'disabled', ik.SMTP_MODE\n"
+            "assert ik.TELEGRAM_ENABLED is True\n"
+            "assert ik.STORE_IDS == ['1224'], ik.STORE_IDS\n"
+            "print('OK')\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_dynamic_state_created_only_after_explicit_initialization(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+        )
+        dynamic_state_path = os.path.join(home_dir, ".ikea_okazje_dynamic.json")
+
+        result_import_only = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(result_import_only.returncode, 0, msg=result_import_only.stderr)
+        self.assertFalse(
+            os.path.exists(dynamic_state_path),
+            "sam import nie powinien tworzyc dynamicznego stanu",
+        )
+
+        result_with_init = _run_python_code(
+            "import ikea_okazje as ik; ik.initialize_runtime()", home_dir
+        )
+        self.assertEqual(result_with_init.returncode, 0, msg=result_with_init.stderr)
+        self.assertTrue(
+            os.path.exists(dynamic_state_path),
+            "initialize_runtime() powinno zasiac dynamiczny stan",
+        )
+
+    def test_invalid_notification_config_fails_during_initialize_not_import(self):
+        home_dir = _make_isolated_home("SMTP_MODE=disabled\nSTORE_IDS=294\n")
+
+        result_import_only = _run_python_code("import ikea_okazje", home_dir)
+        self.assertEqual(
+            result_import_only.returncode, 0,
+            msg="sam import nie powinien walidowac konfiguracji: " + result_import_only.stderr,
+        )
+
+        result_with_init = _run_python_code(
+            "import ikea_okazje as ik; ik.initialize_runtime()", home_dir
+        )
+        self.assertNotEqual(result_with_init.returncode, 0)
+        self.assertIn("RuntimeError", result_with_init.stderr)
+        self.assertIn("Telegram", result_with_init.stderr)
+
+
+class TestReinitialization(unittest.TestCase):
+    """Wywolanie initialize_runtime() drugi raz w tym samym procesie (z
+    innym .env) NIE powinno zachowywac stanu z poprzedniej inicjalizacji -
+    testowane w jednym podprocesie, zeby uniknac zanieczyszczenia stanu
+    uzywanego przez pozostale testy w tym pliku."""
+
+    def test_second_initialization_reflects_new_config_without_stale_state(self):
+        # Uzywamy JEDNEGO katalogu HOME na caly podproces - CONFIG_FILE/
+        # DYNAMIC_STATE_FILE sa w ikea_okazje.py stalymi na poziomie modulu
+        # (os.path.expanduser("~/...") rozwiazywane wzgledem HOME w chwili
+        # importu modulu), wiec zmiana os.environ['HOME'] w trakcie tego
+        # samego procesu nie przesunelaby tych scieżek - to nie jest czesc
+        # tego refaktoru i nie zmieniamy tego zachowania. Symulujemy wiec
+        # zmiane konfiguracji uzytkownika tak, jak dzieje sie to naprawde:
+        # nadpisujac ten sam plik .env miedzy wywolaniami initialize_runtime().
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=first@example.com\n"
+            "STORE_IDS=294\nSEARCH_TERMS=stall\nSEARCH_ARTICLE_NUMBERS=\n"
+            "MIN_DISCOUNT_PERCENT=10\n"
+        )
+        config_path = os.path.join(home_dir, ".config", "ikea-okazje.env")
+
+        code = f"""
+import os
+import ikea_okazje as ik
+
+config_path = {config_path!r}
+
+ik.initialize_runtime()
+assert ik.EMAIL_TO == 'first@example.com', ik.EMAIL_TO
+assert ik.MIN_DISCOUNT_PERCENT == 10, ik.MIN_DISCOUNT_PERCENT
+assert ik.STORE_IDS == ['294'], ik.STORE_IDS
+assert ik.SEARCH_TERMS == ['stall'], ik.SEARCH_TERMS
+
+# Uzytkownik zmienia .env (pola NIE zasiewajace tylko dynamicznego stanu -
+# EMAIL_TO/MIN_DISCOUNT_PERCENT/TELEGRAM_* sa odczytywane z .env przy
+# KAZDYM initialize_runtime(), w przeciwienstwie do STORE_IDS/SEARCH_TERMS,
+# ktore po pierwszym zasianiu zyja tylko w dynamicznym stanie na dysku -
+# patrz README, sekcja "SEARCH_TERMS/... dzialaja tylko RAZ").
+with open(config_path, "w", encoding="utf-8") as f:
+    f.write(
+        "SMTP_MODE=exim\\nEMAIL_TO=second@example.com\\n"
+        "STORE_IDS=294\\nSEARCH_TERMS=stall\\n"
+        "MIN_DISCOUNT_PERCENT=50\\n"
+        "TELEGRAM_BOT_TOKEN=123:fake-token\\nTELEGRAM_CHAT_ID=999\\n"
+    )
+os.chmod(config_path, 0o600)
+
+ik.initialize_runtime()
+assert ik.EMAIL_TO == 'second@example.com', ik.EMAIL_TO
+assert ik.MIN_DISCOUNT_PERCENT == 50, ik.MIN_DISCOUNT_PERCENT
+assert ik.TELEGRAM_ENABLED is True
+# Nic z pierwszej inicjalizacji nie "przecieka" do drugiej:
+assert ik.EMAIL_TO != 'first@example.com'
+assert ik.MIN_DISCOUNT_PERCENT != 10
+print('OK')
+"""
+        result = _run_python_code(code, home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_reinitialization_after_removing_dynamic_state_seeds_new_store_ids(self):
+        # STORE_IDS/SEARCH_TERMS sa zasiewane do dynamicznego stanu tylko
+        # przy pierwszym initialize_runtime() (patrz load_dynamic_state()) -
+        # to jest istniejace, zamierzone zachowanie z PR #1, nie zmieniamy
+        # go tutaj. Usuniecie pliku dynamicznego stanu miedzy wywolaniami
+        # (dokumentowany sposob "resetu" w README) powinno pozwolic drugiej
+        # inicjalizacji zasiac od nowa z aktualnego .env, bez stale wartosci
+        # z pierwszej inicjalizacji.
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\n"
+            "STORE_IDS=294\nSEARCH_TERMS=stall\n"
+        )
+        config_path = os.path.join(home_dir, ".config", "ikea-okazje.env")
+        dynamic_state_path = os.path.join(home_dir, ".ikea_okazje_dynamic.json")
+
+        code = f"""
+import os
+import ikea_okazje as ik
+
+config_path = {config_path!r}
+dynamic_state_path = {dynamic_state_path!r}
+
+ik.initialize_runtime()
+assert ik.STORE_IDS == ['294'], ik.STORE_IDS
+assert ik.SEARCH_TERMS == ['stall'], ik.SEARCH_TERMS
+
+os.remove(dynamic_state_path)
+with open(config_path, "w", encoding="utf-8") as f:
+    f.write(
+        "SMTP_MODE=exim\\nEMAIL_TO=test@example.com\\n"
+        "STORE_IDS=1224,306\\nSEARCH_TERMS=poscie,dywan\\n"
+        "SEARCH_ARTICLE_NUMBERS=90557419\\n"
+    )
+os.chmod(config_path, 0o600)
+
+ik.initialize_runtime()
+assert ik.STORE_IDS == ['1224', '306'], ik.STORE_IDS
+assert ik.SEARCH_TERMS == ['poscie', 'dywan'], ik.SEARCH_TERMS
+assert ik.SEARCH_ARTICLE_NUMBERS == ['90557419'], ik.SEARCH_ARTICLE_NUMBERS
+assert 'stall' not in ik.SEARCH_TERMS, ik.SEARCH_TERMS
+assert '294' not in ik.STORE_IDS, ik.STORE_IDS
+print('OK')
+"""
+        result = _run_python_code(code, home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_repeated_initialization_does_not_duplicate_dynamic_state_entries(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\n"
+            "STORE_IDS=294\nSEARCH_TERMS=stall\n"
+        )
+        code = """
+import ikea_okazje as ik
+ik.initialize_runtime()
+ik.initialize_runtime()
+ik.initialize_runtime()
+assert ik.STORE_IDS == ['294'], ik.STORE_IDS
+assert ik.SEARCH_TERMS == ['stall'], ik.SEARCH_TERMS
+assert ik.SEARCH_TERMS.count('stall') == 1
+print('OK')
+"""
+        result = _run_python_code(code, home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+
+class TestMainLifecycle(unittest.TestCase):
+    """main() musi wywolac initialize_runtime() przed sprawdzeniem komend
+    Telegrama/cyklem cron/startem daemona - testowane z mockami, zeby
+    zadne prawdziwe polaczenie z IKEA/Telegramem/SMTP nie mialo miejsca."""
+
+    def test_main_initializes_runtime_before_cron_cycle(self):
+        calls = []
+
+        def fake_initialize_runtime():
+            calls.append("initialize_runtime")
+
+        def fake_run_ikea_check_cycle():
+            calls.append("run_ikea_check_cycle")
+            return 0
+
+        with mock.patch.object(ik, "initialize_runtime", side_effect=fake_initialize_runtime), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=fake_run_ikea_check_cycle), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "cron"):
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["initialize_runtime", "run_ikea_check_cycle"])
+
+    def test_main_initializes_runtime_before_daemon_start(self):
+        calls = []
+
+        def fake_initialize_runtime():
+            calls.append("initialize_runtime")
+
+        def fake_run_daemon():
+            calls.append("run_daemon")
+            return 0
+
+        with mock.patch.object(ik, "initialize_runtime", side_effect=fake_initialize_runtime), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_daemon", side_effect=fake_run_daemon), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "daemon"):
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["initialize_runtime", "run_daemon"])
+
+    def test_main_initializes_runtime_before_telegram_command_check(self):
+        calls = []
+
+        with mock.patch.object(ik, "initialize_runtime", side_effect=lambda: calls.append("init")), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "handle_telegram_updates", side_effect=lambda: calls.append("telegram")), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=0), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "RUN_MODE", "cron"):
+            ik.main()
+
+        self.assertEqual(calls, ["init", "telegram"])
+
+
+class TestGracefulShutdown(unittest.TestCase):
+    """Testy dla zamkniecia daemona przez SHUTDOWN_EVENT - bez wysylania
+    prawdziwych sygnalow OS do procesu testowego (co byloby niestabilne),
+    tylko deterministyczne testy handlera i petli run_daemon() z mockami."""
+
+    def setUp(self):
+        ik.SHUTDOWN_EVENT.clear()
+
+    def tearDown(self):
+        ik.SHUTDOWN_EVENT.clear()
+
+    def test_request_shutdown_sets_event(self):
+        self.assertFalse(ik.SHUTDOWN_EVENT.is_set())
+        ik.request_shutdown()
+        self.assertTrue(ik.SHUTDOWN_EVENT.is_set())
+
+    def test_request_shutdown_accepts_signal_handler_signature(self):
+        # signal.signal() wywoluje handler jako handler(signum, frame) -
+        # request_shutdown musi przyjmowac te argumenty (nawet ich nie uzywajac).
+        ik.request_shutdown(15, None)
+        self.assertTrue(ik.SHUTDOWN_EVENT.is_set())
+
+    def test_daemon_loop_exits_promptly_when_shutdown_event_already_set(self):
+        ik.SHUTDOWN_EVENT.set()
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates") as mock_telegram, \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
+            result = ik.run_daemon()
+
+        self.assertEqual(result, 0)
+        mock_telegram.assert_not_called()
+        mock_cycle.assert_not_called()
+
+    def test_no_new_cycle_started_after_shutdown_event_set_mid_loop(self):
+        call_count = {"n": 0}
+
+        def fake_handle_telegram_updates():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Sygnal "przychodzi" tuz po pierwszej obslugie komend
+                # Telegrama, przed sprawdzeniem ofert IKEA.
+                ik.SHUTDOWN_EVENT.set()
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates", side_effect=fake_handle_telegram_updates), \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 0):
+            result = ik.run_daemon()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(call_count["n"], 1)
+        mock_cycle.assert_not_called()
+
+    def test_normal_daemon_shutdown_returns_zero(self):
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=0), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 0):
+
+            def stop_after_first_wait(timeout):
+                ik.SHUTDOWN_EVENT.set()
+                return True
+
+            with mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=stop_after_first_wait):
+                result = ik.run_daemon()
+
+        self.assertEqual(result, 0)
+
+    def test_event_wait_used_instead_of_unconditional_sleep(self):
+        # event.wait(timeout) powinien obudzic sie natychmiast, gdy event
+        # jest ustawiony w innym watku - w przeciwienstwie do time.sleep().
+        wait_finished = threading.Event()
+
+        def setter():
+            ik.SHUTDOWN_EVENT.set()
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=0), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 0), \
+             mock.patch.object(ik, "TELEGRAM_POLL_INTERVAL_SECONDS", 300):
+            timer = threading.Timer(0.05, setter)
+            timer.start()
+            start = ik.time.time()
+            ik.run_daemon()
+            elapsed = ik.time.time() - start
+            timer.cancel()
+            wait_finished.set()
+
+        # Petla powinna wybudzic sie szybko (znacznie przed 300s), bo
+        # event.wait() reaguje na SHUTDOWN_EVENT.set() z innego watku.
+        self.assertLess(elapsed, 5)
 
 
 class TestKnownStores(unittest.TestCase):

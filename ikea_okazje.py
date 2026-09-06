@@ -23,13 +23,21 @@ Dwa tryby pracy (RUN_MODE w .env):
     "cron"   (domyslny) - jedno przejscie i wyjscie, do uzycia z crona.
     "daemon" - dziala w petli w tle (np. jako usluga systemd), sprawdza
                komendy Telegrama czesto (TELEGRAM_POLL_INTERVAL_SECONDS),
-               a oferty IKEA rzadziej (CHECK_INTERVAL_SECONDS).
+               a oferty IKEA rzadziej (CHECK_INTERVAL_SECONDS). Konczy sie
+               lagodnie po SIGTERM (systemctl stop/restart) albo SIGINT
+               (Ctrl+C) - patrz run_daemon().
 
 WAZNE: wszystkie ustawienia, ktore chcesz zmieniac (sklepy, szukane
 produkty, filtry, sposob wysylki maila, Telegram, tryb pracy) sa w pliku
 ~/.config/ikea-okazje.env, NIE w tym skrypcie. Dzieki temu aktualizacja
 skryptu (np. z GitHuba) nigdy nie nadpisze Twoich osobistych ustawien -
 edytuj plik .env, nie ten kod. Zobacz .env.example.
+
+WAZNE (dla testow/importu jako biblioteka): samo `import ikea_okazje`
+NIE czyta .env, NIE waliduje konfiguracji i NIE dotyka zadnych plikow
+stanu - definiuje tylko funkcje, stale i harmless defaulty. Faktyczny
+start aplikacji (wczytanie .env, walidacja, dynamiczny stan) dzieje sie
+w initialize_runtime(), wywolywanej jako pierwszy krok main().
 
 Wymagania:
     pip install curl_cffi
@@ -40,6 +48,8 @@ from __future__ import annotations
 import json
 import os
 import random
+import signal
+import threading
 from datetime import datetime
 import smtplib
 import ssl
@@ -298,100 +308,61 @@ def validate_notification_config(
         )
 
 
-ENV = load_env_file(CONFIG_FILE)
-
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
-# BASE_STORE_IDS/BASE_SEARCH_TERMS/BASE_SEARCH_ARTICLE_NUMBERS sluza wylacznie
-# do zasiania dynamicznego stanu (patrz DYNAMICZNA LISTA nizej) - po pierwszym
-# uruchomieniu zrodlem prawdy jest ~/.ikea_okazje_dynamic.json, a nie .env.
-BASE_STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
-BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
-BASE_SEARCH_ARTICLE_NUMBERS = normalize_article_numbers(
-    parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
-)
+# Wszystkie zmienne w tej sekcji sa TYLKO harmless defaultami na poziomie
+# modulu - samo `import ikea_okazje` NIE czyta .env, NIE waliduje
+# konfiguracji i NIE dotyka zadnych plikow stanu. Prawdziwe wartosci
+# (na podstawie ~/.config/ikea-okazje.env) sa wczytywane i przypisywane do
+# tych samych globalnych nazw wylacznie przez initialize_runtime() - patrz
+# nizej. main() wywoluje initialize_runtime() jako pierwszy krok.
+ENV: dict = {}
 
-MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
-MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
-KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
+BASE_STORE_IDS = ["294"]
+BASE_SEARCH_TERMS = ["Stall"]
+BASE_SEARCH_ARTICLE_NUMBERS: list = []
 
-ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
+MIN_DISCOUNT_PERCENT = None
+MAX_PRICE = None
+KEYWORDS_EXCLUDE: list = []
 
-SMTP_MODE = parse_smtp_mode(ENV.get("SMTP_MODE", "gmail"))
-VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
+ALERT_EXISTING_ON_FIRST_RUN = False
 
-# "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
-RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 900
-TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
+SMTP_MODE = "gmail"
+VERIFY_TLS = True
 
-# Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
-# Ma pierwszenstwo nad wbudowana mapa KNOWN_STORES (pozwala obsluzyc nowe
-# sklepy albo zmiane routingu IKEA bez aktualizacji kodu). Jesli puste/brak
-# w .env, uzywana jest wylacznie KNOWN_STORES.
-STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
+RUN_MODE = "cron"
+CHECK_INTERVAL_SECONDS = 900
+TELEGRAM_POLL_INTERVAL_SECONDS = 15
+
+STORE_URL_SLUGS: dict = {}
+
+SMTP_HOST = None
+SMTP_PORT = None
+SMTP_USER = None
+SMTP_PASS = None
+EMAIL_FROM = None
+USE_AUTH = False
+EMAIL_ENABLED = False
+EMAIL_TO = None
+
+TELEGRAM_BOT_TOKEN = None
+TELEGRAM_CHAT_ID = None
+TELEGRAM_ENABLED = False
+
+DYNAMIC_STATE: dict = {}
+SEARCH_TERMS: list = []
+SEARCH_ARTICLE_NUMBERS: list = []
+STORE_IDS: list = []
+NORMALIZED_TERMS: list = []
+NORMALIZED_EXCLUDE: list = []
 # ----------------------------------------------------------------------------------------
 
-if SMTP_MODE == "gmail":
-    # Kompletnosc SMTP_USER/SMTP_PASS/EMAIL_TO jest sprawdzana pozniej,
-    # w jednym miejscu, w validate_notification_config() - nie tutaj.
-    SMTP_HOST = "smtp.gmail.com"
-    SMTP_PORT = 587
-    SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
-    SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
-    EMAIL_FROM = SMTP_USER
-    USE_AUTH = True
-elif SMTP_MODE == "local587":
-    SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
-    SMTP_PORT = 587
-    SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
-    SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
-    EMAIL_FROM = SMTP_USER
-    USE_AUTH = True
-elif SMTP_MODE == "exim":
-    # exim jest w tym skrypcie z definicji niezautentykowany (przekazanie
-    # dalej do lokalnego MTA) - SMTP_USER/SMTP_PASS sa dla niego celowo
-    # nieuzywane, patrz USE_AUTH=False i send_email().
-    SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
-    SMTP_PORT = 25
-    SMTP_USER = None
-    SMTP_PASS = None
-    EMAIL_FROM = ENV.get("EMAIL_FROM", "ikea-watch@localhost")
-    USE_AUTH = False
-else:  # "disabled" - e-mail wylaczony calkowicie, patrz validate_notification_config()
-    SMTP_HOST = None
-    SMTP_PORT = None
-    SMTP_USER = None
-    SMTP_PASS = None
-    EMAIL_FROM = None
-    USE_AUTH = False
-
-EMAIL_ENABLED = SMTP_MODE != "disabled"
-# EMAIL_TO moze spadac (fallback) na EMAIL_FROM (np. SMTP_USER dla
-# gmail/local587, gdzie to naprawde jest ta sama, prawdziwa skrzynka) -
-# to jest istniejace, dokumentowane zachowanie, nie nowosc tego commitu.
-_EXPLICIT_EMAIL_TO = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO")
-EMAIL_TO = _EXPLICIT_EMAIL_TO or EMAIL_FROM
-
-# Do walidacji kompletnosci uzywamy innego efektywnego adresu dla 'exim':
-# EMAIL_FROM dla 'exim' domyslnie spada na placeholder
-# ('ikea-watch@localhost'), ktory NIE jest prawdziwym adresem odbiorcy -
-# w tym trybie EMAIL_TO musi byc jawnie ustawiony w .env, zamiast cicho
-# spadac na ten placeholder.
-_EMAIL_TO_FOR_VALIDATION = _EXPLICIT_EMAIL_TO if SMTP_MODE == "exim" else EMAIL_TO
-
-TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-
-validate_notification_config(
-    SMTP_MODE,
-    SMTP_USER,
-    SMTP_PASS,
-    USE_AUTH,
-    _EMAIL_TO_FOR_VALIDATION,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-)
+# Prosty prymityw zamkniecia dla trybu daemon (patrz run_daemon()). Samo
+# stworzenie obiektu threading.Event() przy imporcie jest nieszkodliwe -
+# nie dotyka systemu plikow, sieci ani sygnalow; handlery SIGTERM/SIGINT sa
+# instalowane wylacznie w run_daemon() (install_shutdown_signal_handlers()),
+# nigdy przy imporcie modulu.
+SHUTDOWN_EVENT = threading.Event()
 
 
 def normalize_text(s: str) -> str:
@@ -445,18 +416,142 @@ def save_dynamic_state(state: dict) -> None:
     os.replace(tmp_path, DYNAMIC_STATE_FILE)
 
 
-DYNAMIC_STATE = load_dynamic_state()
-SEARCH_TERMS = DYNAMIC_STATE["search_terms"]
-SEARCH_ARTICLE_NUMBERS = DYNAMIC_STATE["search_article_numbers"]
-STORE_IDS = DYNAMIC_STATE["store_ids"]
-NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
-NORMALIZED_EXCLUDE = [normalize_text(t) for t in KEYWORDS_EXCLUDE]
-
-
 def refresh_normalized_terms() -> None:
     """Wywolaj po kazdej zmianie SEARCH_TERMS przez komende Telegrama."""
     global NORMALIZED_TERMS
     NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+
+
+def initialize_runtime() -> None:
+    """Jedyne miejsce, ktore faktycznie 'startuje' aplikacje: czyta .env,
+    parsuje i waliduje SMTP_MODE, wyprowadza ustawienia SMTP/Telegrama,
+    waliduje kanaly powiadomien, wczytuje (albo tworzy) dynamiczny stan
+    monitoringu i przygotowuje znormalizowane pochodne (NORMALIZED_TERMS/
+    NORMALIZED_EXCLUDE). Samo `import ikea_okazje` NIE robi nic z tego -
+    modul definiuje tylko funkcje i harmless defaulty (patrz sekcja
+    "USTAWIENIA UZYTKOWNIKA" wyzej).
+
+    main() wywoluje te funkcje jako pierwszy krok, przed sprawdzeniem
+    komend Telegrama, cyklem cron albo startem daemona. Testy moga
+    wywolywac ja explicit, z wlasnym izolowanym HOME/.env.
+
+    Bezpieczna do wielokrotnego wywolania w tym samym procesie (np. w
+    testach) - kazde wywolanie w calosci przebudowuje globalne zmienne
+    od zera z aktualnego ENV, bez doklejania sie do wartosci z
+    poprzedniej inicjalizacji (np. SEARCH_TERMS nie rosnie przy kazdym
+    kolejnym initialize_runtime())."""
+    global ENV
+    global BASE_STORE_IDS, BASE_SEARCH_TERMS, BASE_SEARCH_ARTICLE_NUMBERS
+    global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
+    global ALERT_EXISTING_ON_FIRST_RUN, SMTP_MODE, VERIFY_TLS
+    global RUN_MODE, CHECK_INTERVAL_SECONDS, TELEGRAM_POLL_INTERVAL_SECONDS
+    global STORE_URL_SLUGS
+    global SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, USE_AUTH
+    global EMAIL_ENABLED, EMAIL_TO
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED
+    global DYNAMIC_STATE, SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS, STORE_IDS
+    global NORMALIZED_TERMS, NORMALIZED_EXCLUDE
+
+    ENV = load_env_file(CONFIG_FILE)
+
+    # BASE_STORE_IDS/BASE_SEARCH_TERMS/BASE_SEARCH_ARTICLE_NUMBERS sluza
+    # wylacznie do zasiania dynamicznego stanu (patrz load_dynamic_state()
+    # nizej) - po pierwszym uruchomieniu zrodlem prawdy jest
+    # ~/.ikea_okazje_dynamic.json, a nie .env.
+    BASE_STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
+    BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
+    BASE_SEARCH_ARTICLE_NUMBERS = normalize_article_numbers(
+        parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
+    )
+
+    MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
+    MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
+    KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
+
+    ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
+
+    SMTP_MODE = parse_smtp_mode(ENV.get("SMTP_MODE", "gmail"))
+    VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
+
+    # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
+    RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
+    CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 900
+    TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
+
+    # Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
+    # Ma pierwszenstwo nad wbudowana mapa KNOWN_STORES (pozwala obsluzyc
+    # nowe sklepy albo zmiane routingu IKEA bez aktualizacji kodu). Jesli
+    # puste/brak w .env, uzywana jest wylacznie KNOWN_STORES.
+    STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
+
+    if SMTP_MODE == "gmail":
+        # Kompletnosc SMTP_USER/SMTP_PASS/EMAIL_TO jest sprawdzana pozniej,
+        # w jednym miejscu, w validate_notification_config() - nie tutaj.
+        SMTP_HOST = "smtp.gmail.com"
+        SMTP_PORT = 587
+        SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
+        SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
+        EMAIL_FROM = SMTP_USER
+        USE_AUTH = True
+    elif SMTP_MODE == "local587":
+        SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
+        SMTP_PORT = 587
+        SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
+        SMTP_PASS = ENV.get("SMTP_PASS") or os.environ.get("SMTP_PASS")
+        EMAIL_FROM = SMTP_USER
+        USE_AUTH = True
+    elif SMTP_MODE == "exim":
+        # exim jest w tym skrypcie z definicji niezautentykowany
+        # (przekazanie dalej do lokalnego MTA) - SMTP_USER/SMTP_PASS sa dla
+        # niego celowo nieuzywane, patrz USE_AUTH=False i send_email().
+        SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
+        SMTP_PORT = 25
+        SMTP_USER = None
+        SMTP_PASS = None
+        EMAIL_FROM = ENV.get("EMAIL_FROM", "ikea-watch@localhost")
+        USE_AUTH = False
+    else:  # "disabled" - e-mail wylaczony calkowicie, patrz validate_notification_config()
+        SMTP_HOST = None
+        SMTP_PORT = None
+        SMTP_USER = None
+        SMTP_PASS = None
+        EMAIL_FROM = None
+        USE_AUTH = False
+
+    EMAIL_ENABLED = SMTP_MODE != "disabled"
+    # EMAIL_TO moze spadac (fallback) na EMAIL_FROM (np. SMTP_USER dla
+    # gmail/local587, gdzie to naprawde jest ta sama, prawdziwa skrzynka) -
+    # to jest istniejace, dokumentowane zachowanie.
+    explicit_email_to = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO")
+    EMAIL_TO = explicit_email_to or EMAIL_FROM
+
+    # Do walidacji kompletnosci uzywamy innego efektywnego adresu dla
+    # 'exim': EMAIL_FROM dla 'exim' domyslnie spada na placeholder
+    # ('ikea-watch@localhost'), ktory NIE jest prawdziwym adresem odbiorcy -
+    # w tym trybie EMAIL_TO musi byc jawnie ustawiony w .env, zamiast cicho
+    # spadac na ten placeholder.
+    email_to_for_validation = explicit_email_to if SMTP_MODE == "exim" else EMAIL_TO
+
+    TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+    TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+    validate_notification_config(
+        SMTP_MODE,
+        SMTP_USER,
+        SMTP_PASS,
+        USE_AUTH,
+        email_to_for_validation,
+        TELEGRAM_BOT_TOKEN,
+        TELEGRAM_CHAT_ID,
+    )
+
+    DYNAMIC_STATE = load_dynamic_state()
+    SEARCH_TERMS = DYNAMIC_STATE["search_terms"]
+    SEARCH_ARTICLE_NUMBERS = DYNAMIC_STATE["search_article_numbers"]
+    STORE_IDS = DYNAMIC_STATE["store_ids"]
+    NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+    NORMALIZED_EXCLUDE = [normalize_text(t) for t in KEYWORDS_EXCLUDE]
 
 
 def store_display_name(store_id) -> str:
@@ -1161,28 +1256,61 @@ def run_ikea_check_cycle() -> int:
     return 0
 
 
-def run_daemon() -> None:
+def request_shutdown(signum=None, frame=None) -> None:
+    """Handler sygnalu (SIGTERM/SIGINT) - ustawia SHUTDOWN_EVENT. Petla w
+    run_daemon() sprawdza ten event i konczy sie po zakonczeniu aktualnego
+    przebiegu, bez uruchamiania kolejnego cyklu Telegrama/IKEA. Parametry
+    signum/frame sa akceptowane, bo tak wyglada standardowy sygnatura
+    handlera signal.signal(), ale nie sa uzywane."""
+    SHUTDOWN_EVENT.set()
+
+
+def install_shutdown_signal_handlers() -> None:
+    """Instaluje handlery SIGTERM (systemd stop/restart) i SIGINT (Ctrl+C
+    przy pracy w terminalu) na SHUTDOWN_EVENT. Wywolywane wylacznie z
+    run_daemon() - NIE przy imporcie modulu i NIE w trybie cron, ktory
+    konczy sie po jednym przebiegu i nie potrzebuje takiego handlera."""
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+
+
+def run_daemon() -> int:
     """Petla na potrzeby usterk systemd - Telegram sprawdzany czesto,
-    oferty IKEA rzadziej."""
+    oferty IKEA rzadziej. Reaguje na SIGTERM (systemd stop/restart) i
+    SIGINT (Ctrl+C) - po otrzymaniu jednego z nich petla nie planuje
+    kolejnego sprawdzenia Telegrama/IKEA, loguje jedno, jasne
+    podsumowanie i wraca ze statusem 0 (graceful shutdown), bez
+    modyfikowania plikow stanu poza tym, co juz zrobil ostatni
+    zakonczony cykl."""
+    install_shutdown_signal_handlers()
     log(
         f"Start w trybie daemon (IKEA co {CHECK_INTERVAL_SECONDS}s, "
         f"Telegram co {TELEGRAM_POLL_INTERVAL_SECONDS}s)."
     )
     last_ikea_check = 0.0
 
-    while True:
+    while not SHUTDOWN_EVENT.is_set():
         if TELEGRAM_ENABLED:
             try:
                 handle_telegram_updates()
             except Exception as exc:
                 log(f"Blad obslugi komend Telegrama: {exc}", to_stderr=True)
 
+        if SHUTDOWN_EVENT.is_set():
+            break
+
         now = time.time()
         if now - last_ikea_check >= CHECK_INTERVAL_SECONDS:
             run_ikea_check_cycle()
             last_ikea_check = now
 
-        time.sleep(TELEGRAM_POLL_INTERVAL_SECONDS)
+        # event.wait(timeout) budzi sie natychmiast po ustawieniu
+        # SHUTDOWN_EVENT, w przeciwienstwie do time.sleep(timeout), ktore
+        # zawsze czekaloby caly TELEGRAM_POLL_INTERVAL_SECONDS.
+        SHUTDOWN_EVENT.wait(TELEGRAM_POLL_INTERVAL_SECONDS)
+
+    log("Zatrzymywanie (SIGTERM/SIGINT) - koncze petle daemona bez uruchamiania nowego cyklu.")
+    return 0
 
 
 def warn_if_systemd_without_daemon_mode() -> None:
@@ -1206,6 +1334,13 @@ def warn_if_systemd_without_daemon_mode() -> None:
 
 
 def main() -> int:
+    # Jedyne miejsce, w ktorym aplikacja faktycznie "startuje": czyta .env,
+    # waliduje konfiguracje, wczytuje dynamiczny stan itd. Musi byc
+    # wywolane PRZED sprawdzeniem komend Telegrama, cyklem cron i startem
+    # daemona - żadna z tych czynnosci nie dziala na harmless defaultach
+    # ustawionych przy imporcie modulu.
+    initialize_runtime()
+
     warn_if_systemd_without_daemon_mode()
 
     if TELEGRAM_ENABLED and RUN_MODE != "daemon":
@@ -1217,8 +1352,7 @@ def main() -> int:
             log(f"Blad obslugi komend Telegrama: {exc}", to_stderr=True)
 
     if RUN_MODE == "daemon":
-        run_daemon()
-        return 0  # nieosiagalne w normalnych warunkach - run_daemon() nie wraca
+        return run_daemon()
 
     return run_ikea_check_cycle()
 
