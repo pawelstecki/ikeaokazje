@@ -75,6 +75,23 @@ Telegram.
 - **`SMTP_MODE=disabled`** wyłącza wysyłkę e-mail całkowicie - skrypt nie
   wymaga wtedy `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`, `SMTP_HOST` ani
   żadnych ustawień TLS, i nie inicjuje żadnego połączenia SMTP.
+- **Jeśli `SMTP_MODE` jest `gmail`, `local587` albo `exim`, e-mail musi
+  być KOMPLETNIE skonfigurowany** - skrypt sprawdza to od razu przy
+  starcie, a nie dopiero przy pierwszej próbie wysyłki:
+  - `gmail`/`local587` wymagają niepustych `SMTP_USER` i `SMTP_PASS`
+    (obie wartości są używane do `server.login()`) oraz działającego
+    adresu odbiorcy;
+  - `exim` (bez autentykacji - patrz `send_email()`) NIE wymaga
+    `SMTP_USER`/`SMTP_PASS`, ale wymaga jawnie ustawionego `EMAIL_TO`
+    w `.env` (dla `exim` `EMAIL_TO` nie ma sensownego automatycznego
+    fallbacku, bo domyślny `EMAIL_FROM` to tylko placeholder
+    `ikea-watch@localhost`, a nie prawdziwy adres);
+  - dla `gmail`/`local587` `EMAIL_TO` może pozostać nieustawiony w
+    `.env` - wtedy skrypt używa `SMTP_USER` jako odbiorcy (to jest
+    istniejące, zamierzone zachowanie: wysyłasz powiadomienia na tę
+    samą skrzynkę, z której są wysyłane).
+  - brakujące pole(-a) powodują czytelny błąd przy starcie z listą
+    tego, co trzeba uzupełnić.
 - Telegram jest traktowany jako aktywny kanał tylko wtedy, gdy **oba**
   pola są ustawione: `TELEGRAM_BOT_TOKEN` i `TELEGRAM_CHAT_ID`. Ustawienie
   tylko jednego z nich (np. tokenu bez chat_id) jest odrzucane przy
@@ -82,8 +99,8 @@ Telegram.
   powiadomień, jak i sprawdzania komend w Telegramie.
 - Jeśli `SMTP_MODE=disabled` **i** Telegram nie jest w pełni
   skonfigurowany, skrypt odmawia startu z czytelnym błędem - musisz
-  skonfigurować e-mail (jeden z `gmail`/`local587`/`exim`) albo pełny
-  Telegram.
+  skonfigurować e-mail (jeden z `gmail`/`local587`/`exim`, kompletnie)
+  albo pełny Telegram.
 
 Przykład konfiguracji "tylko Telegram" (bez e-maila) w `.env`:
 
@@ -286,6 +303,19 @@ prostu nic nie robi i wychodzi. Dzięki temu stare cykle nigdy się nie
 kolejkują i dwie kopie monitoringu nigdy nie działają naraz - to jest
 zamierzone zachowanie, nie błąd.
 
+**Dla usługi systemd** przykładowy plik `ikea-okazje.service` używa
+dodatkowo `flock -n -E 75 ...` w połączeniu z
+`RestartPreventExitStatus=75` w sekcji `[Service]`. Flaga `-E 75` mówi
+`flock`, żeby w sytuacji "blokada jest już zajęta" zakończył się
+dedykowanym kodem wyjścia `75` (a nie standardowym `1`), a
+`RestartPreventExitStatus=75` mówi systemd, żeby **nie** traktował tego
+konkretnego kodu jako awarii i **nie** restartował usługi. Bez tego
+`Restart=on-failure` wchodziłoby w pętlę restartów co `RestartSec`,
+mimo że zajęta blokada jest zamierzonym, a nie błędnym stanem.
+Prawdziwe awarie skryptu (np. błąd zapytania do API IKEA) kończą się
+innymi kodami wyjścia (1, 2 albo 3) i wciąż są normalnie restartowane
+przez systemd.
+
 ## Dwa tryby pracy
 
 ### Tryb "cron" (domyślny)
@@ -383,9 +413,10 @@ Testy sprawdzają m.in. mapowanie `storeId -> slug` w `KNOWN_STORES`,
 poprawność generowania linków rezerwacji (w tym kodowanie polskich
 znaków i pozostawienie `+` bez zmian), dodawanie/usuwanie sklepów
 komendami Telegrama (bez duplikatów, odrzucanie nieznanych ID), walidację
-`SMTP_MODE` (w tym `disabled`), walidację konfiguracji kanałów
-powiadomień (Telegram-only, odrzucanie niepełnego Telegrama, błąd przy
-braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
+`SMTP_MODE` (w tym `disabled`), walidację KOMPLETNOŚCI konfiguracji
+kanałów powiadomień (Telegram-only, odrzucanie niepełnego Telegrama,
+odrzucanie niekompletnego e-maila dla `gmail`/`local587`/`exim`, błąd
+przy braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
 `SMTP_MODE=disabled`, ostrzeżenie o uruchomieniu pod systemd bez
 `RUN_MODE=daemon`, escapowanie HTML w odpowiedziach Telegrama,
 normalizację numerów artykułu oraz odporność cyklu sprawdzania ofert na

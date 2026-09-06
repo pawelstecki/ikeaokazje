@@ -16,8 +16,9 @@ _TEST_HOME = tempfile.mkdtemp(prefix="ikea_okazje_test_home_")
 os.environ["HOME"] = _TEST_HOME
 os.makedirs(os.path.join(_TEST_HOME, ".config"), exist_ok=True)
 with open(os.path.join(_TEST_HOME, ".config", "ikea-okazje.env"), "w", encoding="utf-8") as _f:
-    # SMTP_MODE=exim nie wymaga zadnych sekretow (SMTP_USER/PASS).
-    _f.write("SMTP_MODE=exim\nSTORE_IDS=294\n")
+    # SMTP_MODE=exim nie wymaga zadnych sekretow (SMTP_USER/PASS), ale
+    # wymaga jawnego EMAIL_TO (patrz validate_notification_config()).
+    _f.write("SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n")
 os.chmod(os.path.join(_TEST_HOME, ".config", "ikea-okazje.env"), 0o600)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -162,32 +163,104 @@ class TestSmtpModeValidation(unittest.TestCase):
 
 
 class TestNotificationConfigValidation(unittest.TestCase):
-    def test_disabled_smtp_with_full_telegram_is_accepted(self):
-        ik.validate_notification_config("disabled", "123:token", "999")  # nie rzuca
+    """Testy dla validate_notification_config(smtp_mode, smtp_user,
+    smtp_pass, use_smtp_auth, email_to, telegram_bot_token,
+    telegram_chat_id) - efektywne wartosci PO fallbackach, tak jak
+    dostaje je kod na poziomie modulu."""
 
-    def test_email_mode_without_telegram_is_accepted(self):
-        ik.validate_notification_config("gmail", None, None)  # nie rzuca
+    def test_disabled_smtp_with_full_telegram_is_accepted(self):
+        ik.validate_notification_config(
+            "disabled", None, None, False, None, "123:token", "999"
+        )  # nie rzuca
 
     def test_disabled_smtp_without_telegram_raises(self):
         with self.assertRaises(RuntimeError) as ctx:
-            ik.validate_notification_config("disabled", None, None)
+            ik.validate_notification_config(
+                "disabled", None, None, False, None, None, None
+            )
         message = str(ctx.exception)
         self.assertIn("e-mail", message)
         self.assertIn("Telegram", message)
 
+    def test_gmail_without_user_and_pass_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.validate_notification_config(
+                "gmail", None, None, True, None, None, None
+            )
+        message = str(ctx.exception)
+        self.assertIn("SMTP_USER", message)
+        self.assertIn("SMTP_PASS", message)
+
+    def test_gmail_with_user_but_without_pass_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.validate_notification_config(
+                "gmail", "me@gmail.com", None, True, "me@gmail.com", None, None
+            )
+        message = str(ctx.exception)
+        self.assertIn("SMTP_PASS", message)
+        self.assertNotIn("SMTP_USER", message)  # SMTP_USER jest ustawiony, nie powinien byc zgloszony
+
+    def test_gmail_with_complete_settings_is_accepted(self):
+        ik.validate_notification_config(
+            "gmail", "me@gmail.com", "app-password", True, "me@gmail.com", None, None
+        )  # nie rzuca
+
+    def test_local587_without_user_and_pass_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.validate_notification_config(
+                "local587", None, None, True, "me@example.com", None, None
+            )
+        message = str(ctx.exception)
+        self.assertIn("SMTP_USER", message)
+        self.assertIn("SMTP_PASS", message)
+
+    def test_local587_with_complete_settings_is_accepted(self):
+        ik.validate_notification_config(
+            "local587", "user", "pass", True, "me@example.com", None, None
+        )  # nie rzuca
+
+    def test_exim_without_email_to_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.validate_notification_config(
+                "exim", None, None, False, None, None, None
+            )
+        self.assertIn("EMAIL_TO", str(ctx.exception))
+
+    def test_exim_with_email_to_is_accepted_without_user_and_pass(self):
+        ik.validate_notification_config(
+            "exim", None, None, False, "me@example.com", None, None
+        )  # nie rzuca
+
     def test_token_without_chat_id_raises(self):
         with self.assertRaises(RuntimeError) as ctx:
-            ik.validate_notification_config("gmail", "123:token", None)
+            ik.validate_notification_config(
+                "gmail", "me@gmail.com", "app-password", True, "me@gmail.com",
+                "123:token", None,
+            )
         self.assertIn("TELEGRAM_CHAT_ID", str(ctx.exception))
 
     def test_chat_id_without_token_raises(self):
         with self.assertRaises(RuntimeError) as ctx:
-            ik.validate_notification_config("gmail", None, "999")
+            ik.validate_notification_config(
+                "gmail", "me@gmail.com", "app-password", True, "me@gmail.com",
+                None, "999",
+            )
         self.assertIn("TELEGRAM_BOT_TOKEN", str(ctx.exception))
 
     def test_token_without_chat_id_raises_even_with_disabled_smtp(self):
         with self.assertRaises(RuntimeError):
-            ik.validate_notification_config("disabled", "123:token", None)
+            ik.validate_notification_config(
+                "disabled", None, None, False, None, "123:token", None
+            )
+
+    def test_incomplete_email_is_rejected_even_with_full_telegram(self):
+        # Telegram kompletny NIE maskuje niekompletnej konfiguracji e-mail,
+        # dopoki SMTP_MODE nie jest explicite 'disabled'.
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.validate_notification_config(
+                "gmail", None, None, True, None, "123:token", "999"
+            )
+        self.assertIn("SMTP_USER", str(ctx.exception))
 
 
 class TestEmailDisabledMode(unittest.TestCase):
@@ -252,12 +325,42 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
     def test_partial_telegram_configuration_is_rejected(self):
         result = _run_module_with_env(
             "SMTP_MODE=exim\n"
+            "EMAIL_TO=test@example.com\n"
             "TELEGRAM_BOT_TOKEN=123:fake-token\n"
             "STORE_IDS=294\n"
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("RuntimeError", result.stderr)
         self.assertIn("TELEGRAM_CHAT_ID", result.stderr)
+
+    def test_gmail_mode_without_smtp_fields_fails_at_startup(self):
+        result = _run_module_with_env(
+            "SMTP_MODE=gmail\n"
+            "STORE_IDS=294\n"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("SMTP_USER", result.stderr)
+        self.assertIn("SMTP_PASS", result.stderr)
+
+    def test_exim_mode_without_email_to_fails_at_startup(self):
+        result = _run_module_with_env(
+            "SMTP_MODE=exim\n"
+            "STORE_IDS=294\n"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("EMAIL_TO", result.stderr)
+
+    def test_exim_mode_with_email_to_succeeds(self):
+        result = _run_module_with_env(
+            "SMTP_MODE=exim\n"
+            "EMAIL_TO=test@example.com\n"
+            "STORE_IDS=294\n"
+            "SEARCH_TERMS=\n"
+            "SEARCH_ARTICLE_NUMBERS=\n"
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
 
     def test_disabled_smtp_mode_does_not_require_smtp_fields(self):
         result = _run_module_with_env(
