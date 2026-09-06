@@ -379,16 +379,42 @@ sudo systemctl status ikea-okazje
 journalctl -u ikea-okazje -f
 ```
 
-Ręczne uruchomienie skryptu (np. `python3 ikea_okazje.py` prosto z
-terminala) podczas gdy usługa systemd już działa może zostać celowo
-"pominięte" przez `flock -n`, jeśli ręcznie użyjesz tego samego pliku
-blokady - to zamierzone zachowanie (patrz "Ochrona przed równoległymi
-procesami" wyżej), a nie błąd.
+**Ręczne uruchomienie skryptu musi również przechodzić przez tę samą
+blokadę** - samo `python3 ikea_okazje.py` NIE korzysta z `flock` i może
+więc działać równolegle z usługą systemd albo z cronem, powodując
+podwójne odpytywanie Telegrama i zdublowane odpowiedzi. Użyj zamiast
+tego:
+
+```
+/usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
+  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+```
+
+Podmień `TWOJ_UZYTKOWNIK` na swoją prawdziwą nazwę użytkownika w
+systemie Linux - i użyj **dokładnie tej samej ścieżki pliku blokady**,
+jaka jest skonfigurowana w pliku usługi systemd i w wpisie crontaba
+wyżej. Jeśli ta blokada jest już zajęta (bo usługa systemd albo cron
+właśnie wykonują cykl), `flock -n` celowo **pomija** to ręczne
+uruchomienie - nie czeka i nic nie robi - żeby nie doszło do
+uruchomienia dwóch kopii monitoringu naraz (patrz "Ochrona przed
+równoległymi procesami" wyżej).
 
 ## Użycie
 
 ```
 python3 ikea_okazje.py
+```
+
+**Uwaga:** to proste polecenie nie korzysta z pliku blokady i nie
+powinno być używane, jeśli masz już skonfigurowany cron albo usługę
+systemd (patrz "Ochrona przed równoległymi procesami" oraz sekcja
+"Ręczne uruchomienie" w "Tryb daemon" wyżej) - w takiej sytuacji użyj
+zamiast tego tego samego polecenia z `flock -n` i tym samym plikiem
+blokady co cron/systemd:
+
+```
+/usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
+  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
 ```
 
 Pierwsze uruchomienie nie wyśle powiadomienia, nawet jeśli od razu
