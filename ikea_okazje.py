@@ -81,12 +81,13 @@ BLOCKING_STATUS_CODES = {403, 429}
 STORE_JITTER_RANGE = (1.0, 3.0)
 
 # Domyslny bazowy interwal sprawdzania ofert w trybie daemon (sekundy) -
-# 3600s (1 godzina), odpowiada celowi tego narzedzia: rzadkie, prywatne
+# 2700s (45 minut), odpowiada celowi tego narzedzia: rzadkie, prywatne
 # sprawdzanie, a nie agresywne odpytywanie. Uzywany TYLKO, jesli
 # CHECK_INTERVAL_SECONDS nie jest jawnie ustawiony w .env (patrz
 # initialize_runtime()) - istniejace instalacje z wlasnym ustawieniem (np.
-# starym 900s) nie sa tym dotkniete, .env ma zawsze pierwszenstwo.
-DEFAULT_CHECK_INTERVAL_SECONDS = 3600
+# starym 900s/15 min albo poprzednim domyslnym 3600s/1h) nie sa tym
+# dotkniete, .env ma zawsze pierwszenstwo.
+DEFAULT_CHECK_INTERVAL_SECONDS = 2700
 
 # Jitter wokol CHECK_INTERVAL_SECONDS przy kazdym rzeczywistym sleep/wait w
 # petli daemon (patrz compute_jittered_interval() i run_daemon()) - procent
@@ -449,34 +450,74 @@ def normalize_text(s: str) -> str:
 
 # ---------------- DYNAMICZNA LISTA (modyfikowana komendami z Telegrama) ----------------
 
+def default_access_notification_state() -> dict:
+    """Domyslny, "pusty" stan bloku 'ikea_access_notification' (patrz
+    load_dynamic_state()/get_access_notification_state() nizej) - brak
+    aktywnej utraty dostepu, brak zapamietanego ostatniego kodu HTTP
+    blokady. Uzywany do zasiania nowego pliku stanu i jako fallback dla
+    starszych plikow stanu, ktore jeszcze nie mialy tego klucza."""
+    return {"outage_active": False, "last_status_code": None}
+
+
 def load_dynamic_state() -> dict:
     """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/
     STORE_IDS z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
     pierwszym razie nie jest juz zrodlem prawdy dla tych list (zmieniaj je
     odtad komendami w Telegramie albo edytujac ten plik). Jesli plik juz
-    istnieje, ale nie ma jeszcze klucza "store_ids" (starsza wersja stanu),
-    dopisujemy go z .env jako fallback i zapisujemy z powrotem na dysk."""
+    istnieje, ale nie ma jeszcze klucza "store_ids" albo
+    "ikea_access_notification" (starsza wersja stanu), dopisujemy brakujace
+    klucze (z .env albo z domyslnego, "pustego" stanu) i zapisujemy z
+    powrotem na dysk - stare pliki stanu bez tego bloku nadal dzialaja bez
+    wyjatku."""
     if os.path.exists(DYNAMIC_STATE_FILE):
         with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         had_store_ids = "store_ids" in data
+        had_access_notification = "ikea_access_notification" in data
         raw_article_numbers = data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS))
         normalized_article_numbers = normalize_article_numbers(raw_article_numbers)
+        access_notification = data.get("ikea_access_notification") or default_access_notification_state()
         state = {
             "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
             "search_article_numbers": normalized_article_numbers,
             "store_ids": data.get("store_ids", list(BASE_STORE_IDS)),
+            "ikea_access_notification": access_notification,
         }
-        if not had_store_ids or normalized_article_numbers != raw_article_numbers:
+        if (
+            not had_store_ids
+            or not had_access_notification
+            or normalized_article_numbers != raw_article_numbers
+        ):
             save_dynamic_state(state)
         return state
     state = {
         "search_terms": list(BASE_SEARCH_TERMS),
         "search_article_numbers": list(BASE_SEARCH_ARTICLE_NUMBERS),
         "store_ids": list(BASE_STORE_IDS),
+        "ikea_access_notification": default_access_notification_state(),
     }
     save_dynamic_state(state)
     return state
+
+
+def get_access_notification_state() -> dict:
+    """Zwraca aktualny stan bloku 'ikea_access_notification' z DYNAMIC_STATE
+    (patrz load_dynamic_state()) - z fallbackiem na domyslny, "pusty" stan,
+    gdyby z jakiegos powodu brakowalo tego klucza w pamieci."""
+    return DYNAMIC_STATE.get("ikea_access_notification") or default_access_notification_state()
+
+
+def set_access_notification_state(outage_active: bool, last_status_code) -> None:
+    """Aktualizuje i trwale zapisuje (na dysk, w DYNAMIC_STATE_FILE) stan
+    bloku 'ikea_access_notification' - patrz
+    handle_access_notification_state(). Zapis na dysk (a nie tylko w
+    pamieci) jest tym, co gwarantuje, ze restart procesu/uslugi systemd w
+    trakcie trwajacej blokady 403/429 nie spowoduje ponownego alertu."""
+    DYNAMIC_STATE["ikea_access_notification"] = {
+        "outage_active": outage_active,
+        "last_status_code": last_status_code,
+    }
+    save_dynamic_state(DYNAMIC_STATE)
 
 
 def save_dynamic_state(state: dict) -> None:
@@ -548,11 +589,12 @@ def initialize_runtime() -> None:
 
     # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
     RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-    # Domyslnie 3600s (1 godzina) - odpowiada celowi tego narzedzia (rzadkie,
+    # Domyslnie 2700s (45 minut) - odpowiada celowi tego narzedzia (rzadkie,
     # prywatne sprawdzanie). Jesli CHECK_INTERVAL_SECONDS jest jawnie
-    # ustawiony w .env (nawet na wartosc mniejsza, np. stare 900s), ta
-    # wartosc ma pierwszenstwo - zachowanie wstecznie kompatybilne,
-    # istniejace instalacje nie zmieniaja sie bez zmiany w .env.
+    # ustawiony w .env (nawet na wartosc inna, np. stare 900s/15 min albo
+    # poprzednie domyslne 3600s/1h), ta wartosc ma pierwszenstwo -
+    # zachowanie wstecznie kompatybilne, istniejace instalacje nie
+    # zmieniaja sie bez zmiany w .env.
     CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or CHECK_INTERVAL_SECONDS
     TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
 
@@ -956,17 +998,15 @@ def format_offer_block(o: dict) -> str:
     return "\n".join(lines)
 
 
-def send_email(new_offers) -> None:
-    titles = ", ".join(sorted({o["title"] for o in new_offers}))
-    subject = f"IKEA Okazje: nowa oferta - {titles}"
-
-    blocks = [format_offer_block(o) for o in new_offers]
-    body = (
-        "Znaleziono nowe oferty dla: " + ", ".join(SEARCH_TERMS) + "\n\n"
-        + "\n\n".join(blocks)
-        + "\n\nSprawdz strone:\nhttps://www.ikea.com/pl/pl/second-hand/buy-from-ikea/"
-    )
-
+def deliver_email_message(subject: str, body: str) -> None:
+    """Buduje i wysyla jedna wiadomosc e-mail (naglowki From/To + tresc
+    tekstowa) przez aktualnie skonfigurowany SMTP - wspolna, niska warstwa
+    dostawy uzywana zarowno przez send_email() (powiadomienia o nowych
+    ofertach) jak i notify_access_status() (jednorazowe alerty o
+    utracie/odzyskaniu dostepu, patrz handle_access_notification_state()).
+    Nie zmienia istniejacego zachowania SMTP (host/port/TLS/auth) - to
+    tylko wydzielenie identycznego kodu dostawy, ktory wczesniej istnial
+    wylacznie wewnatrz send_email()."""
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
@@ -984,6 +1024,20 @@ def send_email(new_offers) -> None:
             server.ehlo()
             server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
+
+
+def send_email(new_offers) -> None:
+    titles = ", ".join(sorted({o["title"] for o in new_offers}))
+    subject = f"IKEA Okazje: nowa oferta - {titles}"
+
+    blocks = [format_offer_block(o) for o in new_offers]
+    body = (
+        "Znaleziono nowe oferty dla: " + ", ".join(SEARCH_TERMS) + "\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nSprawdz strone:\nhttps://www.ikea.com/pl/pl/second-hand/buy-from-ikea/"
+    )
+
+    deliver_email_message(subject, body)
 
 
 def format_offer_telegram(o: dict) -> str:
@@ -1077,6 +1131,115 @@ def notify(new_offers) -> list:
             errors.append(f"telegram: {exc}")
 
     return errors
+
+
+# ---------------- POWIADOMIENIA O UTRACIE/ODZYSKANIU DOSTEPU (403/429) ----------------
+# Minimalny, dodatkowy mechanizm stanu (patrz ikea_access_notification w
+# load_dynamic_state()) - odrebny od notify()/new_offers powyzej, bo dotyczy
+# stanu DOSTEPU do API IKEA jako calosci (pelny cykl bez zadnych danych z
+# powodu HTTP 403/429), nie konkretnych ofert. Uzywa jednak tych samych,
+# aktualnie skonfigurowanych kanalow (e-mail/Telegram) i tego samego wzorca
+# zbierania bledow jak notify() - patrz notify_access_status() nizej.
+
+ACCESS_OUTAGE_EMAIL_SUBJECT = "IKEA Okazje: brak dostepu (HTTP 403/429)"
+ACCESS_OUTAGE_MESSAGE = (
+    "IKEA odrzuca zapytania monitora (HTTP 403/429).\n"
+    "Monitor nadal dziala, ale aktualnie nie moze pobrac ofert.\n"
+    "Kolejne identyczne bledy nie beda wysylaly nastepnych powiadomien."
+)
+ACCESS_OUTAGE_TELEGRAM_MESSAGE = "⚠️ " + ACCESS_OUTAGE_MESSAGE
+
+ACCESS_RECOVERY_EMAIL_SUBJECT = "IKEA Okazje: dostep odzyskany"
+ACCESS_RECOVERY_MESSAGE = (
+    "Monitor IKEA ponownie moze pobierac oferty.\n"
+    "Dostep do danych zostal odzyskany."
+)
+ACCESS_RECOVERY_TELEGRAM_MESSAGE = "✅ " + ACCESS_RECOVERY_MESSAGE
+
+
+def notify_access_status(email_subject: str, email_body: str, telegram_text: str) -> list:
+    """Jak notify() powyzej, ale dla krotkich komunikatow o stanie dostepu
+    (utrata/odzyskanie) - te same, aktualnie skonfigurowane i wlaczone
+    kanaly (EMAIL_ENABLED/TELEGRAM_ENABLED), zaden nowy kanal powiadomien.
+    Zwraca liste bledow dostawy w tym samym formacie co notify(), zeby
+    wolajacy (handle_access_notification_state()) mogl zastosowac
+    identyczna logike "czy to byla calkowita porazka dostawy" jak dla
+    powiadomien o nowych ofertach."""
+    errors = []
+
+    if EMAIL_ENABLED:
+        try:
+            deliver_email_message(email_subject, email_body)
+        except Exception as exc:
+            errors.append(f"e-mail: {exc}")
+
+    if TELEGRAM_ENABLED:
+        try:
+            telegram_send_message(telegram_text)
+        except Exception as exc:
+            errors.append(f"telegram: {exc}")
+
+    return errors
+
+
+def handle_access_notification_state(all_stores_blocked: bool, blocked_status_code) -> None:
+    """Aktualizuje stan powiadomien o dostepie (ikea_access_notification w
+    DYNAMIC_STATE, patrz get_access_notification_state()/
+    set_access_notification_state()) na podstawie wyniku JEDNEGO cyklu
+    sprawdzenia ofert (run_ikea_check_cycle()):
+
+    - all_stores_blocked=True: caly cykl nie pobral danych z zadnego
+      sklepu z powodu HTTP 403/429 (patrz wywolanie w
+      run_ikea_check_cycle()). Jesli stan nie byl jeszcze aktywny, wysyla
+      DOKLADNIE JEDNO powiadomienie (notify_access_status()) i zapisuje
+      stan jako aktywny - trwale, na dysk, wiec restart procesu/systemd w
+      trakcie trwajacej blokady NIE wysle kolejnego alertu. Jesli stan byl
+      juz aktywny, nic nie robi (brak duplikatow).
+    - all_stores_blocked=False: brak blokady w tym cyklu. Jesli stan byl
+      aktywny (poprzednio wyslano alert o utracie dostepu), wysyla
+      DOKLADNIE JEDNO powiadomienie o odzyskaniu i resetuje stan - kolejne
+      udane cykle nie wysylaja kolejnych komunikatow. Jesli stan nie byl
+      aktywny, nic nie robi.
+
+    Jesli sama dostawa powiadomienia calkowicie zawiedzie (wszystkie
+    aktywne kanaly zwrocily blad - identycznie jak w run_ikea_check_cycle()
+    dla notify(new_offers)), stan NIE jest oznaczany jako
+    wyslany/zresetowany - kolejny cykl z tym samym wynikiem sprobuje
+    wyslac powiadomienie ponownie, zamiast cicho "zgubic" alert."""
+    state = get_access_notification_state()
+    active_channels = (1 if EMAIL_ENABLED else 0) + (1 if TELEGRAM_ENABLED else 0)
+
+    if all_stores_blocked:
+        if state.get("outage_active"):
+            return  # alert juz wyslany - brak duplikatow, patrz opis wyzej
+
+        errors = notify_access_status(
+            ACCESS_OUTAGE_EMAIL_SUBJECT, ACCESS_OUTAGE_MESSAGE, ACCESS_OUTAGE_TELEGRAM_MESSAGE
+        )
+        for err in errors:
+            log(f"Blad wysylki alertu o utracie dostepu ({err})", to_stderr=True)
+        if errors and len(errors) == active_channels:
+            # Calkowita porazka dostawy (wszystkie aktywne kanaly) - nie
+            # oznaczaj alertu jako wyslany, zeby kolejny cykl mogl sprobowac
+            # ponownie (patrz docstring).
+            return
+
+        set_access_notification_state(True, blocked_status_code)
+        log("Wyslano alert o utracie dostepu do IKEA (HTTP 403/429).")
+    else:
+        if not state.get("outage_active"):
+            return  # dostep nie byl uznany za utracony - nic do resetowania
+
+        errors = notify_access_status(
+            ACCESS_RECOVERY_EMAIL_SUBJECT, ACCESS_RECOVERY_MESSAGE, ACCESS_RECOVERY_TELEGRAM_MESSAGE
+        )
+        for err in errors:
+            log(f"Blad wysylki alertu o odzyskaniu dostepu ({err})", to_stderr=True)
+        if errors and len(errors) == active_channels:
+            return
+
+        set_access_notification_state(False, None)
+        log("Wyslano alert o odzyskaniu dostepu do IKEA.")
 
 
 # ---------------- KOMENDY TELEGRAMA ----------------
@@ -1356,6 +1519,34 @@ def compute_backoff_delay(failure_count: int) -> float:
     return apply_jitter_percent(delay, BACKOFF_JITTER_PERCENT)
 
 
+def all_stores_blocked_by_403_429(store_errors: dict) -> bool:
+    """Definicja 'utraty dostepu' z zadania: caly cykl (przynajmniej jeden
+    sklep w STORE_IDS) nie pobral danych z ZADNEGO sklepu, WYLACZNIE z
+    powodu HTTP 403/429 (BlockedByServerError - patrz BLOCKING_STATUS_CODES).
+    Zwraca False, jesli STORE_IDS jest puste, jesli chocby jeden sklep sie
+    powiodl, albo jesli chocby jeden z bledow to nie BlockedByServerError
+    (np. zwykly blad pojedynczego sklepu, timeout, HTTP 5xx, blad
+    parsowania) - te przypadki NIE sa 'utrata dostepu' w rozumieniu
+    handle_access_notification_state()."""
+    if not STORE_IDS or not store_errors:
+        return False
+    if len(store_errors) < len(STORE_IDS):
+        return False
+    return all(isinstance(exc, BlockedByServerError) for exc in store_errors.values())
+
+
+def full_cycle_fetched_successfully(store_errors: dict) -> bool:
+    """Zwierciadlana definicja 'odzyskania dostepu' z zadania: PELNY cykl
+    pobral dane poprawnie ze WSZYSTKICH skonfigurowanych sklepow (zero
+    bledow jakiegokolwiek typu) - patrz handle_access_notification_state().
+    Cykl z jakimkolwiek bledem sklepu (nawet nie-blokujacym, np. 5xx albo
+    timeout jednego sklepu) NIE jest tu traktowany jako 'odzyskanie dostepu'
+    - nie zeruje aktywnego stanu alertu, ale rowniez nie generuje nowego
+    alertu o utracie dostepu (patrz all_stores_blocked_by_403_429() -
+    wymaga, zeby WSZYSTKIE bledy byly 403/429)."""
+    return not store_errors
+
+
 def update_blocking_backoff_state(store_errors: dict) -> None:
     """Aktualizuje CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE na
     podstawie bledow zebranych w jednym cyklu (patrz fetch_all_offers()) -
@@ -1414,6 +1605,26 @@ def run_ikea_check_cycle() -> int:
         return 1
 
     update_blocking_backoff_state(store_errors)
+
+    # Alert o utracie/odzyskaniu dostepu (HTTP 403/429 na CALYM cyklu) -
+    # patrz all_stores_blocked_by_403_429()/full_cycle_fetched_successfully()/
+    # handle_access_notification_state(). Niezalezne od
+    # CONSECUTIVE_BLOCKED_CYCLES/backoffu powyzej (ktory dotyczy WYLACZNIE
+    # trybu daemon) - ten alert dziala tak samo w trybie cron i daemon, bo
+    # stan jest trwale zapisywany w DYNAMIC_STATE_FILE. Cykl z bledem
+    # niebedacym utrata dostepu ANI pelnym sukcesem (np. 1 sklep na 5xx,
+    # pozostale OK) celowo NIE wywoluje handle_access_notification_state() w
+    # zadna strone - to nie jest ani nowa utrata dostepu (patrz
+    # all_stores_blocked_by_403_429()), ani "pelny cykl pobrany poprawnie"
+    # wymagany do zresetowania alertu (patrz zadanie: wymog 9).
+    if all_stores_blocked_by_403_429(store_errors):
+        blocked_status_code = sorted({
+            exc.status_code for exc in store_errors.values()
+            if isinstance(exc, BlockedByServerError)
+        })[-1]
+        handle_access_notification_state(True, blocked_status_code)
+    elif full_cycle_fetched_successfully(store_errors):
+        handle_access_notification_state(False, None)
 
     if store_errors and len(store_errors) >= len(STORE_IDS):
         log(
