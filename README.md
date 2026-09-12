@@ -16,11 +16,19 @@ To API nie jest publicznie dokumentowane. Znalazłem je, bo strona z
 niego korzysta, ale IKEA może je zmienić albo zablokować w każdej chwili,
 bez ostrzeżenia.
 
-Endpoint jest chroniony przez Cloudflare na poziomie fingerprintu TLS,
-nie tylko nagłówków HTTP. Dlatego używam `curl_cffi` (a nie zwykłego
-`requests`) - `HEADERS` i `IMPERSONATE` w skrypcie muszą się wzajemnie
-zgadzać (ta sama wersja Chrome) - to jedyne dwie rzeczy w kodzie, których
-bym nie ruszał.
+Endpoint jest chroniony przez Cloudflare/Akamai na poziomie fingerprintu
+TLS, nie tylko nagłówków HTTP. Dlatego używam `curl_cffi` (a nie zwykłego
+`requests`) - `impersonate=` (profil TLS/JA3) i nagłówki `User-Agent`/
+`sec-ch-ua` w skrypcie muszą się wzajemnie zgadzać (ta sama "wersja
+Chrome"). Skrypt wybiera jeden spójny profil klienta (`CLIENT_PROFILES` w
+kodzie) raz na cały cykl monitoringu - patrz "Rzadkie, prywatne
+sprawdzanie" niżej.
+
+**Ten projekt jest prywatnym narzędziem do osobistego monitorowania ofert,
+nie scraperem komercyjnym ani mechanizmem do obchodzenia zabezpieczeń.**
+Skrypt ma jedynie automatyzować to, co i tak robiłbyś ręcznie w
+przeglądarce (sporadyczne sprawdzenie oferty) - nie próbuje "przepychać"
+ruchu przez blokady ani fałszować mechanizmów ochrony strony.
 
 ## Kod vs ustawienia
 
@@ -70,7 +78,7 @@ importowanie `ikea_okazje.py` do testów jednostkowych nie wymaga
 | `KEYWORDS_EXCLUDE` | czarna lista słów, po przecinku | brak |
 | `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na starcie | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać IKEA (sekundy) | `900` |
+| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - bazowy interwał sprawdzania IKEA (sekundy); jeśli jest ustawiony w `.env`, ta wartość ma zawsze pierwszeństwo przed domyślną - patrz "Rzadkie, prywatne sprawdzanie" niżej | `2700` (45 minut) |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać komendy Telegrama (sekundy) | `15` |
 
 ### Kanały powiadomień: e-mail, Telegram albo oba
@@ -353,8 +361,73 @@ dotychczas; łagodne zatrzymanie przez `SIGTERM`/`SIGINT` (patrz tryb
 ### Tryb "daemon" (systemd)
 
 Działa cały czas w tle:
-- **oferty IKEA** są sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie **900 sekund = 15 minut**);
+- **oferty IKEA** są sprawdzane w przybliżeniu co `CHECK_INTERVAL_SECONDS` (domyślnie **2700 sekund = 45 minut**; jeśli masz już własną wartość w `.env` - np. starsze 900/15 min albo poprzednie domyślne 3600/1h - ta wartość ma zawsze pierwszeństwo i nie jest nadpisywana) - patrz "Rzadkie, prywatne sprawdzanie: jitter i backoff" niżej po szczegóły;
 - **komendy Telegrama** są sprawdzane co `TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie **15 sekund**) - reakcja jest praktycznie natychmiastowa, niezależnie od tego, jak rzadko sprawdzane są oferty IKEA.
+
+#### Rzadkie, prywatne sprawdzanie: jitter i backoff
+
+To narzędzie ma służyć do **rzadkiego, prywatnego** sprawdzania oferty - w
+przybliżeniu tak często, jak sam sprawdzałbyś stronę ręcznie w
+przeglądarce, a nie do ciągłego, metronomicznego odpytywania:
+
+- **Jitter interwału.** Zamiast sztywnego, w pełni przewidywalnego odstępu
+  między sprawdzeniami, rzeczywisty odstęp to `CHECK_INTERVAL_SECONDS`
+  losowo zmieniony o do ±25% (`CHECK_INTERVAL_JITTER_PERCENT` w kodzie).
+  Np. dla domyślnych 45 minut rzeczywisty odstęp wynosi gdzieś między
+  ok. 34 a 56 minutami, inny przy każdym cyklu. To nie zwiększa
+  częstotliwości sprawdzania - tylko rozbija sztywny rytm requestów.
+- **Spójny profil klienta na cykl.** Skrypt losuje jeden profil klienta
+  (`impersonate` + zgodny `User-Agent`/`sec-ch-ua`, patrz
+  `CLIENT_PROFILES` w kodzie) na początek każdego cyklu i używa go
+  konsekwentnie dla wszystkich zapytań w tym cyklu (wszystkie strony,
+  wszystkie sklepy) - żadnego mieszania profili w ramach jednej sekwencji
+  requestów.
+- **Wykładniczy backoff po 403/429.** Jeśli IKEA odpowie HTTP 403 albo 429
+  (blokada Akamai / rate limit), skrypt **nie próbuje tego obchodzić** -
+  zamiast tego kolejne cykle z rzędu zakończone takim błędem wydłużają
+  odstęp do następnej próby: `60s, 120s, 240s, ...` aż do maks. `1800s`
+  (30 minut), z dodatkowym jitterem. Licznik resetuje się do zera po
+  pierwszym udanym pobraniu. W logach zobaczysz np.:
+  ```
+  Blokada/rate limit (HTTP 403) - kolejna porazka #2 z rzedu.
+  Backoff po HTTP 403 (porazka #2 z rzedu) - nastepna proba za 118s.
+  ```
+  Ten backoff dotyczy **wyłącznie trybu `daemon`** - w trybie `cron`
+  każde wywołanie skryptu to jedno, niezależne przejście i kody wyjścia
+  się nie zmieniają (patrz "Dwa tryby pracy" wyżej).
+
+**Ważne: to nie jest mechanizm obchodzenia blokad.** Celem jitteru,
+spójnego profilu klienta i backoffu jest to, żeby prywatny monitor
+zachowywał się możliwie blisko sporadycznego, ręcznego sprawdzania strony
+w przeglądarce - nie zwiększenie skuteczności automatycznego dostępu po
+odmowie. Jeśli IKEA konsekwentnie blokuje żądania, skrypt będzie próbował
+coraz rzadziej i zostawi to jasno w logach, zamiast "przepychać" ruch.
+
+#### Alert o utracie i odzyskaniu dostępu (HTTP 403/429)
+
+Niezależnie od backoffu opisanego wyżej (który dotyczy tylko odstępu
+między próbami w trybie `daemon`), skrypt wysyła też - przez te same,
+już skonfigurowane kanały (e-mail i/albo Telegram) - krótkie
+powiadomienie o **stanie dostępu** do danych IKEA:
+
+- Jeśli **cały** cykl sprawdzania nie pobrał danych z żadnego
+  monitorowanego sklepu wyłącznie z powodu HTTP 403/429, a stan dostępu
+  nie był już oznaczony jako utracony, skrypt wysyła **dokładnie jedno**
+  powiadomienie o utracie dostępu i zapisuje ten fakt trwale (w tym samym
+  pliku `~/.ikea_okazje_dynamic.json`, w którym żyje też lista sklepów i
+  szukanych słów). Kolejne cykle z tym samym błędem **nie** wysyłają
+  kolejnych powiadomień, także po restarcie procesu albo usługi systemd.
+- Kiedy pierwszy późniejszy **pełny** cykl pobierze dane poprawnie ze
+  wszystkich monitorowanych sklepów (bez żadnego 403/429), skrypt wysyła
+  **dokładnie jedno** powiadomienie o odzyskaniu dostępu i resetuje stan -
+  kolejne udane cykle nie wysyłają kolejnych komunikatów o odzyskaniu.
+  Kolejna, nowa utrata dostępu może potem znów wygenerować jeden alert.
+- Zwykły błąd pojedynczego sklepu, timeout, HTTP 5xx, błąd parsowania,
+  brak wyników/ofert albo brak skonfigurowanych kryteriów wyszukiwania
+  **nie** są traktowane jako utrata dostępu i nie wywołują tego alertu.
+
+Ten mechanizm nie zmienia częstotliwości requestów, retry ani backoffu -
+to tylko dodatkowe, pojedyncze powiadomienie o zmianie stanu dostępu.
 
 **Zatrzymanie jest łagodne (graceful shutdown).** `systemctl stop`/
 `restart` wysyła do procesu sygnał `SIGTERM` - daemon wychwytuje go (a
@@ -465,8 +538,17 @@ przy braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
 normalizację numerów artykułu, odporność cyklu sprawdzania ofert na
 błąd pojedynczego sklepu, brak efektów pobocznych samego importu modułu
 (`initialize_runtime()` jako jedyne miejsce startu aplikacji, bezpieczne
-do wielokrotnego wywołania) oraz łagodne zatrzymanie pętli daemona po
-`SIGTERM`/`SIGINT`.
+do wielokrotnego wywołania), łagodne zatrzymanie pętli daemona po
+`SIGTERM`/`SIGINT`, deterministyczny jitter interwału sprawdzania (z
+mockowanym `random`) i jego zakres, wybór spójnego profilu klienta na
+cykl (i zgodność `User-Agent`/`sec-ch-ua` z tym profilem, bez żadnych
+prawdziwych requestów sieciowych), wykładniczy backoff po HTTP
+403/429 (narastanie, reset po sukcesie, cap, deterministyczny jitter),
+domyślny interwał `CHECK_INTERVAL_SECONDS` (45 minut) i jego
+nadpisywanie przez `.env`, oraz alert o utracie/odzyskaniu dostępu przy
+403/429 (dokładnie jedno powiadomienie w każdą stronę, tłumienie
+duplikatów po restarcie, brak alertu dla błędu pojedynczego sklepu/5xx/
+timeoutu) - wszystko bez prawdziwych requestów HTTP, SMTP czy Telegrama.
 
 ## Aktualizacja skryptu
 
@@ -494,8 +576,15 @@ odpowiedzi. Wybierz jeden mechanizm trwałego uruchamiania (cron albo
 systemd, patrz "Ochrona przed równoległymi procesami") i upewnij się, że
 wszystkie sposoby odpalania używają tego samego pliku blokady `flock`.
 
-**Blokada Cloudflare / 403.** `IMPERSONATE` musi zgadzać się z wersją
-Chrome w `HEADERS`.
+**Blokada Cloudflare/Akamai / 403 albo 429.** Sprawdź, czy każdy profil w
+`CLIENT_PROFILES` ma zgodną wersję Chrome między `impersonate` a
+`User-Agent`/`sec-ch-ua`. W trybie `daemon` powtarzające się 403/429
+włączają automatycznie coraz dłuższy backoff (patrz "Rzadkie, prywatne
+sprawdzanie: jitter i backoff" wyżej) - to jest zamierzone, konserwatywne
+zachowanie, nie błąd; skrypt celowo nie próbuje obchodzić takiej blokady.
+Dostaniesz też jedno powiadomienie o utracie dostępu, jeśli cały cykl nie
+pobierze danych z żadnego sklepu z tego powodu (patrz "Alert o utracie i
+odzyskaniu dostępu" wyżej).
 
 **`Size must be less than or equal to 64`.** `PAGE_SIZE` już jest na `64`.
 
