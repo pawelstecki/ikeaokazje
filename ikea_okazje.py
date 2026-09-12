@@ -71,28 +71,101 @@ MAX_PAGES = 20      # zabezpieczenie przed niekonczaca sie paginacja
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# 403/429 NIE sa tutaj - to sygnaly blokady/rate limitu (patrz
+# BLOCKING_STATUS_CODES nizej), ktore mają wywolac natychmiastowe
+# ograniczenie ruchu (BlockedByServerError + backoff w run_daemon()), a NIE
+# kolejne, ciche retry w tej samej sekundzie. Tylko przejsciowe bledy
+# serwera (5xx) sa tu retry'owane wewnatrz jednego zapytania o strone.
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+BLOCKING_STATUS_CODES = {403, 429}
 STORE_JITTER_RANGE = (1.0, 3.0)
 
-HEADERS = {
+# Domyslny bazowy interwal sprawdzania ofert w trybie daemon (sekundy) -
+# 3600s (1 godzina), odpowiada celowi tego narzedzia: rzadkie, prywatne
+# sprawdzanie, a nie agresywne odpytywanie. Uzywany TYLKO, jesli
+# CHECK_INTERVAL_SECONDS nie jest jawnie ustawiony w .env (patrz
+# initialize_runtime()) - istniejace instalacje z wlasnym ustawieniem (np.
+# starym 900s) nie sa tym dotkniete, .env ma zawsze pierwszenstwo.
+DEFAULT_CHECK_INTERVAL_SECONDS = 3600
+
+# Jitter wokol CHECK_INTERVAL_SECONDS przy kazdym rzeczywistym sleep/wait w
+# petli daemon (patrz compute_jittered_interval() i run_daemon()) - procent
+# wartosci bazowej, stosowany w OBIE strony (np. 25 = przedzial [-25%, +25%]).
+# Celem jest rozbicie sztywnego, metronomicznego rytmu sprawdzania ofert
+# przy rzadkim, prywatnym monitoringu - NIE zwiekszenie czestotliwosci
+# (jitter nigdy nie skraca efektywnego interwalu ponizej tego zakresu).
+CHECK_INTERVAL_JITTER_PERCENT = 25
+
+# Wykladniczy backoff PO CYKLU zakonczonym HTTP 403/429 (patrz
+# compute_backoff_delay(), LAST_BLOCKED_STATUS_CODES i run_daemon()) -
+# dotyczy WYLACZNIE trybu daemon, nie trybu cron (patrz run_ikea_check_cycle()
+# i main()). Celem jest zmniejszenie, nie zwiekszenie aktywnosci: kolejne
+# porazki z rzedu wydluzaja odstep miedzy probami do BACKOFF_CAP_SECONDS.
+BACKOFF_BASE_SECONDS = 60.0
+BACKOFF_CAP_SECONDS = 1800.0
+BACKOFF_JITTER_PERCENT = 20
+
+# Naglowki HTTP niezalezne od wybranego profilu klienta - patrz
+# CLIENT_PROFILES/build_headers_for_profile() nizej dla user-agent i
+# sec-ch-ua, ktore MUSZA zgadzac sie z profilem impersonacji curl_cffi w
+# ramach jednego cyklu (ta sama "przegladarka" we wszystkich naglowkach i
+# w fingerprint TLS/JA3) - to jest wylacznie o wewnetrznej spojnosci
+# parametrow klienta, nie o obchodzeniu jakichkolwiek zabezpieczen.
+BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "pl-PL,pl;q=0.8",
     "origin": "https://www.ikea.com",
     "priority": "u=1, i",
     "referer": "https://www.ikea.com/",
-    "sec-ch-ua": '"Chromium";v="124", "Not?A_Brand";v="24", "Brave";v="124"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-site",
     "sec-gpc": "1",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
 }
-IMPERSONATE = "chrome124"
+
+# Profile klienta (impersonate curl_cffi + zgodny User-Agent/sec-ch-ua).
+# Ograniczone do chrome120/123/124 - to jedyne wersje Chrome, ktorych
+# impersonacja jest wspierana we WSZYSTKICH wersjach curl_cffi od minimalnej
+# wymaganej w requirements.txt (curl_cffi>=0.7.0). Nie dodawaj tu nowszych
+# profili (np. chrome131/133a/136) bez jednoczesnego podniesienia dolnej
+# granicy w requirements.txt - patrz README. Wybor profilu na cykl robi
+# choose_client_profile(), naglowki dla wybranego profilu build_headers_for_profile().
+CLIENT_PROFILES = [
+    {
+        "impersonate": "chrome120",
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "sec_ch_ua": '"Chromium";v="120", "Not_A Brand";v="8", "Google Chrome";v="120"',
+    },
+    {
+        "impersonate": "chrome123",
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "sec_ch_ua": '"Google Chrome";v="123", "Not(A:Brand";v="24", "Chromium";v="123"',
+    },
+    {
+        "impersonate": "chrome124",
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "sec_ch_ua": '"Chromium";v="124", "Not?A_Brand";v="24", "Google Chrome";v="124"',
+    },
+]
+
+# Profil klienta HTTP/TLS wybrany dla AKTUALNEGO cyklu monitoringu (patrz
+# choose_client_profile()) - ustawiany raz na poczatku run_ikea_check_cycle(),
+# NIE między pojedynczymi zapytaniami do API w tym samym cyklu, zeby
+# wszystkie zapytania (wszystkie strony, wszystkie sklepy) w ramach jednego
+# przebiegu uzywaly tego samego, spojnego zestawu naglowkow i fingerprintu
+# TLS/JA3. None przed pierwszym wywolaniem choose_client_profile().
+CURRENT_CLIENT_PROFILE: dict | None = None
 
 STATE_FILE = os.path.expanduser("~/.ikea_okazje_seen_offers.json")
 RAW_DUMP_FILE = os.path.expanduser("~/.ikea_okazje_last_raw.json")
@@ -331,7 +404,7 @@ SMTP_MODE = "gmail"
 VERIFY_TLS = True
 
 RUN_MODE = "cron"
-CHECK_INTERVAL_SECONDS = 900
+CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL_SECONDS
 TELEGRAM_POLL_INTERVAL_SECONDS = 15
 
 STORE_URL_SLUGS: dict = {}
@@ -475,7 +548,12 @@ def initialize_runtime() -> None:
 
     # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
     RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-    CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or 900
+    # Domyslnie 3600s (1 godzina) - odpowiada celowi tego narzedzia (rzadkie,
+    # prywatne sprawdzanie). Jesli CHECK_INTERVAL_SECONDS jest jawnie
+    # ustawiony w .env (nawet na wartosc mniejsza, np. stare 900s), ta
+    # wartosc ma pierwszenstwo - zachowanie wstecznie kompatybilne,
+    # istniejace instalacje nie zmieniaja sie bez zmiany w .env.
+    CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or CHECK_INTERVAL_SECONDS
     TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
 
     # Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
@@ -568,6 +646,40 @@ def store_display_name(store_id) -> str:
     return name
 
 
+# ---------------- SPOJNY PROFIL KLIENTA (impersonate + naglowki) ----------------
+
+def choose_client_profile() -> dict:
+    """Losuje jeden profil z CLIENT_PROFILES. Wywolywane co najwyzej raz na
+    cykl monitoringu (patrz run_ikea_check_cycle() - ustawia
+    CURRENT_CLIENT_PROFILE na poczatku cyklu), NIGDY miedzy pojedynczymi
+    zapytaniami w tej samej sekwencji (wszystkie strony wszystkich sklepow w
+    jednym przebiegu uzywaja tego samego profilu - patrz get_active_client_profile())."""
+    return random.choice(CLIENT_PROFILES)
+
+
+def get_active_client_profile() -> dict:
+    """Zwraca profil klienta aktywny dla aktualnego cyklu (CURRENT_CLIENT_PROFILE).
+    Jesli nic go jeszcze nie ustawilo (np. wywolanie fetch_* poza
+    run_ikea_check_cycle(), tak jak w niektorych testach), losuje i
+    zapamietuje jeden - fetch_page_with_retry() nigdy nie dostaje None."""
+    global CURRENT_CLIENT_PROFILE
+    if CURRENT_CLIENT_PROFILE is None:
+        CURRENT_CLIENT_PROFILE = choose_client_profile()
+    return CURRENT_CLIENT_PROFILE
+
+
+def build_headers_for_profile(profile: dict) -> dict:
+    """Buduje kompletny slownik naglowkow HTTP dla danego profilu klienta -
+    BASE_HEADERS (wspolne, niezalezne od przegladarki) plus user-agent i
+    sec-ch-ua zgodne z tym konkretnym profilem (patrz CLIENT_PROFILES).
+    Wylacznie o wewnetrznej spojnosci naglowkow z fingerprintem TLS/JA3
+    wybranym przez impersonate= - nie o obchodzeniu zabezpieczen."""
+    headers = dict(BASE_HEADERS)
+    headers["user-agent"] = profile["user_agent"]
+    headers["sec-ch-ua"] = profile["sec_ch_ua"]
+    return headers
+
+
 # ---------------- IKEA API ----------------
 
 def dump_raw(data) -> None:
@@ -578,6 +690,20 @@ def dump_raw(data) -> None:
         pass
 
 
+class BlockedByServerError(RuntimeError):
+    """Sygnalizuje, ze IKEA odrzucila zapytanie kodem z BLOCKING_STATUS_CODES
+    (403/429 - blokada Akamai/rate limit), w odroznieniu od przejsciowego
+    bledu serwera (5xx, patrz RETRYABLE_STATUS_CODES). NIE jest retry'owany
+    wewnatrz fetch_page_with_retry() - wychodzi natychmiast na wierch, zeby
+    run_ikea_check_cycle()/run_daemon() mogly zareagowac zmniejszeniem
+    czestotliwosci (backoff, patrz compute_backoff_delay()), a nie
+    "przepychaniem" kolejnych prob w tej samej sekundzie."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def fetch_page_with_retry(store_id: str, page: int) -> dict:
     params = {
         "languageCode": "pl",
@@ -585,22 +711,33 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
         "storeIds": store_id,
         "page": str(page),
     }
+    profile = get_active_client_profile()
+    headers = build_headers_for_profile(profile)
 
     last_error = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = requests.get(
                 API_URL,
-                headers=HEADERS,
+                headers=headers,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
-                impersonate=IMPERSONATE,
+                impersonate=profile["impersonate"],
             )
         except Exception as exc:
             last_error = exc
         else:
             if resp.status_code == 200:
                 return resp.json()
+            if resp.status_code in BLOCKING_STATUS_CODES:
+                # Blokada/rate limit - NIE retry'ujemy w miejscu (patrz
+                # BlockedByServerError powyzej), to ma wyjsc jako sygnal do
+                # ograniczenia aktywnosci cyklu/daemona, nie do ponawiania
+                # zapytan.
+                raise BlockedByServerError(
+                    resp.status_code,
+                    f"HTTP {resp.status_code} (sklep {store_id}, strona {page}): {resp.text[:300]}",
+                )
             if resp.status_code not in RETRYABLE_STATUS_CODES:
                 raise RuntimeError(
                     f"HTTP {resp.status_code} (sklep {store_id}, strona {page}): {resp.text[:300]}"
@@ -659,7 +796,10 @@ def fetch_all_offers() -> tuple:
     nie przerywa calego cyklu - jest logowany i zapamietywany w
     store_errors, a pobieranie kontynuowane dla pozostalych sklepow.
     Zwraca (all_content, store_errors), gdzie store_errors to slownik
-    {store_id: opis_bledu} dla sklepow, ktore nie udalo sie pobrac."""
+    {store_id: wyjatek} dla sklepow, ktore nie udalo sie pobrac - wartosc
+    to oryginalny obiekt wyjatku (nie tekst), zeby wolajacy mogl rozpoznac
+    BlockedByServerError (HTTP 403/429) i zareagowac backoffem, patrz
+    update_blocking_backoff_state()."""
     all_content = []
     store_errors = {}
     for i, store_id in enumerate(STORE_IDS):
@@ -667,7 +807,7 @@ def fetch_all_offers() -> tuple:
             all_content.extend(fetch_store_offers(store_id))
         except Exception as exc:
             log(f"Blad pobierania sklepu {store_id}: {exc}", to_stderr=True)
-            store_errors[store_id] = str(exc)
+            store_errors[store_id] = exc
         if i < len(STORE_IDS) - 1:
             time.sleep(random.uniform(*STORE_JITTER_RANGE))
     return all_content, store_errors
@@ -1169,6 +1309,87 @@ def handle_telegram_updates() -> None:
         save_telegram_offset(max_update_id + 1)
 
 
+# ---------------- JITTER I WYKLADNICZY BACKOFF (tylko tryb daemon) ----------------
+# Licznik kolejnych CYKLI sprawdzania ofert (nie pojedynczych requestow)
+# zakonczonych HTTP 403/429 (patrz BLOCKING_STATUS_CODES) - globalnie, nie
+# per sklep, bo run_ikea_check_cycle() juz agreguje wszystkie sklepy w
+# jednym przebiegu (fetch_all_offers()) i tak decyduje o statusie calego
+# cyklu. Aktualizowany przez update_blocking_backoff_state() (wywolywane z
+# run_ikea_check_cycle() niezaleznie od RUN_MODE), ale faktyczny backoff
+# (dluzsze oczekiwanie przed kolejna proba) stosuje WYLACZNIE run_daemon() -
+# w trybie cron ten licznik jest wiec aktualizowany, ale nie ma zadnego
+# wplywu na zachowanie/kod wyjscia (patrz main()).
+CONSECUTIVE_BLOCKED_CYCLES = 0
+LAST_BLOCKED_STATUS_CODE: int | None = None
+
+
+def apply_jitter_percent(value: float, percent: float) -> float:
+    """Stosuje losowy jitter +/-percent% do danej wartosci (np. sekund
+    oczekiwania) - wynik jest losowany rownomiernie w przedziale
+    [value*(1-percent/100), value*(1+percent/100)] i nigdy nie jest
+    ujemny. percent <= 0 wylacza jitter (zwraca value bez zmian)."""
+    if percent <= 0:
+        return value
+    jitter_fraction = random.uniform(-percent, percent) / 100.0
+    return max(0.0, value * (1 + jitter_fraction))
+
+
+def compute_jittered_interval() -> float:
+    """Bazowy interwal sprawdzania ofert (CHECK_INTERVAL_SECONDS) +/- jitter
+    (CHECK_INTERVAL_JITTER_PERCENT) - patrz komentarze przy tych stalych.
+    Wywolywane WYLACZNIE z run_daemon(), przy kazdym planowaniu kolejnego
+    sprawdzenia ofert (bez aktywnego backoffu) - celem jest rozbicie
+    sztywnego, metronomicznego rytmu przy rzadkim, prywatnym monitoringu,
+    NIE zwiekszenie czestotliwosci ponad wartosc bazowa."""
+    return apply_jitter_percent(CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_JITTER_PERCENT)
+
+
+def compute_backoff_delay(failure_count: int) -> float:
+    """Wykladniczy backoff po `failure_count` kolejnych cyklach zakonczonych
+    HTTP 403/429 z rzedu: BACKOFF_BASE_SECONDS * 2^(failure_count-1),
+    ograniczony do BACKOFF_CAP_SECONDS, z jitterem (BACKOFF_JITTER_PERCENT).
+    failure_count <= 0 oznacza brak aktywnego backoffu - zwraca 0.0."""
+    if failure_count <= 0:
+        return 0.0
+    delay = BACKOFF_BASE_SECONDS * (2 ** (failure_count - 1))
+    delay = min(delay, BACKOFF_CAP_SECONDS)
+    return apply_jitter_percent(delay, BACKOFF_JITTER_PERCENT)
+
+
+def update_blocking_backoff_state(store_errors: dict) -> None:
+    """Aktualizuje CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE na
+    podstawie bledow zebranych w jednym cyklu (patrz fetch_all_offers()) -
+    store_errors mapuje storeId na oryginalny wyjatek (nie tekst), zeby
+    dalo sie rozpoznac BlockedByServerError (HTTP 403/429) i wyciagnac jego
+    status_code. Cykl bez zadnego bledu blokujacego resetuje licznik do 0,
+    NAWET jesli inne (niebloujace) bledy sklepow wystapily - to jest
+    "pierwsze udane pobranie" w rozumieniu zadania: brak sygnalu
+    blokady/rate limitu w tym cyklu."""
+    global CONSECUTIVE_BLOCKED_CYCLES, LAST_BLOCKED_STATUS_CODE
+
+    blocked_codes = sorted({
+        exc.status_code
+        for exc in store_errors.values()
+        if isinstance(exc, BlockedByServerError)
+    })
+
+    if blocked_codes:
+        CONSECUTIVE_BLOCKED_CYCLES += 1
+        LAST_BLOCKED_STATUS_CODE = blocked_codes[-1]
+        log(
+            f"Blokada/rate limit (HTTP {', '.join(str(c) for c in blocked_codes)}) - "
+            f"kolejna porazka #{CONSECUTIVE_BLOCKED_CYCLES} z rzedu.",
+            to_stderr=True,
+        )
+    elif CONSECUTIVE_BLOCKED_CYCLES:
+        log(
+            f"Pobranie bez blokady/rate limitu - resetuje licznik backoffu "
+            f"(byl na #{CONSECUTIVE_BLOCKED_CYCLES})."
+        )
+        CONSECUTIVE_BLOCKED_CYCLES = 0
+        LAST_BLOCKED_STATUS_CODE = None
+
+
 # ---------------- GLOWNA LOGIKA (jeden cykl sprawdzenia ofert) ----------------
 
 def run_ikea_check_cycle() -> int:
@@ -1179,11 +1400,20 @@ def run_ikea_check_cycle() -> int:
         )
         return 0
 
+    # Jeden spojny profil klienta (impersonate + user-agent/sec-ch-ua) na
+    # caly ten cykl - wszystkie zapytania do API IKEA w tym przebiegu
+    # (wszystkie strony, wszystkie sklepy) uzyja tego samego profilu, patrz
+    # get_active_client_profile()/CLIENT_PROFILES.
+    global CURRENT_CLIENT_PROFILE
+    CURRENT_CLIENT_PROFILE = choose_client_profile()
+
     try:
         content, store_errors = fetch_all_offers()
     except Exception as exc:
         log(f"Blad zapytania do API: {exc}", to_stderr=True)
         return 1
+
+    update_blocking_backoff_state(store_errors)
 
     if store_errors and len(store_errors) >= len(STORE_IDS):
         log(
@@ -1284,10 +1514,17 @@ def run_daemon() -> int:
     zakonczony cykl."""
     install_shutdown_signal_handlers()
     log(
-        f"Start w trybie daemon (IKEA co {CHECK_INTERVAL_SECONDS}s, "
-        f"Telegram co {TELEGRAM_POLL_INTERVAL_SECONDS}s)."
+        f"Start w trybie daemon (IKEA co ~{CHECK_INTERVAL_SECONDS}s "
+        f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, Telegram co "
+        f"{TELEGRAM_POLL_INTERVAL_SECONDS}s)."
     )
     last_ikea_check = 0.0
+    # Wartosc poczatkowa nie ma znaczenia dla PIERWSZEGO sprawdzenia (patrz
+    # nizej: last_ikea_check=0.0 + prawdziwy unix timestamp w "now" i tak
+    # zawsze przekroczy jakikolwiek rozsadny interwal) - liczy sie od
+    # momentu, gdy pierwszy cykl juz sie wykona i zaplanuje kolejny odstep
+    # (z jitterem albo, po 403/429, z backoffem).
+    next_check_interval = compute_jittered_interval()
 
     while not SHUTDOWN_EVENT.is_set():
         if TELEGRAM_ENABLED:
@@ -1300,9 +1537,24 @@ def run_daemon() -> int:
             break
 
         now = time.time()
-        if now - last_ikea_check >= CHECK_INTERVAL_SECONDS:
+        if now - last_ikea_check >= next_check_interval:
             run_ikea_check_cycle()
             last_ikea_check = now
+            if CONSECUTIVE_BLOCKED_CYCLES > 0:
+                # Backoff: konserwatywne, coraz rzadsze proby po kolejnych
+                # 403/429 z rzedu - patrz compute_backoff_delay() i
+                # update_blocking_backoff_state(). To NADPISUJE zwykly,
+                # jittered interwal, dopoki backoff nie zostanie
+                # zresetowany przez pierwsze udane pobranie.
+                next_check_interval = compute_backoff_delay(CONSECUTIVE_BLOCKED_CYCLES)
+                log(
+                    f"Backoff po HTTP {LAST_BLOCKED_STATUS_CODE} "
+                    f"(porazka #{CONSECUTIVE_BLOCKED_CYCLES} z rzedu) - "
+                    f"nastepna proba za {next_check_interval:.0f}s."
+                )
+            else:
+                next_check_interval = compute_jittered_interval()
+                log(f"Nastepne sprawdzenie ofert za {next_check_interval:.0f}s.")
 
         # event.wait(timeout) budzi sie natychmiast po ustawieniu
         # SHUTDOWN_EVENT, w przeciwienstwie do time.sleep(timeout), ktore
