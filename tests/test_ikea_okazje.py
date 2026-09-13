@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -1255,19 +1256,27 @@ class TestClientProfileSelection(unittest.TestCase):
     def test_headers_match_profile_user_agent_and_sec_ch_ua(self):
         for profile in ik.CLIENT_PROFILES:
             headers = ik.build_headers_for_profile(profile)
-            self.assertEqual(headers["user-agent"], profile["user_agent"])
-            self.assertEqual(headers["sec-ch-ua"], profile["sec_ch_ua"])
+            self.assertEqual(headers["user-agent"], profile.user_agent)
+            self.assertEqual(headers["sec-ch-ua"], profile.sec_ch_ua)
             # Wersja Chrome w user-agent musi zgadzac sie z wersja w impersonate=
-            chrome_version = profile["impersonate"].replace("chrome", "")
-            self.assertIn(f"Chrome/{chrome_version}.", profile["user_agent"])
+            chrome_version = profile.impersonate.replace("chrome", "")
+            self.assertIn(f"Chrome/{chrome_version}.", profile.user_agent)
 
     def test_all_profiles_are_supported_by_minimum_curl_cffi_version(self):
         # requirements.txt wymaga curl_cffi>=0.7.0 - profile musza byc
         # ograniczone do wersji Chrome wspieranych juz w tej minimalnej
         # wersji (chrome120/123/124), patrz komentarz przy CLIENT_PROFILES.
         supported_in_0_7_0 = {"chrome120", "chrome123", "chrome124"}
-        used = {p["impersonate"] for p in ik.CLIENT_PROFILES}
+        used = {p.impersonate for p in ik.CLIENT_PROFILES}
         self.assertTrue(used.issubset(supported_in_0_7_0))
+
+    def test_profile_is_a_frozen_dataclass_instance(self):
+        # BrowserProfile - model oparty o obiekt/dane, nie o luzny slownik
+        # (patrz README/scalenie anti_detection.py) - niezmienny (frozen).
+        profile = ik.CLIENT_PROFILES[0]
+        self.assertIsInstance(profile, ik.BrowserProfile)
+        with self.assertRaises(Exception):
+            profile.impersonate = "chrome999"
 
     def test_fetch_page_with_retry_uses_single_profile_across_calls_in_one_cycle(self):
         # Wewnatrz jednego cyklu (CURRENT_CLIENT_PROFILE juz ustawiony) kazde
@@ -1291,6 +1300,11 @@ class TestClientProfileSelection(unittest.TestCase):
         self.assertEqual(len(set(seen_impersonate)), 1)
         self.assertEqual(len(set(seen_user_agents)), 1)
         self.assertEqual(seen_impersonate[0], "chrome124")
+
+    def test_get_active_client_profile_type(self):
+        ik.CURRENT_CLIENT_PROFILE = None
+        profile = ik.get_active_client_profile()
+        self.assertIsInstance(profile, ik.BrowserProfile)
 
 
 class TestAccessNotificationState(unittest.TestCase):
@@ -1503,8 +1517,7 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.STORE_IDS = orig_store_ids
             ik.SEARCH_TERMS = orig_terms
             ik.refresh_normalized_terms()
-            ik.CONSECUTIVE_BLOCKED_CYCLES = 0
-            ik.LAST_BLOCKED_STATUS_CODE = None
+            ik.set_blocking_backoff_state(ik.BackoffState())
 
     def test_run_cycle_partial_store_failure_does_not_trigger_outage_alert(self):
         # Blad pojedynczego sklepu (nie 403/429) w cyklu z wieloma sklepami -
@@ -1578,87 +1591,193 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.STORE_IDS = orig_store_ids
             ik.SEARCH_TERMS = orig_terms
             ik.refresh_normalized_terms()
-            ik.CONSECUTIVE_BLOCKED_CYCLES = 0
-            ik.LAST_BLOCKED_STATUS_CODE = None
+            ik.set_blocking_backoff_state(ik.BackoffState())
             if os.path.exists(ik.STATE_FILE):
                 os.remove(ik.STATE_FILE)
 
 
 class TestBackoffAfterBlocking(unittest.TestCase):
-    """Wykladniczy backoff po HTTP 403/429 - narastanie, reset po sukcesie,
-    cap i deterministyczny jitter (mockowany random.uniform)."""
+    """Wykladniczy, GLOBALNY backoff po HTTP 403/429 (BackoffState) -
+    narastanie, reset po sukcesie, cap, deterministyczny jitter (mockowany
+    random.uniform), pierwszy krok >= CHECK_INTERVAL_SECONDS oraz trwalosc
+    stanu (klucz "blocking_backoff" w DYNAMIC_STATE_FILE)."""
 
     def setUp(self):
-        self._orig_consecutive = ik.CONSECUTIVE_BLOCKED_CYCLES
-        self._orig_last_status = ik.LAST_BLOCKED_STATUS_CODE
-        ik.CONSECUTIVE_BLOCKED_CYCLES = 0
-        ik.LAST_BLOCKED_STATUS_CODE = None
+        self._orig_state_dict = dict(ik.get_blocking_backoff_state().to_dict())
+        self._orig_check_interval = ik.CHECK_INTERVAL_SECONDS
+        ik.set_blocking_backoff_state(ik.BackoffState())
 
     def tearDown(self):
-        ik.CONSECUTIVE_BLOCKED_CYCLES = self._orig_consecutive
-        ik.LAST_BLOCKED_STATUS_CODE = self._orig_last_status
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_state_dict))
+        ik.CHECK_INTERVAL_SECONDS = self._orig_check_interval
 
-    def test_compute_backoff_delay_zero_when_no_failures(self):
-        self.assertEqual(ik.compute_backoff_delay(0), 0.0)
+    # --- lokalny, wykladniczy backoff (bez Retry-After) ---
 
-    def test_compute_backoff_delay_grows_exponentially_with_mocked_jitter(self):
-        with mock.patch.object(ik.random, "uniform", return_value=0.0):
-            first = ik.compute_backoff_delay(1)
-            second = ik.compute_backoff_delay(2)
-            third = ik.compute_backoff_delay(3)
+    def test_compute_local_backoff_delay_zero_when_no_failures(self):
+        self.assertEqual(ik.compute_local_backoff_delay(0), 0.0)
+
+    def test_compute_local_backoff_delay_grows_exponentially(self):
+        ik.CHECK_INTERVAL_SECONDS = 30  # ponizej BACKOFF_BASE_SECONDS, zeby nie zaklamac wyniku
+        first = ik.compute_local_backoff_delay(1)
+        second = ik.compute_local_backoff_delay(2)
+        third = ik.compute_local_backoff_delay(3)
         self.assertAlmostEqual(first, ik.BACKOFF_BASE_SECONDS)
         self.assertAlmostEqual(second, ik.BACKOFF_BASE_SECONDS * 2)
         self.assertAlmostEqual(third, ik.BACKOFF_BASE_SECONDS * 4)
         self.assertLess(first, second)
         self.assertLess(second, third)
 
-    def test_compute_backoff_delay_capped_at_maximum(self):
-        with mock.patch.object(ik.random, "uniform", return_value=0.0):
-            delay = ik.compute_backoff_delay(20)  # bardzo duzo porazek z rzedu
+    def test_compute_local_backoff_delay_capped_at_maximum(self):
+        ik.CHECK_INTERVAL_SECONDS = 30
+        delay = ik.compute_local_backoff_delay(20)  # bardzo duzo porazek z rzedu
         self.assertLessEqual(delay, ik.BACKOFF_CAP_SECONDS)
         self.assertAlmostEqual(delay, ik.BACKOFF_CAP_SECONDS)
 
-    def test_compute_backoff_delay_deterministic_jitter(self):
+    # --- wymog: pierwszy backoff nigdy nie jest krotszy od normalnego interwalu ---
+
+    def test_first_backoff_step_is_never_shorter_than_check_interval(self):
+        # Normalny interwal (2700s w tym przypadku) jest WIEKSZY niz
+        # BACKOFF_BASE_SECONDS (60s) - pierwszy krok backoffu MUSI wiec
+        # wynosic przynajmniej CHECK_INTERVAL_SECONDS, NIE 60s.
+        ik.CHECK_INTERVAL_SECONDS = 2700
+        delay = ik.compute_local_backoff_delay(1)
+        self.assertGreaterEqual(delay, 2700)
+
+    def test_effective_backoff_base_uses_larger_of_check_interval_and_base(self):
+        ik.CHECK_INTERVAL_SECONDS = 5000  # wieksze niz BACKOFF_CAP_SECONDS domyslne (1800)
+        self.assertEqual(ik.effective_backoff_base_seconds(), 5000)
+        # Cap tez musi wtedy wzrosnac >= bazy, inaczej pierwszy krok
+        # przekroczylby cap.
+        self.assertGreaterEqual(ik.effective_backoff_cap_seconds(), 5000)
+
+    def test_effective_backoff_base_falls_back_to_backoff_base_when_smaller(self):
+        ik.CHECK_INTERVAL_SECONDS = 10  # znacznie mniejsze niz BACKOFF_BASE_SECONDS
+        self.assertEqual(ik.effective_backoff_base_seconds(), ik.BACKOFF_BASE_SECONDS)
+
+    # --- jitter backoffu: tylko w gore, nigdy nie skraca ---
+
+    def test_backoff_jitter_never_shortens_value(self):
+        for _ in range(200):
+            value = 1000.0
+            jittered = ik.apply_backoff_jitter(value)
+            self.assertGreaterEqual(jittered, value)
+            self.assertLessEqual(jittered, value * (1 + ik.BACKOFF_JITTER_PERCENT / 100.0) + 1e-9)
+
+    def test_backoff_jitter_deterministic_with_mocked_random(self):
         with mock.patch.object(ik.random, "uniform", return_value=10.0) as mock_uniform:
-            delay = ik.compute_backoff_delay(1)
-        mock_uniform.assert_called_once_with(-ik.BACKOFF_JITTER_PERCENT, ik.BACKOFF_JITTER_PERCENT)
-        self.assertAlmostEqual(delay, ik.BACKOFF_BASE_SECONDS * 1.10)
+            result = ik.apply_backoff_jitter(100.0, percent=20)
+        mock_uniform.assert_called_once_with(0, 20)
+        self.assertAlmostEqual(result, 110.0)
 
-    def test_update_state_increments_on_403(self):
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 1)
-        self.assertEqual(ik.LAST_BLOCKED_STATUS_CODE, 403)
+    def test_zero_percent_jitter_returns_value_unchanged(self):
+        self.assertEqual(ik.apply_backoff_jitter(500.0, percent=0), 500.0)
 
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 2)
+    # --- finalny czas oczekiwania: max(lokalny backoff, Retry-After) + jitter w gore ---
 
-    def test_update_state_increments_on_429_same_as_403(self):
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 1)
-        self.assertEqual(ik.LAST_BLOCKED_STATUS_CODE, 429)
+    def test_final_delay_uses_local_backoff_when_larger_than_retry_after(self):
+        ik.CHECK_INTERVAL_SECONDS = 2700
+        with mock.patch.object(ik.random, "uniform", return_value=0.0):
+            delay = ik.compute_next_allowed_check_delay(1, retry_after_seconds=30)
+        self.assertAlmostEqual(delay, 2700)
 
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 2)
+    def test_final_delay_uses_retry_after_when_larger_than_local_backoff(self):
+        ik.CHECK_INTERVAL_SECONDS = 60
+        with mock.patch.object(ik.random, "uniform", return_value=0.0):
+            delay = ik.compute_next_allowed_check_delay(1, retry_after_seconds=7200)
+        self.assertAlmostEqual(delay, 7200)
 
-    def test_update_state_resets_after_success(self):
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
-        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 2)
+    def test_final_delay_jitter_never_drops_below_minimum(self):
+        ik.CHECK_INTERVAL_SECONDS = 2700
+        for _ in range(200):
+            delay = ik.compute_next_allowed_check_delay(2, retry_after_seconds=1000)
+            minimum = max(ik.compute_local_backoff_delay(2), 1000)
+            self.assertGreaterEqual(delay, minimum)
 
-        ik.update_blocking_backoff_state({})  # brak bledow - "pierwsze udane pobranie"
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 0)
-        self.assertIsNone(ik.LAST_BLOCKED_STATUS_CODE)
+    def test_final_delay_without_retry_after_equals_local_backoff_jitter(self):
+        ik.CHECK_INTERVAL_SECONDS = 2700
+        with mock.patch.object(ik.random, "uniform", return_value=0.0):
+            delay = ik.compute_next_allowed_check_delay(1, retry_after_seconds=None)
+        self.assertAlmostEqual(delay, ik.compute_local_backoff_delay(1))
 
-    def test_update_state_ignores_non_blocking_errors(self):
-        # Blad inny niz 403/429 (np. zwykly RuntimeError z retry na 5xx) nie
-        # powinien zwiekszac licznika backoffu blokady.
-        ik.update_blocking_backoff_state({"294": RuntimeError("boom")})
-        self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 0)
+    # --- Retry-After: parsowanie naglowka ---
+
+    def test_retry_after_seconds_value(self):
+        self.assertEqual(ik.parse_retry_after_header("120"), 120.0)
+
+    def test_retry_after_zero_is_valid(self):
+        self.assertEqual(ik.parse_retry_after_header("0"), 0.0)
+
+    def test_retry_after_negative_is_invalid(self):
+        self.assertIsNone(ik.parse_retry_after_header("-5"))
+
+    def test_retry_after_empty_is_invalid(self):
+        self.assertIsNone(ik.parse_retry_after_header(""))
+
+    def test_retry_after_none_is_invalid(self):
+        self.assertIsNone(ik.parse_retry_after_header(None))
+
+    def test_retry_after_garbage_is_invalid(self):
+        self.assertIsNone(ik.parse_retry_after_header("nie-liczba-ani-data"))
+
+    def test_retry_after_http_date_in_future(self):
+        from email.utils import format_datetime
+        from datetime import datetime, timedelta, timezone
+
+        future = datetime.now(timezone.utc) + timedelta(seconds=120)
+        header_value = format_datetime(future, usegmt=True)
+        seconds = ik.parse_retry_after_header(header_value)
+        self.assertIsNotNone(seconds)
+        self.assertGreater(seconds, 100)
+        self.assertLess(seconds, 140)
+
+    def test_retry_after_http_date_in_past_is_invalid(self):
+        from email.utils import format_datetime
+        from datetime import datetime, timedelta, timezone
+
+        past = datetime.now(timezone.utc) - timedelta(seconds=120)
+        header_value = format_datetime(past, usegmt=True)
+        self.assertIsNone(ik.parse_retry_after_header(header_value))
+
+    def test_fetch_page_with_retry_reads_retry_after_on_429(self):
+        fake_resp = mock.Mock(status_code=429, text="rate limited")
+        fake_resp.headers = {"retry-after": "120"}
+
+        with mock.patch.object(ik.requests, "get", return_value=fake_resp), \
+             mock.patch.object(ik.time, "sleep"):
+            with self.assertRaises(ik.BlockedByServerError) as ctx:
+                ik.fetch_page_with_retry("294", 0)
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.retry_after_seconds, 120.0)
+
+    def test_fetch_page_with_retry_ignores_invalid_retry_after(self):
+        fake_resp = mock.Mock(status_code=429, text="rate limited")
+        fake_resp.headers = {"retry-after": "not-a-number"}
+
+        with mock.patch.object(ik.requests, "get", return_value=fake_resp), \
+             mock.patch.object(ik.time, "sleep"):
+            with self.assertRaises(ik.BlockedByServerError) as ctx:
+                ik.fetch_page_with_retry("294", 0)
+
+        self.assertIsNone(ctx.exception.retry_after_seconds)
+
+    def test_fetch_page_with_retry_403_without_retry_after(self):
+        fake_resp = mock.Mock(status_code=403, text="blocked")
+        fake_resp.headers = {}
+
+        with mock.patch.object(ik.requests, "get", return_value=fake_resp), \
+             mock.patch.object(ik.time, "sleep"):
+            with self.assertRaises(ik.BlockedByServerError) as ctx:
+                ik.fetch_page_with_retry("294", 0)
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIsNone(ctx.exception.retry_after_seconds)
 
     def test_blocked_status_code_raised_immediately_without_local_retry(self):
         # fetch_page_with_retry() NIE powinien ponawiac requestu w miejscu
         # dla 403/429 - ma wyjsc natychmiast jako BlockedByServerError.
         fake_resp = mock.Mock(status_code=403, text="blocked")
+        fake_resp.headers = {}
         call_count = {"n": 0}
 
         def fake_get(*args, **kwargs):
@@ -1673,6 +1792,105 @@ class TestBackoffAfterBlocking(unittest.TestCase):
         self.assertEqual(call_count["n"], 1)
         self.assertEqual(ctx.exception.status_code, 403)
 
+    # --- update_blocking_backoff_state(): narastanie/reset + trwalosc ---
+
+    def test_update_state_increments_on_403(self):
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        state = ik.get_blocking_backoff_state()
+        self.assertEqual(state.failure_count, 1)
+        self.assertEqual(state.last_status_code, 403)
+
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        self.assertEqual(ik.get_blocking_backoff_state().failure_count, 2)
+
+    def test_update_state_increments_on_429_same_as_403(self):
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
+        state = ik.get_blocking_backoff_state()
+        self.assertEqual(state.failure_count, 1)
+        self.assertEqual(state.last_status_code, 429)
+
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
+        self.assertEqual(ik.get_blocking_backoff_state().failure_count, 2)
+
+    def test_update_state_resets_after_success(self):
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        self.assertEqual(ik.get_blocking_backoff_state().failure_count, 2)
+
+        ik.update_blocking_backoff_state({})  # brak bledow - "pierwsze udane pobranie"
+        state = ik.get_blocking_backoff_state()
+        self.assertEqual(state.failure_count, 0)
+        self.assertIsNone(state.last_status_code)
+        self.assertIsNone(state.next_allowed_check_at)
+
+    def test_update_state_ignores_non_blocking_errors(self):
+        # Blad inny niz 403/429 (np. zwykly RuntimeError z retry na 5xx) nie
+        # powinien zwiekszac licznika backoffu blokady.
+        ik.update_blocking_backoff_state({"294": RuntimeError("boom")})
+        self.assertEqual(ik.get_blocking_backoff_state().failure_count, 0)
+
+    def test_update_state_picks_longer_of_local_backoff_and_retry_after(self):
+        ik.CHECK_INTERVAL_SECONDS = 60  # male, zeby lokalny backoff byl krotszy niz Retry-After
+        before = time.time()
+        ik.update_blocking_backoff_state({
+            "294": ik.BlockedByServerError(429, "HTTP 429", retry_after_seconds=9999),
+        })
+        state = ik.get_blocking_backoff_state()
+        self.assertGreaterEqual(state.next_allowed_check_at, before + 9999 - 1)
+
+    def test_update_state_persists_retry_after_seconds(self):
+        ik.update_blocking_backoff_state({
+            "294": ik.BlockedByServerError(429, "HTTP 429", retry_after_seconds=42.0),
+        })
+        state = ik.get_blocking_backoff_state()
+        self.assertEqual(state.retry_after_seconds, 42.0)
+
+    # --- trwalosc stanu backoffu na dysku / restart procesu ---
+
+    def test_blocking_backoff_state_persists_to_dynamic_state_file(self):
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn("blocking_backoff", data)
+        self.assertEqual(data["blocking_backoff"]["failure_count"], 1)
+        self.assertEqual(data["blocking_backoff"]["last_status_code"], 403)
+        self.assertIsNotNone(data["blocking_backoff"]["next_allowed_check_at"])
+
+    def test_blocking_backoff_state_survives_simulated_restart(self):
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(429, "HTTP 429")})
+
+        # Symulacja restartu: wczytujemy DYNAMIC_STATE na nowo z dysku,
+        # tak jak initialize_runtime() robi to na starcie procesu.
+        reloaded = ik.load_dynamic_state()
+        reloaded_state = ik.BackoffState.from_dict(reloaded["blocking_backoff"])
+        self.assertEqual(reloaded_state.failure_count, 2)
+        self.assertEqual(reloaded_state.last_status_code, 429)
+        self.assertIsNotNone(reloaded_state.next_allowed_check_at)
+
+    def test_old_dynamic_state_file_without_blocking_backoff_migrates_cleanly(self):
+        # Stary plik stanu (przed tym refaktorem) bez klucza
+        # "blocking_backoff" - load_dynamic_state() musi dopisac domyslny
+        # stan (brak aktywnego backoffu) bez wyjatku i zapisac go na dysk.
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.pop("blocking_backoff", None)
+        with open(ik.DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        reloaded = ik.load_dynamic_state()
+        self.assertIn("blocking_backoff", reloaded)
+        state = ik.BackoffState.from_dict(reloaded["blocking_backoff"])
+        self.assertEqual(state.failure_count, 0)
+        self.assertIsNone(state.last_status_code)
+        self.assertIsNone(state.next_allowed_check_at)
+
+        # Migracja jest zapisana na dysk, nie tylko w pamieci.
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        self.assertIn("blocking_backoff", persisted)
+
     def test_run_ikea_check_cycle_updates_backoff_state_on_403(self):
         orig_store_ids = list(ik.STORE_IDS)
         orig_terms = list(ik.SEARCH_TERMS)
@@ -1681,25 +1899,168 @@ class TestBackoffAfterBlocking(unittest.TestCase):
         ik.refresh_normalized_terms()
         try:
             # notify_access_status() zmockowane - ten test dotyczy WYLACZNIE
-            # CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE (backoff w
-            # trybie daemon), nie alertu o utracie dostepu (patrz
-            # TestAccessNotificationState nizej) - bez tego mocka test
-            # probowalby nawiazac prawdziwe polaczenie SMTP.
+            # globalnego stanu backoffu (BackoffState), nie alertu o
+            # utracie dostepu (patrz TestAccessNotificationState wyzej) -
+            # bez tego mocka test probowalby nawiazac prawdziwe polaczenie SMTP.
             with mock.patch.object(
                 ik, "fetch_store_offers",
                 side_effect=ik.BlockedByServerError(403, "HTTP 403"),
             ), mock.patch.object(ik.time, "sleep"), \
                  mock.patch.object(ik, "notify_access_status", return_value=[]):
                 ik.run_ikea_check_cycle()
-            self.assertEqual(ik.CONSECUTIVE_BLOCKED_CYCLES, 1)
-            self.assertEqual(ik.LAST_BLOCKED_STATUS_CODE, 403)
+            state = ik.get_blocking_backoff_state()
+            self.assertEqual(state.failure_count, 1)
+            self.assertEqual(state.last_status_code, 403)
         finally:
             ik.STORE_IDS = orig_store_ids
             ik.SEARCH_TERMS = orig_terms
             ik.refresh_normalized_terms()
-            ik.CONSECUTIVE_BLOCKED_CYCLES = 0
-            ik.LAST_BLOCKED_STATUS_CODE = None
+            ik.set_blocking_backoff_state(ik.BackoffState())
             ik.set_access_notification_state(False, None)
+
+    def test_run_ikea_check_cycle_resets_backoff_after_full_success(self):
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.STORE_IDS = ["294"]
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        self.assertEqual(ik.get_blocking_backoff_state().failure_count, 1)
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        try:
+            with mock.patch.object(ik, "fetch_store_offers", return_value=[]), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.run_ikea_check_cycle()
+            state = ik.get_blocking_backoff_state()
+            self.assertEqual(state.failure_count, 0)
+            self.assertIsNone(state.next_allowed_check_at)
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
+            ik.set_access_notification_state(False, None)
+            if os.path.exists(ik.STATE_FILE):
+                os.remove(ik.STATE_FILE)
+
+
+class TestDaemonRespectsPersistedBackoff(unittest.TestCase):
+    """run_daemon() po (symulowanym) restarcie procesu respektuje zapisany,
+    trwaly termin next_allowed_check_at - bez zadnych prawdziwych requestow
+    sieciowych/SMTP/Telegrama (run_ikea_check_cycle/handle_telegram_updates
+    sa tu zawsze zmockowane) i bez rzeczywistego oczekiwania (SHUTDOWN_EVENT
+    jest ustawiany od razu po pierwszym obiegu petli)."""
+
+    def setUp(self):
+        self._orig_state_dict = dict(ik.get_blocking_backoff_state().to_dict())
+        ik.SHUTDOWN_EVENT.clear()
+
+    def tearDown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_state_dict))
+        ik.SHUTDOWN_EVENT.clear()
+
+    def test_seconds_until_next_allowed_check_none_without_backoff(self):
+        state = ik.BackoffState()
+        self.assertIsNone(ik.seconds_until_next_allowed_check(state))
+
+    def test_seconds_until_next_allowed_check_future_timestamp(self):
+        state = ik.BackoffState(failure_count=1, next_allowed_check_at=time.time() + 100)
+        remaining = ik.seconds_until_next_allowed_check(state)
+        self.assertGreater(remaining, 90)
+        self.assertLessEqual(remaining, 100)
+
+    def test_seconds_until_next_allowed_check_past_timestamp_returns_zero(self):
+        # Jesli od next_allowed_check_at minelo juz dużo czasu (proces byl
+        # zatrzymany dluzej niz trwal backoff), daemon ma sprawdzic od razu.
+        state = ik.BackoffState(failure_count=1, next_allowed_check_at=time.time() - 5000)
+        self.assertEqual(ik.seconds_until_next_allowed_check(state), 0.0)
+
+    def test_run_daemon_logs_resumed_backoff_after_restart(self):
+        # Stan zapisany na dysku PRZED startem run_daemon() (symulacja
+        # restartu procesu w trakcie aktywnego backoffu) - run_daemon() musi
+        # to wykryc i zalogowac, bez uruchamiania nowego cyklu natychmiast
+        # (SHUTDOWN_EVENT jest ustawiany zaraz na starcie petli, zanim
+        # minie next_check_interval).
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=2, last_status_code=429, next_allowed_check_at=time.time() + 999999,
+        ))
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "log") as mock_log:
+
+            def stop_after_first_wait(timeout):
+                ik.SHUTDOWN_EVENT.set()
+                return True
+
+            with mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=stop_after_first_wait):
+                ik.run_daemon()
+
+        mock_cycle.assert_not_called()
+        messages = " ".join(str(call.args[0]) for call in mock_log.call_args_list)
+        self.assertIn("restarcie", messages.lower())
+
+    def test_run_daemon_checks_immediately_when_persisted_deadline_in_past(self):
+        # next_allowed_check_at juz dawno minal - run_daemon() powinien
+        # wykonac cykl IKEA od razu (delay=0.0), zanim event.wait() zdazy
+        # cokolwiek zablokowac.
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() - 99999,
+        ))
+        call_count = {"n": 0}
+
+        def fake_cycle():
+            call_count["n"] += 1
+            ik.SHUTDOWN_EVENT.set()
+            return 0
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=fake_cycle), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", return_value=True):
+            ik.run_daemon()
+
+        self.assertEqual(call_count["n"], 1)
+
+    def test_run_daemon_uses_monotonic_clock_for_interval_accounting(self):
+        # Zamiast sprawdzac implementacje przez introspekcje, potwierdzamy
+        # zachowanie: podbicie time.monotonic() (nie time.time()) w trakcie
+        # oczekiwania powinno wywolac kolejny cykl - to demonstruje, ze
+        # petla liczy odstep wzgledem monotonic(), a nie zegara sciennego.
+        fake_monotonic_value = {"t": 1000.0}
+
+        def fake_monotonic():
+            return fake_monotonic_value["t"]
+
+        call_count = {"n": 0}
+
+        def fake_cycle():
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                ik.SHUTDOWN_EVENT.set()
+            return 0
+
+        def fake_wait(timeout):
+            # Kazde "oczekiwanie" przesuwa zegar monotoniczny naprzod,
+            # symulujac uplyw czasu bez prawdziwego time.sleep().
+            fake_monotonic_value["t"] += 10
+            return ik.SHUTDOWN_EVENT.is_set()
+
+        ik.set_blocking_backoff_state(ik.BackoffState())
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=fake_cycle), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 5), \
+             mock.patch.object(ik, "CHECK_INTERVAL_JITTER_PERCENT", 0), \
+             mock.patch.object(ik.time, "monotonic", side_effect=fake_monotonic), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=fake_wait):
+            ik.run_daemon()
+
+        self.assertGreaterEqual(call_count["n"], 2)
 
 
 if __name__ == "__main__":
