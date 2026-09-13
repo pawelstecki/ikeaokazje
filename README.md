@@ -372,42 +372,137 @@ przeglądarce, a nie do ciągłego, metronomicznego odpytywania:
 
 - **Jitter interwału.** Zamiast sztywnego, w pełni przewidywalnego odstępu
   między sprawdzeniami, rzeczywisty odstęp to `CHECK_INTERVAL_SECONDS`
-  losowo zmieniony o do ±25% (`CHECK_INTERVAL_JITTER_PERCENT` w kodzie).
-  Np. dla domyślnych 45 minut rzeczywisty odstęp wynosi gdzieś między
-  ok. 34 a 56 minutami, inny przy każdym cyklu. To nie zwiększa
-  częstotliwości sprawdzania - tylko rozbija sztywny rytm requestów.
+  losowo zmieniony o do ±25% (`CHECK_INTERVAL_JITTER_PERCENT` w kodzie) -
+  **w obie strony**, czyli realny odstęp może wypaść i krócej, i dłużej
+  niż wartość bazowa (dla domyślnych 45 minut: gdzieś między ok. 34 a
+  56 minutami, inny przy każdym cyklu). Celem jest rozbicie sztywnego,
+  przewidywalnego rytmu requestów - nie systematyczne zwiększenie
+  częstotliwości sprawdzania (w długim okresie średnia i tak wypada
+  blisko wartości bazowej). Ten jitter dotyczy **wyłącznie** normalnego,
+  nieblokowanego interwału - backoff po 403/429 (patrz niżej) używa
+  **innego**, jednostronnego jitteru, który nigdy nie skraca oczekiwania.
 - **Spójny profil klienta na cykl.** Skrypt losuje jeden profil klienta
-  (`impersonate` + zgodny `User-Agent`/`sec-ch-ua`, patrz
-  `CLIENT_PROFILES` w kodzie) na początek każdego cyklu i używa go
-  konsekwentnie dla wszystkich zapytań w tym cyklu (wszystkie strony,
-  wszystkie sklepy) - żadnego mieszania profili w ramach jednej sekwencji
-  requestów.
-- **Wykładniczy backoff po 403/429.** Jeśli IKEA odpowie HTTP 403 albo 429
-  (blokada Akamai / rate limit), skrypt **nie próbuje tego obchodzić** -
-  zamiast tego kolejne cykle z rzędu zakończone takim błędem wydłużają
-  odstęp do następnej próby: `60s, 120s, 240s, ...` aż do maks. `1800s`
-  (30 minut), z dodatkowym jitterem. Licznik resetuje się do zera po
-  pierwszym udanym pobraniu. W logach zobaczysz np.:
+  (`impersonate` + zgodny `User-Agent`/`sec-ch-ua`, model `BrowserProfile`,
+  patrz stała `CLIENT_PROFILES` w kodzie) na początek każdego cyklu i
+  używa go konsekwentnie dla wszystkich zapytań w tym cyklu (wszystkie
+  strony, wszystkie sklepy) - żadnego mieszania profili w ramach jednej
+  sekwencji requestów.
+- **Globalny, wykładniczy backoff po 403/429 - wspólny dla całego
+  procesu, nie per sklep.** IKEA odpytywana jest przez **jeden, wspólny
+  endpoint/API** dla wszystkich sklepów (`web-api.ikea.com/circular/...`) -
+  jeśli ten endpoint odpowie HTTP 403 (blokada Akamai) albo 429 (rate
+  limit), to jest to blokada klienta wobec **tego serwera jako całości**,
+  niezależnie od tego, który `storeId` akurat odpytywano. Dlatego backoff
+  jest liczony **globalnie dla całego monitora**, a nie osobno dla
+  każdego `STORE_IDS` - wybór innego sklepu w kolejnym cyklu **nie
+  omija** tej blokady i nie resetuje licznika. Skrypt **nie próbuje tego
+  obchodzić** - zamiast tego kolejne cykle z rzędu zakończone 403/429
+  (na **wszystkich** skonfigurowanych sklepach - patrz "Alert o utracie i
+  odzyskaniu dostępu" niżej dla precyzyjnej definicji) wydłużają globalny
+  odstęp do następnej próby.
+
+  **Pierwszy krok backoffu nigdy nie jest krótszy od zwykłego
+  `CHECK_INTERVAL_SECONDS`** - to jest istotne: błąd dostępu nie może
+  paradoksalnie *zwiększyć* częstotliwości zapytań względem normalnej
+  pracy. Kolejne, następujące po sobie blokady podwajają ten odstęp
+  (`CHECK_INTERVAL_SECONDS, 2×, 4×, 8×, ...`), aż do capu, który jest
+  zawsze **większy lub równy** pierwszemu krokowi. Domyślne stałe w
+  kodzie (`BACKOFF_BASE_SECONDS=60s`, `BACKOFF_CAP_SECONDS=1800s`) są więc
+  tylko **dolnymi granicami** - jeśli masz ustawiony dłuższy
+  `CHECK_INTERVAL_SECONDS` (np. 2700s domyślnie), backoff automatycznie
+  startuje od tej większej wartości, nie od 60s. Do tego wyliczonego
+  backoffu jest dodawany jitter (`BACKOFF_JITTER_PERCENT`), ale **tylko w
+  górę** - jitter backoffu nigdy nie skraca finalnego czasu oczekiwania
+  poniżej wyliczonego minimum (w odróżnieniu od jitteru normalnego
+  interwału opisanego wyżej, który jest symetryczny). Stan (licznik
+  kolejnych blokad, ostatni kod HTTP, wyliczony termin kolejnej próby)
+  resetuje się do zera po pierwszym w pełni udanym cyklu (wszystkie
+  skonfigurowane sklepy pobrane bez błędu). W logach zobaczysz np.:
   ```
-  Blokada/rate limit (HTTP 403) - kolejna porazka #2 z rzedu.
-  Backoff po HTTP 403 (porazka #2 z rzedu) - nastepna proba za 118s.
+  Blokada/rate limit HTTP 429: porazka #3.
+  Lokalny backoff: 5400 s; Retry-After: 7200 s; nastepna proba nie wcześniej niż za 7200 s.
   ```
-  Ten backoff dotyczy **wyłącznie trybu `daemon`** - w trybie `cron`
-  każde wywołanie skryptu to jedno, niezależne przejście i kody wyjścia
-  się nie zmieniają (patrz "Dwa tryby pracy" wyżej).
+  Ten backoff **wpływa na harmonogram wyłącznie w trybie `daemon`** - w
+  trybie `cron` stan jest tak samo aktualizowany i zapisywany na dysk
+  (patrz "Trwały backoff po 403/429" niżej), ale nie ma wpływu na
+  zachowanie/kod wyjścia tego jednego przebiegu (każde wywołanie skryptu
+  w trybie `cron` to wciąż jedno, niezależne przejście - patrz "Dwa tryby
+  pracy" wyżej).
+- **Nagłówek `Retry-After`.** Jeśli odpowiedź HTTP 403/429 zawiera
+  nagłówek `Retry-After`, skrypt go odczytuje i respektuje - obsługiwane
+  są zarówno liczba sekund (`Retry-After: 120`), jak i data HTTP
+  (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Błędna, ujemna, pusta
+  albo nieobsługiwana wartość jest cicho traktowana jak brak nagłówka
+  (bez przerywania obsługi błędu). **Rzeczywisty termin kolejnej próby to
+  WIĘKSZA z dwóch wartości: lokalnie wyliczonego backoffu (opisanego
+  wyżej) i `Retry-After` podanego przez serwer** - skrypt nigdy nie
+  próbuje wcześniej, niż wskazuje którakolwiek z tych dwóch wartości.
+  Dla HTTP 403 `Retry-After` jest opcjonalny (Akamai zwykle go nie
+  wysyła) - jeśli go nie ma, liczy się wyłącznie lokalny backoff.
 
 **Ważne: to nie jest mechanizm obchodzenia blokad.** Celem jitteru,
-spójnego profilu klienta i backoffu jest to, żeby prywatny monitor
-zachowywał się możliwie blisko sporadycznego, ręcznego sprawdzania strony
-w przeglądarce - nie zwiększenie skuteczności automatycznego dostępu po
-odmowie. Jeśli IKEA konsekwentnie blokuje żądania, skrypt będzie próbował
-coraz rzadziej i zostawi to jasno w logach, zamiast "przepychać" ruch.
+spójnego profilu klienta, globalnego backoffu i respektowania
+`Retry-After` jest to, żeby prywatny monitor zachowywał się możliwie
+blisko sporadycznego, ręcznego sprawdzania strony w przeglądarce - nie
+zwiększenie skuteczności automatycznego dostępu po odmowie. Jeśli IKEA
+konsekwentnie blokuje żądania, skrypt będzie próbował coraz rzadziej i
+zostawi to jasno w logach, zamiast "przepychać" ruch.
+
+#### Trwały backoff po 403/429 (przetrwa restart procesu/systemd)
+
+Stan globalnego backoffu opisanego wyżej (licznik kolejnych blokad,
+ostatni kod HTTP, wyliczony termin `next_allowed_check_at`, ewentualny
+`Retry-After`) **nie żyje wyłącznie w pamięci procesu** - jest trwale
+zapisywany w tym samym pliku dynamicznego stanu, w którym żyje też lista
+sklepów/słów kluczowych (`~/.ikea_okazje_dynamic.json`, klucz
+`blocking_backoff`), tym samym, atomowym mechanizmem zapisu (plik
+tymczasowy + `os.replace`) co pozostałe pola tego pliku.
+
+Konsekwencje:
+
+- **Restart procesu albo usługi systemd w trakcie aktywnej blokady NIE
+  resetuje backoffu.** Jeśli monitor został zatrzymany (albo padł) w
+  trakcie oczekiwania po 403/429, po ponownym starcie odczyta zapisany
+  termin `next_allowed_check_at` i będzie czekał do tego samego,
+  pierwotnie wyliczonego momentu - restart nie jest sposobem na
+  "przyspieszenie" kolejnej próby.
+- **Jeśli od zapisanego terminu minęło już bardzo dużo czasu** (np.
+  usługa była zatrzymana przez wiele godzin), daemon nie czeka
+  dodatkowo - wykonuje kontrolę od razu przy starcie.
+- Zapis na dysk następuje po **każdym** wykrytym 403/429 (aktualizacja
+  licznika i terminu) oraz po **każdym** pełnym, udanym cyklu (reset do
+  stanu "brak backoffu").
+- **Istniejące pliki dynamicznego stanu z wcześniejszych wersji skryptu**
+  (bez klucza `blocking_backoff`) są automatycznie i bezpiecznie
+  migrowane - przy najbliższym uruchomieniu skrypt dopisze domyślny,
+  "pusty" stan backoffu (bez błędu) i zapisze poprawną strukturę z
+  powrotem na dysk, tak jak już wcześniej robił to dla `store_ids` i
+  `ikea_access_notification`.
+- Ten stan backoffu jest **czymś innym** niż opisywany niżej alert o
+  utracie/odzyskaniu dostępu (`ikea_access_notification`) - obie
+  struktury żyją w tym samym pliku JSON, ale mają niezależną
+  odpowiedzialność: backoff opisuje **harmonogram** kolejnych zapytań do
+  API, alert opisuje **jednorazowe powiadomienie** wysyłane Tobie. Zmiana
+  jednej z nich nie wpływa na drugą.
+
+Technicznie: do zapisu na dysk używany jest czas ścienny (`time.time()`,
+epoch) - `time.monotonic()` (używany do faktycznego odliczania interwału
+w działającej pętli `run_daemon()`) nie jest przenośny między restartami
+procesu (jego "zero" jest umowne, per-proces), więc nie nadaje się do
+zapisu trwałego. Po starcie zapisany, ścienny `next_allowed_check_at`
+jest przeliczany jednorazowo na pozostały czas oczekiwania, a dalsze
+odliczanie w pętli i tak korzysta wyłącznie z `time.monotonic()` - skok
+zegara systemowego/NTP w trakcie działania procesu nie przyspiesza ani
+nie opóźnia zaplanowanej kontroli. Znacznik czasu ostatniego sprawdzenia
+jest ustawiany **po** zakończeniu cyklu (nie przed nim), więc czas
+trwania samego pobierania nie skraca kolejnego interwału.
 
 #### Alert o utracie i odzyskaniu dostępu (HTTP 403/429)
 
 Niezależnie od backoffu opisanego wyżej (który dotyczy tylko odstępu
-między próbami w trybie `daemon`), skrypt wysyła też - przez te same,
-już skonfigurowane kanały (e-mail i/albo Telegram) - krótkie
+między próbami w trybie `daemon` i żyje w osobnym polu pliku stanu,
+patrz "Trwały backoff po 403/429" wyżej), skrypt wysyła też - przez te
+same, już skonfigurowane kanały (e-mail i/albo Telegram) - krótkie
 powiadomienie o **stanie dostępu** do danych IKEA:
 
 - Jeśli **cały** cykl sprawdzania nie pobrał danych z żadnego
@@ -542,8 +637,18 @@ do wielokrotnego wywołania), łagodne zatrzymanie pętli daemona po
 `SIGTERM`/`SIGINT`, deterministyczny jitter interwału sprawdzania (z
 mockowanym `random`) i jego zakres, wybór spójnego profilu klienta na
 cykl (i zgodność `User-Agent`/`sec-ch-ua` z tym profilem, bez żadnych
-prawdziwych requestów sieciowych), wykładniczy backoff po HTTP
-403/429 (narastanie, reset po sukcesie, cap, deterministyczny jitter),
+prawdziwych requestów sieciowych), globalny, wykładniczy backoff po HTTP
+403/429 (`BackoffState` - narastanie, reset po sukcesie, cap,
+jednostronny jitter, pierwszy krok nigdy krótszy niż
+`CHECK_INTERVAL_SECONDS`), parsowanie nagłówka `Retry-After` (liczba
+sekund, data HTTP, wartości błędne/ujemne/puste), wybór dłuższego z
+lokalnego backoffu i `Retry-After`, trwałość stanu backoffu w pliku
+dynamicznego stanu (klucz `blocking_backoff` - migracja starych plików
+bez tego klucza, zapis po każdej blokadzie i po pełnym sukcesie,
+odtworzenie harmonogramu po symulowanym restarcie procesu), respektowanie
+przez `run_daemon()` zapisanego terminu `next_allowed_check_at` po
+restarcie (w tym natychmiastową kontrolę, gdy termin już minął) oraz
+odliczanie interwału w pętli daemona względem `time.monotonic()`,
 domyślny interwał `CHECK_INTERVAL_SECONDS` (45 minut) i jego
 nadpisywanie przez `.env`, oraz alert o utracie/odzyskaniu dostępu przy
 403/429 (dokładnie jedno powiadomienie w każdą stronę, tłumienie
@@ -578,13 +683,18 @@ wszystkie sposoby odpalania używają tego samego pliku blokady `flock`.
 
 **Blokada Cloudflare/Akamai / 403 albo 429.** Sprawdź, czy każdy profil w
 `CLIENT_PROFILES` ma zgodną wersję Chrome między `impersonate` a
-`User-Agent`/`sec-ch-ua`. W trybie `daemon` powtarzające się 403/429
-włączają automatycznie coraz dłuższy backoff (patrz "Rzadkie, prywatne
-sprawdzanie: jitter i backoff" wyżej) - to jest zamierzone, konserwatywne
+`User-Agent`/`sec-ch-ua`. Pamiętaj, że blokada dotyczy **wspólnego
+endpointu/API IKEA**, nie pojedynczego sklepu - backoff jest więc globalny
+dla całego monitora, niezależnie od tego, ile sklepów masz w `STORE_IDS`
+(patrz "Rzadkie, prywatne sprawdzanie: jitter i backoff" wyżej). W trybie
+`daemon` powtarzające się 403/429 włączają automatycznie coraz dłuższy,
+**trwały** backoff (przetrwa restart procesu/usługi systemd, patrz
+"Trwały backoff po 403/429" wyżej), który respektuje też nagłówek
+`Retry-After`, jeśli serwer go zwróci - to jest zamierzone, konserwatywne
 zachowanie, nie błąd; skrypt celowo nie próbuje obchodzić takiej blokady.
 Dostaniesz też jedno powiadomienie o utracie dostępu, jeśli cały cykl nie
 pobierze danych z żadnego sklepu z tego powodu (patrz "Alert o utracie i
-odzyskaniu dostępu" wyżej).
+odzyskaniu dostępu" wyżej) - to jest osobny mechanizm od backoffu.
 
 **`Size must be less than or equal to 64`.** `PAGE_SIZE` już jest na `64`.
 
