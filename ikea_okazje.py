@@ -46,11 +46,13 @@ Wymagania:
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import signal
 import threading
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import smtplib
 import ssl
 import sys
@@ -60,6 +62,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
 
 from curl_cffi import requests
 
@@ -97,11 +100,33 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 2700
 # (jitter nigdy nie skraca efektywnego interwalu ponizej tego zakresu).
 CHECK_INTERVAL_JITTER_PERCENT = 25
 
-# Wykladniczy backoff PO CYKLU zakonczonym HTTP 403/429 (patrz
-# compute_backoff_delay(), LAST_BLOCKED_STATUS_CODES i run_daemon()) -
-# dotyczy WYLACZNIE trybu daemon, nie trybu cron (patrz run_ikea_check_cycle()
-# i main()). Celem jest zmniejszenie, nie zwiekszenie aktywnosci: kolejne
-# porazki z rzedu wydluzaja odstep miedzy probami do BACKOFF_CAP_SECONDS.
+# Wykladniczy backoff PO CYKLU zakonczonym HTTP 403/429 - GLOBALNY dla
+# calego procesu/monitora (NIE per store_id, patrz BackoffState i
+# update_blocking_backoff_state() nizej): IKEA jest odpytywana przez jeden,
+# wspolny endpoint/API dla wszystkich sklepow, wiec 403/429 oznacza blokade
+# calego klienta wobec TEGO serwera, niezaleznie od tego, ktory store_id
+# akurat probowal - wybor innego sklepu w kolejnym cyklu nie omija tej
+# blokady. Stan backoffu jest TRWALE zapisywany w DYNAMIC_STATE_FILE (klucz
+# "blocking_backoff"), wiec restart procesu/uslugi systemd w trakcie
+# aktywnej blokady NIE resetuje juz wyliczonego harmonogramu - patrz
+# README, "Trwaly backoff po 403/429".
+#
+# BACKOFF_BASE_SECONDS to DOLNA granica pierwszego kroku backoffu - patrz
+# effective_backoff_base_seconds(), ktora zwraca WIEKSZA z tej wartosci i
+# CHECK_INTERVAL_SECONDS. Dzieki temu PIERWSZA proba po wykryciu blokady
+# nigdy nie nastapi WCZESNIEJ niz normalny, skonfigurowany interwal
+# sprawdzania ofert (wymog: backoff ma zmniejszac, nie zwiekszac ruch po
+# odmowie dostepu). BACKOFF_CAP_SECONDS to DOLNA granica capu backoffu -
+# patrz effective_backoff_cap_seconds(), ktora zwraca WIEKSZA z tej
+# wartosci i efektywnej bazy, zeby cap nigdy nie wypadl NIZEJ niz pierwszy
+# krok (np. przy bardzo dlugim CHECK_INTERVAL_SECONDS w .env).
+#
+# BACKOFF_JITTER_PERCENT jest stosowany WYLACZNIE w gore (patrz
+# apply_backoff_jitter()) - w odroznieniu od CHECK_INTERVAL_JITTER_PERCENT
+# (symetryczny +/-, dla normalnego, nieblokowanego interwalu), jitter
+# backoffu NIE MOZE skrocic finalnego czasu oczekiwania (lokalny backoff
+# scalony z Retry-After, patrz compute_next_allowed_check_delay()) - tylko
+# ewentualnie go wydluzyc.
 BACKOFF_BASE_SECONDS = 60.0
 BACKOFF_CAP_SECONDS = 1800.0
 BACKOFF_JITTER_PERCENT = 20
@@ -126,39 +151,52 @@ BASE_HEADERS = {
     "sec-gpc": "1",
 }
 
-# Profile klienta (impersonate curl_cffi + zgodny User-Agent/sec-ch-ua).
+# Profil klienta (impersonate curl_cffi + zgodny User-Agent/sec-ch-ua) -
+# model oparty o obiekt (BrowserProfile), nie o luzny slownik, zeby pola
+# byly niezmienne (frozen dataclass) i zeby dostep do nich (profile.impersonate,
+# profile.user_agent, profile.sec_ch_ua) byl czytelny i bezpieczny (literowka w
+# nazwie pola jest bledem w czasie definicji/testow, nie cichym KeyError/None
+# w czasie dzialania). Odpowiednik BrowserProfile z poprzedniego,
+# oddzielnego modulu anti_detection.py - scalony tutaj, patrz README.
+@dataclass(frozen=True)
+class BrowserProfile:
+    impersonate: str
+    user_agent: str
+    sec_ch_ua: str
+
+
 # Ograniczone do chrome120/123/124 - to jedyne wersje Chrome, ktorych
 # impersonacja jest wspierana we WSZYSTKICH wersjach curl_cffi od minimalnej
 # wymaganej w requirements.txt (curl_cffi>=0.7.0). Nie dodawaj tu nowszych
 # profili (np. chrome131/133a/136) bez jednoczesnego podniesienia dolnej
 # granicy w requirements.txt - patrz README. Wybor profilu na cykl robi
 # choose_client_profile(), naglowki dla wybranego profilu build_headers_for_profile().
-CLIENT_PROFILES = [
-    {
-        "impersonate": "chrome120",
-        "user_agent": (
+CLIENT_PROFILES: tuple[BrowserProfile, ...] = (
+    BrowserProfile(
+        impersonate="chrome120",
+        user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "sec_ch_ua": '"Chromium";v="120", "Not_A Brand";v="8", "Google Chrome";v="120"',
-    },
-    {
-        "impersonate": "chrome123",
-        "user_agent": (
+        sec_ch_ua='"Chromium";v="120", "Not_A Brand";v="8", "Google Chrome";v="120"',
+    ),
+    BrowserProfile(
+        impersonate="chrome123",
+        user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
         ),
-        "sec_ch_ua": '"Google Chrome";v="123", "Not(A:Brand";v="24", "Chromium";v="123"',
-    },
-    {
-        "impersonate": "chrome124",
-        "user_agent": (
+        sec_ch_ua='"Google Chrome";v="123", "Not(A:Brand";v="24", "Chromium";v="123"',
+    ),
+    BrowserProfile(
+        impersonate="chrome124",
+        user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "sec_ch_ua": '"Chromium";v="124", "Not?A_Brand";v="24", "Google Chrome";v="124"',
-    },
-]
+        sec_ch_ua='"Chromium";v="124", "Not?A_Brand";v="24", "Google Chrome";v="124"',
+    ),
+)
 
 # Profil klienta HTTP/TLS wybrany dla AKTUALNEGO cyklu monitoringu (patrz
 # choose_client_profile()) - ustawiany raz na poczatku run_ikea_check_cycle(),
@@ -166,7 +204,62 @@ CLIENT_PROFILES = [
 # wszystkie zapytania (wszystkie strony, wszystkie sklepy) w ramach jednego
 # przebiegu uzywaly tego samego, spojnego zestawu naglowkow i fingerprintu
 # TLS/JA3. None przed pierwszym wywolaniem choose_client_profile().
-CURRENT_CLIENT_PROFILE: dict | None = None
+CURRENT_CLIENT_PROFILE: "BrowserProfile | None" = None
+
+
+# Stan GLOBALNEGO backoffu po HTTP 403/429 (blokada/rate limit wspolnego
+# endpointu/API IKEA - patrz komentarz przy BACKOFF_BASE_SECONDS powyzej) -
+# model oparty o obiekt (BackoffState), zamiast luznych globali procesu
+# (poprzednio CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE), zeby caly
+# stan mial jedna, spojna reprezentacje, ktora da sie:
+#   (a) trywialnie zserializowac do/z DYNAMIC_STATE_FILE (patrz to_dict()/
+#       from_dict() nizej i klucz "blocking_backoff" w load_dynamic_state()),
+#       co jest wymagane, zeby restart procesu/uslugi systemd w trakcie
+#       aktywnej blokady NIE zerowal juz wyliczonego harmonogramu;
+#   (b) testowac bez dotykania globalnych zmiennych modulu.
+#
+# next_allowed_check_at to czas SCIENNY (epoch, time.time()) kolejnej
+# dozwolonej proby - NIE time.monotonic(), bo monotonic() nie przetrwa
+# restartu procesu (jego "zero" jest arbitralne per-proces). Runtime
+# (run_daemon()) odczytuje ta wartosc WYLACZNIE do przeliczenia jej na
+# pozostały czas oczekiwania w chwili startu/aktualizacji stanu - a
+# samo odliczanie interwalu w petli daemona i tak korzysta z
+# time.monotonic() (patrz seconds_until_next_allowed_check() i run_daemon()),
+# zeby skoki zegara systemowego/NTP nie zmienialy dlugosci juz
+# zaplanowanego oczekiwania.
+@dataclass
+class BackoffState:
+    failure_count: int = 0
+    last_status_code: "int | None" = None
+    next_allowed_check_at: "float | None" = None
+    retry_after_seconds: "float | None" = None
+
+    def to_dict(self) -> dict:
+        return {
+            "failure_count": self.failure_count,
+            "last_status_code": self.last_status_code,
+            "next_allowed_check_at": self.next_allowed_check_at,
+            "retry_after_seconds": self.retry_after_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data) -> "BackoffState":
+        """Odtwarza BackoffState z dict wczytanego z JSON. Odporne na
+        brakujace/None pola (np. stary plik stanu bez tego klucza wcale,
+        patrz default_blocking_backoff_state_dict()/load_dynamic_state())."""
+        if not isinstance(data, dict):
+            return cls()
+        try:
+            failure_count = int(data.get("failure_count") or 0)
+        except (TypeError, ValueError):
+            failure_count = 0
+        return cls(
+            failure_count=max(0, failure_count),
+            last_status_code=data.get("last_status_code"),
+            next_allowed_check_at=data.get("next_allowed_check_at"),
+            retry_after_seconds=data.get("retry_after_seconds"),
+        )
+
 
 STATE_FILE = os.path.expanduser("~/.ikea_okazje_seen_offers.json")
 RAW_DUMP_FILE = os.path.expanduser("~/.ikea_okazje_last_raw.json")
@@ -459,33 +552,49 @@ def default_access_notification_state() -> dict:
     return {"outage_active": False, "last_status_code": None}
 
 
+def default_blocking_backoff_state_dict() -> dict:
+    """Domyslny, "pusty" stan bloku 'blocking_backoff' (patrz
+    BackoffState/get_blocking_backoff_state() nizej) - brak aktywnego
+    backoffu po 403/429. Uzywany do zasiania nowego pliku stanu i jako
+    fallback dla starszych plikow stanu (bez tego klucza) - patrz
+    load_dynamic_state(). Odrebny od 'ikea_access_notification' powyzej:
+    ten blok trzyma harmonogram GLOBALNEGO backoffu calego procesu/API
+    (ile sekund czekac przed kolejna proba), nie stan alertu o
+    utracie/odzyskaniu dostepu wysylanego uzytkownikowi."""
+    return BackoffState().to_dict()
+
+
 def load_dynamic_state() -> dict:
     """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/
     STORE_IDS z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
     pierwszym razie nie jest juz zrodlem prawdy dla tych list (zmieniaj je
     odtad komendami w Telegramie albo edytujac ten plik). Jesli plik juz
-    istnieje, ale nie ma jeszcze klucza "store_ids" albo
-    "ikea_access_notification" (starsza wersja stanu), dopisujemy brakujace
+    istnieje, ale nie ma jeszcze klucza "store_ids", "ikea_access_notification"
+    albo "blocking_backoff" (starsza wersja stanu), dopisujemy brakujace
     klucze (z .env albo z domyslnego, "pustego" stanu) i zapisujemy z
-    powrotem na dysk - stare pliki stanu bez tego bloku nadal dzialaja bez
-    wyjatku."""
+    powrotem na dysk - stare pliki stanu bez tych blokow nadal dzialaja bez
+    wyjatku (migracja "w miejscu", bez utraty danych juz obecnych w pliku)."""
     if os.path.exists(DYNAMIC_STATE_FILE):
         with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         had_store_ids = "store_ids" in data
         had_access_notification = "ikea_access_notification" in data
+        had_blocking_backoff = "blocking_backoff" in data
         raw_article_numbers = data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS))
         normalized_article_numbers = normalize_article_numbers(raw_article_numbers)
         access_notification = data.get("ikea_access_notification") or default_access_notification_state()
+        blocking_backoff = data.get("blocking_backoff") or default_blocking_backoff_state_dict()
         state = {
             "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
             "search_article_numbers": normalized_article_numbers,
             "store_ids": data.get("store_ids", list(BASE_STORE_IDS)),
             "ikea_access_notification": access_notification,
+            "blocking_backoff": blocking_backoff,
         }
         if (
             not had_store_ids
             or not had_access_notification
+            or not had_blocking_backoff
             or normalized_article_numbers != raw_article_numbers
         ):
             save_dynamic_state(state)
@@ -495,6 +604,7 @@ def load_dynamic_state() -> dict:
         "search_article_numbers": list(BASE_SEARCH_ARTICLE_NUMBERS),
         "store_ids": list(BASE_STORE_IDS),
         "ikea_access_notification": default_access_notification_state(),
+        "blocking_backoff": default_blocking_backoff_state_dict(),
     }
     save_dynamic_state(state)
     return state
@@ -517,6 +627,27 @@ def set_access_notification_state(outage_active: bool, last_status_code) -> None
         "outage_active": outage_active,
         "last_status_code": last_status_code,
     }
+    save_dynamic_state(DYNAMIC_STATE)
+
+
+def get_blocking_backoff_state() -> BackoffState:
+    """Zwraca aktualny, TRWALY stan globalnego backoffu (klucz
+    'blocking_backoff' w DYNAMIC_STATE, patrz load_dynamic_state()) jako
+    BackoffState - odrebny od 'ikea_access_notification'
+    (get_access_notification_state()): ten stan opisuje harmonogram
+    kolejnej dozwolonej proby zapytania do API IKEA (wylacznie), nie stan
+    powiadomienia uzytkownika o utracie/odzyskaniu dostepu."""
+    return BackoffState.from_dict(DYNAMIC_STATE.get("blocking_backoff"))
+
+
+def set_blocking_backoff_state(state: BackoffState) -> None:
+    """Aktualizuje i trwale zapisuje (na dysk, w DYNAMIC_STATE_FILE) stan
+    globalnego backoffu - patrz update_blocking_backoff_state(). Zapis na
+    dysk (a nie tylko w pamieci procesu) jest tym, co gwarantuje, ze
+    restart procesu/uslugi systemd w trakcie aktywnej blokady 403/429 NIE
+    resetuje juz wyliczonego harmonogramu (next_allowed_check_at) - patrz
+    README, "Trwaly backoff po 403/429"."""
+    DYNAMIC_STATE["blocking_backoff"] = state.to_dict()
     save_dynamic_state(DYNAMIC_STATE)
 
 
@@ -690,7 +821,7 @@ def store_display_name(store_id) -> str:
 
 # ---------------- SPOJNY PROFIL KLIENTA (impersonate + naglowki) ----------------
 
-def choose_client_profile() -> dict:
+def choose_client_profile() -> BrowserProfile:
     """Losuje jeden profil z CLIENT_PROFILES. Wywolywane co najwyzej raz na
     cykl monitoringu (patrz run_ikea_check_cycle() - ustawia
     CURRENT_CLIENT_PROFILE na poczatku cyklu), NIGDY miedzy pojedynczymi
@@ -699,7 +830,7 @@ def choose_client_profile() -> dict:
     return random.choice(CLIENT_PROFILES)
 
 
-def get_active_client_profile() -> dict:
+def get_active_client_profile() -> BrowserProfile:
     """Zwraca profil klienta aktywny dla aktualnego cyklu (CURRENT_CLIENT_PROFILE).
     Jesli nic go jeszcze nie ustawilo (np. wywolanie fetch_* poza
     run_ikea_check_cycle(), tak jak w niektorych testach), losuje i
@@ -710,15 +841,15 @@ def get_active_client_profile() -> dict:
     return CURRENT_CLIENT_PROFILE
 
 
-def build_headers_for_profile(profile: dict) -> dict:
+def build_headers_for_profile(profile: BrowserProfile) -> dict:
     """Buduje kompletny slownik naglowkow HTTP dla danego profilu klienta -
     BASE_HEADERS (wspolne, niezalezne od przegladarki) plus user-agent i
     sec-ch-ua zgodne z tym konkretnym profilem (patrz CLIENT_PROFILES).
     Wylacznie o wewnetrznej spojnosci naglowkow z fingerprintem TLS/JA3
     wybranym przez impersonate= - nie o obchodzeniu zabezpieczen."""
     headers = dict(BASE_HEADERS)
-    headers["user-agent"] = profile["user_agent"]
-    headers["sec-ch-ua"] = profile["sec_ch_ua"]
+    headers["user-agent"] = profile.user_agent
+    headers["sec-ch-ua"] = profile.sec_ch_ua
     return headers
 
 
@@ -738,12 +869,60 @@ class BlockedByServerError(RuntimeError):
     bledu serwera (5xx, patrz RETRYABLE_STATUS_CODES). NIE jest retry'owany
     wewnatrz fetch_page_with_retry() - wychodzi natychmiast na wierch, zeby
     run_ikea_check_cycle()/run_daemon() mogly zareagowac zmniejszeniem
-    czestotliwosci (backoff, patrz compute_backoff_delay()), a nie
-    "przepychaniem" kolejnych prob w tej samej sekundzie."""
+    czestotliwosci (backoff, patrz BackoffState/compute_next_allowed_check_delay()), a
+    nie "przepychaniem" kolejnych prob w tej samej sekundzie.
 
-    def __init__(self, status_code: int, message: str):
+    retry_after_seconds (opcjonalny) to wartosc naglowka HTTP Retry-After z
+    odpowiedzi serwera, jesli byla obecna i poprawna (patrz
+    parse_retry_after_header()) - None, jesli naglowka nie bylo albo byl
+    nieparsowalny/ujemny. To jest WYLACZNIE odczytana wartosc podana przez
+    serwer, nie lokalnie wyliczony backoff - patrz
+    compute_next_allowed_check_delay(), ktora wybiera dluzszy z obu."""
+
+    def __init__(self, status_code: int, message: str, retry_after_seconds: "float | None" = None):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+
+def parse_retry_after_header(raw_value) -> "float | None":
+    """Parsuje naglowek HTTP Retry-After (patrz RFC 9110 sec. 10.2.3):
+    albo liczba sekund (np. "120"), albo data HTTP (np.
+    "Wed, 21 Oct 2026 07:28:00 GMT"). Kazda bledna, pusta, ujemna albo
+    nieobslugiwana wartosc jest traktowana jako BRAK naglowka (zwraca None)
+    - NIGDY nie rzuca wyjatku, bo blad parsowania tego opcjonalnego
+    naglowka nie powinien przerywac obslugi 403/429 (patrz
+    fetch_page_with_retry())."""
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    if not value:
+        return None
+
+    # Format 1: liczba sekund (calkowita albo, wyjatkowo, z przecinkiem).
+    try:
+        seconds = float(value)
+    except ValueError:
+        pass
+    else:
+        if seconds >= 0 and math.isfinite(seconds):
+            return seconds
+        return None
+
+    # Format 2: data HTTP (RFC 1123/2822) - "Retry-After: <http-date>".
+    try:
+        target_dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if target_dt is None:
+        return None
+    if target_dt.tzinfo is None:
+        target_dt = target_dt.replace(tzinfo=timezone.utc)
+
+    delta_seconds = (target_dt - datetime.now(timezone.utc)).total_seconds()
+    if delta_seconds < 0 or not math.isfinite(delta_seconds):
+        return None
+    return delta_seconds
 
 
 def fetch_page_with_retry(store_id: str, page: int) -> dict:
@@ -764,7 +943,7 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
                 headers=headers,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
-                impersonate=profile["impersonate"],
+                impersonate=profile.impersonate,
             )
         except Exception as exc:
             last_error = exc
@@ -775,10 +954,16 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
                 # Blokada/rate limit - NIE retry'ujemy w miejscu (patrz
                 # BlockedByServerError powyzej), to ma wyjsc jako sygnal do
                 # ograniczenia aktywnosci cyklu/daemona, nie do ponawiania
-                # zapytan.
+                # zapytan. Odczytujemy tez opcjonalny naglowek Retry-After
+                # (patrz parse_retry_after_header()) - serwer moze nim
+                # podac wlasny, wiazacy termin kolejnej dozwolonej proby,
+                # ktory update_blocking_backoff_state() porowna z lokalnie
+                # wyliczonym backoffem i wybierze dluzszy z obu.
+                retry_after = parse_retry_after_header(resp.headers.get("retry-after"))
                 raise BlockedByServerError(
                     resp.status_code,
                     f"HTTP {resp.status_code} (sklep {store_id}, strona {page}): {resp.text[:300]}",
+                    retry_after_seconds=retry_after,
                 )
             if resp.status_code not in RETRYABLE_STATUS_CODES:
                 raise RuntimeError(
@@ -1473,24 +1658,30 @@ def handle_telegram_updates() -> None:
 
 
 # ---------------- JITTER I WYKLADNICZY BACKOFF (tylko tryb daemon) ----------------
-# Licznik kolejnych CYKLI sprawdzania ofert (nie pojedynczych requestow)
-# zakonczonych HTTP 403/429 (patrz BLOCKING_STATUS_CODES) - globalnie, nie
-# per sklep, bo run_ikea_check_cycle() juz agreguje wszystkie sklepy w
-# jednym przebiegu (fetch_all_offers()) i tak decyduje o statusie calego
-# cyklu. Aktualizowany przez update_blocking_backoff_state() (wywolywane z
-# run_ikea_check_cycle() niezaleznie od RUN_MODE), ale faktyczny backoff
-# (dluzsze oczekiwanie przed kolejna proba) stosuje WYLACZNIE run_daemon() -
-# w trybie cron ten licznik jest wiec aktualizowany, ale nie ma zadnego
-# wplywu na zachowanie/kod wyjscia (patrz main()).
-CONSECUTIVE_BLOCKED_CYCLES = 0
-LAST_BLOCKED_STATUS_CODE: int | None = None
+# Stan globalnego backoffu (patrz BackoffState powyzej) zyje TRWALE w
+# DYNAMIC_STATE (klucz "blocking_backoff", patrz get_blocking_backoff_state()/
+# set_blocking_backoff_state()), nie w osobnych globalach modulu - dzieki
+# temu restart procesu/uslugi systemd w trakcie aktywnej blokady 403/429
+# nie zeruje juz wyliczonego harmonogramu next_allowed_check_at. Aktualizowany
+# przez update_blocking_backoff_state() (wywolywane z run_ikea_check_cycle()
+# niezaleznie od RUN_MODE), ale faktyczny backoff (dluzsze oczekiwanie przed
+# kolejna proba) stosuje WYLACZNIE run_daemon() - w trybie cron stan jest
+# wiec aktualizowany i zapisywany, ale nie ma zadnego wplywu na
+# zachowanie/kod wyjscia tego jednego przebiegu (patrz main()).
 
 
 def apply_jitter_percent(value: float, percent: float) -> float:
     """Stosuje losowy jitter +/-percent% do danej wartosci (np. sekund
     oczekiwania) - wynik jest losowany rownomiernie w przedziale
     [value*(1-percent/100), value*(1+percent/100)] i nigdy nie jest
-    ujemny. percent <= 0 wylacza jitter (zwraca value bez zmian)."""
+    ujemny. percent <= 0 wylacza jitter (zwraca value bez zmian).
+
+    UWAGA: to jest jitter SYMETRYCZNY (moze zarowno wydluzyc, jak i
+    SKROCIC wartosc) - uzywany WYLACZNIE dla normalnego, nieblokowanego
+    interwalu sprawdzania ofert (patrz compute_jittered_interval()). Dla
+    backoffu po 403/429 uzywany jest apply_backoff_jitter() nizej, ktory
+    jitteruje TYLKO w gore, zeby nigdy nie skrocic backoffu ponizej
+    wyliczonego minimum."""
     if percent <= 0:
         return value
     jitter_fraction = random.uniform(-percent, percent) / 100.0
@@ -1502,21 +1693,85 @@ def compute_jittered_interval() -> float:
     (CHECK_INTERVAL_JITTER_PERCENT) - patrz komentarze przy tych stalych.
     Wywolywane WYLACZNIE z run_daemon(), przy kazdym planowaniu kolejnego
     sprawdzenia ofert (bez aktywnego backoffu) - celem jest rozbicie
-    sztywnego, metronomicznego rytmu przy rzadkim, prywatnym monitoringu,
-    NIE zwiekszenie czestotliwosci ponad wartosc bazowa."""
+    sztywnego, metronomicznego rytmu przy rzadkim, prywatnym monitoringu.
+    Ten jitter MOZE losowo skrocic wartosc bazowa (do -25% domyslnie), ale
+    nie ma to znaczenia dla polityki backoffu nizej - te dwa jittery sa
+    niezalezne i nie sa ze soba mieszane w jednym wyliczeniu."""
     return apply_jitter_percent(CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_JITTER_PERCENT)
 
 
-def compute_backoff_delay(failure_count: int) -> float:
-    """Wykladniczy backoff po `failure_count` kolejnych cyklach zakonczonych
-    HTTP 403/429 z rzedu: BACKOFF_BASE_SECONDS * 2^(failure_count-1),
-    ograniczony do BACKOFF_CAP_SECONDS, z jitterem (BACKOFF_JITTER_PERCENT).
-    failure_count <= 0 oznacza brak aktywnego backoffu - zwraca 0.0."""
+def effective_backoff_base_seconds() -> float:
+    """Pierwszy krok backoffu NIE MOZE byc krotszy od normalnego,
+    skonfigurowanego interwalu sprawdzania ofert (CHECK_INTERVAL_SECONDS) -
+    inaczej 403/429 paradoksalnie ZWIEKSZALOBY czestotliwosc zapytan tuz po
+    tym, jak serwer odmowil dostepu. Zwraca WIEKSZA z CHECK_INTERVAL_SECONDS
+    i BACKOFF_BASE_SECONDS (BACKOFF_BASE_SECONDS jest wiec tylko DOLNYM
+    limitem na wypadek nietypowo malego CHECK_INTERVAL_SECONDS w .env)."""
+    return max(CHECK_INTERVAL_SECONDS, BACKOFF_BASE_SECONDS)
+
+
+def effective_backoff_cap_seconds() -> float:
+    """Cap backoffu musi byc >= efektywnej bazy (effective_backoff_base_seconds())
+    - inaczej dla duzego CHECK_INTERVAL_SECONDS w .env cap (BACKOFF_CAP_SECONDS)
+    moglby wypasc NIZEJ niz sam pierwszy krok backoffu, co przeczyloby idei
+    "backoff nie przyspiesza ruchu"."""
+    return max(effective_backoff_base_seconds(), BACKOFF_CAP_SECONDS)
+
+
+def apply_backoff_jitter(value: float, percent: float = BACKOFF_JITTER_PERCENT) -> float:
+    """Jitter backoffu - w odroznieniu od apply_jitter_percent() (symetryczny,
+    uzywany dla normalnego interwalu), ten jitter losuje WYLACZNIE w gore:
+    wynik jest w przedziale [value, value*(1+percent/100)]. Backoff po
+    403/429 (a tym bardziej scalony z Retry-After, patrz
+    compute_next_allowed_check_delay()) nigdy nie powinien zejsc PONIZEJ
+    wyliczonego minimum - jitter moze go tylko dodatkowo wydluzyc, nigdy
+    skrocic (wymog zadania: "jitter nie moze skrocic finalnego okresu
+    ponizej minimalnego okresu wynikajacego z polityki backoffu i
+    Retry-After")."""
+    if percent <= 0:
+        return value
+    extra_fraction = random.uniform(0, percent) / 100.0
+    return value * (1 + extra_fraction)
+
+
+def compute_local_backoff_delay(failure_count: int) -> float:
+    """Wykladniczy, lokalnie wyliczony backoff (BEZ uwzglednienia
+    Retry-After - patrz compute_next_allowed_check_delay() dla finalnej
+    wartosci) po `failure_count` kolejnych cyklach zakonczonych HTTP
+    403/429 z rzedu:
+
+        base = effective_backoff_base_seconds()  # >= CHECK_INTERVAL_SECONDS
+        delay = min(base * 2^(failure_count-1), effective_backoff_cap_seconds())
+
+    failure_count <= 0 oznacza brak aktywnego backoffu - zwraca 0.0. Jitter
+    (apply_backoff_jitter(), tylko w gore) jest stosowany PO tym
+    wyliczeniu, patrz wywolanie w compute_next_allowed_check_delay()."""
     if failure_count <= 0:
         return 0.0
-    delay = BACKOFF_BASE_SECONDS * (2 ** (failure_count - 1))
-    delay = min(delay, BACKOFF_CAP_SECONDS)
-    return apply_jitter_percent(delay, BACKOFF_JITTER_PERCENT)
+    base = effective_backoff_base_seconds()
+    cap = effective_backoff_cap_seconds()
+    delay = base * (2 ** (failure_count - 1))
+    return min(delay, cap)
+
+
+def compute_next_allowed_check_delay(failure_count: int, retry_after_seconds=None) -> float:
+    """Finalny czas oczekiwania przed kolejna proba po `failure_count`
+    kolejnych blokadach 403/429 z rzedu - WIEKSZA z:
+      (a) lokalnie wyliczonego, wykladniczego backoffu (patrz
+          compute_local_backoff_delay(), juz >= CHECK_INTERVAL_SECONDS), i
+      (b) `retry_after_seconds` podanego przez serwer (naglowek Retry-After,
+          patrz parse_retry_after_header()), jesli nie None.
+    Jitter (apply_backoff_jitter(), tylko w gore) jest stosowany NA KONIEC,
+    na juz wybranej, dluzszej z tych dwoch wartosci - wiec finalny wynik
+    nigdy nie jest krotszy niz max(lokalny backoff, Retry-After)."""
+    local_delay = compute_local_backoff_delay(failure_count)
+    if retry_after_seconds is not None and retry_after_seconds > local_delay:
+        base_delay = retry_after_seconds
+    else:
+        base_delay = local_delay
+    if base_delay <= 0:
+        return 0.0
+    return apply_backoff_jitter(base_delay)
 
 
 def all_stores_blocked_by_403_429(store_errors: dict) -> bool:
@@ -1547,38 +1802,69 @@ def full_cycle_fetched_successfully(store_errors: dict) -> bool:
     return not store_errors
 
 
-def update_blocking_backoff_state(store_errors: dict) -> None:
-    """Aktualizuje CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE na
-    podstawie bledow zebranych w jednym cyklu (patrz fetch_all_offers()) -
-    store_errors mapuje storeId na oryginalny wyjatek (nie tekst), zeby
-    dalo sie rozpoznac BlockedByServerError (HTTP 403/429) i wyciagnac jego
-    status_code. Cykl bez zadnego bledu blokujacego resetuje licznik do 0,
-    NAWET jesli inne (niebloujace) bledy sklepow wystapily - to jest
+def update_blocking_backoff_state(store_errors: dict) -> BackoffState:
+    """Aktualizuje i TRWALE ZAPISUJE (na dysk, patrz set_blocking_backoff_state())
+    globalny stan backoffu (BackoffState, klucz "blocking_backoff" w
+    DYNAMIC_STATE) na podstawie bledow zebranych w jednym cyklu (patrz
+    fetch_all_offers()) - store_errors mapuje storeId na oryginalny
+    wyjatek (nie tekst), zeby dalo sie rozpoznac BlockedByServerError
+    (HTTP 403/429), jego status_code i opcjonalny retry_after_seconds
+    (patrz parse_retry_after_header()).
+
+    Cykl bez zadnego bledu blokujacego resetuje stan do "brak backoffu",
+    NAWET jesli inne (nieblokujace) bledy sklepow wystapily - to jest
     "pierwsze udane pobranie" w rozumieniu zadania: brak sygnalu
-    blokady/rate limitu w tym cyklu."""
-    global CONSECUTIVE_BLOCKED_CYCLES, LAST_BLOCKED_STATUS_CODE
+    blokady/rate limitu w tym cyklu. Zwraca zapisany BackoffState (przydatne
+    dla wywolujacego/testow, zeby nie trzeba bylo od razu wczytywac go
+    ponownie z DYNAMIC_STATE)."""
+    state = get_blocking_backoff_state()
 
-    blocked_codes = sorted({
-        exc.status_code
-        for exc in store_errors.values()
-        if isinstance(exc, BlockedByServerError)
-    })
+    blocked_errors = [
+        exc for exc in store_errors.values() if isinstance(exc, BlockedByServerError)
+    ]
 
-    if blocked_codes:
-        CONSECUTIVE_BLOCKED_CYCLES += 1
-        LAST_BLOCKED_STATUS_CODE = blocked_codes[-1]
+    if blocked_errors:
+        blocked_codes = sorted({exc.status_code for exc in blocked_errors})
+        # Retry-After: uzywamy NAJWIEKSZEJ poprawnej wartosci zwroconej w
+        # tym cyklu (kilka sklepow moze dostac 403/429 z roznymi/zadnymi
+        # Retry-After w tym samym przebiegu) - konserwatywnie, zeby nie
+        # zaniedbac dluzszego z podanych terminow.
+        retry_after_candidates = [
+            exc.retry_after_seconds for exc in blocked_errors
+            if exc.retry_after_seconds is not None
+        ]
+        retry_after_seconds = max(retry_after_candidates) if retry_after_candidates else None
+
+        failure_count = state.failure_count + 1
+        local_delay = compute_local_backoff_delay(failure_count)
+        final_delay = compute_next_allowed_check_delay(failure_count, retry_after_seconds)
+
+        state = BackoffState(
+            failure_count=failure_count,
+            last_status_code=blocked_codes[-1],
+            next_allowed_check_at=time.time() + final_delay,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+        retry_after_txt = (
+            f"{retry_after_seconds:.0f}s" if retry_after_seconds is not None else "brak"
+        )
         log(
-            f"Blokada/rate limit (HTTP {', '.join(str(c) for c in blocked_codes)}) - "
-            f"kolejna porazka #{CONSECUTIVE_BLOCKED_CYCLES} z rzedu.",
+            f"Blokada/rate limit HTTP {', '.join(str(c) for c in blocked_codes)}: "
+            f"porazka #{failure_count}. Lokalny backoff: {local_delay:.0f}s; "
+            f"Retry-After: {retry_after_txt}; nastepna proba nie wcześniej niż "
+            f"za {final_delay:.0f}s.",
             to_stderr=True,
         )
-    elif CONSECUTIVE_BLOCKED_CYCLES:
+    elif state.failure_count:
         log(
-            f"Pobranie bez blokady/rate limitu - resetuje licznik backoffu "
-            f"(byl na #{CONSECUTIVE_BLOCKED_CYCLES})."
+            "Pobranie bez blokady/rate limitu - resetuje globalny stan backoffu "
+            f"(byl na porazce #{state.failure_count})."
         )
-        CONSECUTIVE_BLOCKED_CYCLES = 0
-        LAST_BLOCKED_STATUS_CODE = None
+        state = BackoffState()
+
+    set_blocking_backoff_state(state)
+    return state
 
 
 # ---------------- GLOWNA LOGIKA (jeden cykl sprawdzenia ofert) ----------------
@@ -1604,13 +1890,17 @@ def run_ikea_check_cycle() -> int:
         log(f"Blad zapytania do API: {exc}", to_stderr=True)
         return 1
 
+    # Aktualizuje i trwale zapisuje globalny stan backoffu (BackoffState) -
+    # reset przy braku bledow blokujacych 403/429 w tym cyklu (w tym przy
+    # PELNYM sukcesie, store_errors == {}), narastanie przy kolejnej
+    # blokadzie - patrz update_blocking_backoff_state().
     update_blocking_backoff_state(store_errors)
 
     # Alert o utracie/odzyskaniu dostepu (HTTP 403/429 na CALYM cyklu) -
     # patrz all_stores_blocked_by_403_429()/full_cycle_fetched_successfully()/
-    # handle_access_notification_state(). Niezalezne od
-    # CONSECUTIVE_BLOCKED_CYCLES/backoffu powyzej (ktory dotyczy WYLACZNIE
-    # trybu daemon) - ten alert dziala tak samo w trybie cron i daemon, bo
+    # handle_access_notification_state(). Niezalezne od globalnego stanu
+    # backoffu powyzej (ktory dotyczy WYLACZNIE trybu daemon) - ten alert
+    # dziala tak samo w trybie cron i daemon, bo
     # stan jest trwale zapisywany w DYNAMIC_STATE_FILE. Cykl z bledem
     # niebedacym utrata dostepu ANI pelnym sukcesem (np. 1 sklep na 5xx,
     # pozostale OK) celowo NIE wywoluje handle_access_notification_state() w
@@ -1715,6 +2005,34 @@ def install_shutdown_signal_handlers() -> None:
     signal.signal(signal.SIGINT, request_shutdown)
 
 
+def seconds_until_next_allowed_check(state: BackoffState, now_wall_clock=None) -> "float | None":
+    """Przelicza TRWALY, zapisany na dysk next_allowed_check_at (czas
+    scienny, epoch - patrz BackoffState) na liczbe sekund pozostalych OD
+    TERAZ do tej chwili - do jednorazowego uzycia przy starcie
+    run_daemon(), zeby zaplanowac czas do pierwszego sprawdzenia po
+    (ewentualnym) restarcie procesu w trakcie aktywnego backoffu.
+
+    Zwraca None, jesli brak aktywnego backoffu (next_allowed_check_at is
+    None) - wywolujacy powinien w tym przypadku zaplanowac normalny,
+    jittered interwal. Zwraca 0.0 (kontrola od razu), jesli zapisany
+    termin jest juz w przeszlosci - to jest zamierzone: jesli od
+    next_allowed_check_at minelo juz dużo czasu (np. usluga byla
+    zatrzymana dluzej niz trwal backoff), daemon nie ma sensu czekac
+    dodatkowo, tylko sprawdza od razu.
+
+    UWAGA: to jest JEDYNE miejsce w runtime, gdzie liczy sie roznica
+    dwoch odczytow time.time() - wylacznie do jednorazowego przeliczenia
+    trwałego stanu na zegar monotoniczny przy starcie/aktualizacji stanu.
+    Samo odliczanie interwalu W PETLI daemona (petla `while` nizej) uzywa
+    WYLACZNIE time.monotonic(), zeby skoki zegara systemowego/NTP nie
+    zmienialy dlugosci juz zaplanowanego oczekiwania."""
+    if state.next_allowed_check_at is None:
+        return None
+    now_wall_clock = time.time() if now_wall_clock is None else now_wall_clock
+    remaining = state.next_allowed_check_at - now_wall_clock
+    return max(0.0, remaining)
+
+
 def run_daemon() -> int:
     """Petla na potrzeby usterk systemd - Telegram sprawdzany czesto,
     oferty IKEA rzadziej. Reaguje na SIGTERM (systemd stop/restart) i
@@ -1722,20 +2040,51 @@ def run_daemon() -> int:
     kolejnego sprawdzenia Telegrama/IKEA, loguje jedno, jasne
     podsumowanie i wraca ze statusem 0 (graceful shutdown), bez
     modyfikowania plikow stanu poza tym, co juz zrobil ostatni
-    zakonczony cykl."""
+    zakonczony cykl.
+
+    Odliczanie interwalu miedzy sprawdzeniami ofert korzysta WYLACZNIE z
+    time.monotonic() (patrz next_ikea_check_monotonic nizej) - nie
+    time.time() - zeby ewentualny skok zegara systemowego (np. korekta
+    NTP) w trakcie dzialania procesu nie przyspieszyl ani nie opoznil
+    kolejnej kontroli. Jedynym miejscem, gdzie w ogole liczy sie roznica
+    dwoch odczytow time.time(), jest JEDNORAZOWE przeliczenie TRWALEGO
+    next_allowed_check_at (zapisanego jako czas scienny, bo
+    time.monotonic() nie przetrwa restartu procesu) na sekundy startowe
+    przy starcie tej funkcji - patrz seconds_until_next_allowed_check()."""
     install_shutdown_signal_handlers()
     log(
         f"Start w trybie daemon (IKEA co ~{CHECK_INTERVAL_SECONDS}s "
         f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, Telegram co "
         f"{TELEGRAM_POLL_INTERVAL_SECONDS}s)."
     )
-    last_ikea_check = 0.0
-    # Wartosc poczatkowa nie ma znaczenia dla PIERWSZEGO sprawdzenia (patrz
-    # nizej: last_ikea_check=0.0 + prawdziwy unix timestamp w "now" i tak
-    # zawsze przekroczy jakikolwiek rozsadny interwal) - liczy sie od
-    # momentu, gdy pierwszy cykl juz sie wykona i zaplanuje kolejny odstep
-    # (z jitterem albo, po 403/429, z backoffem).
-    next_check_interval = compute_jittered_interval()
+
+    # Po (ewentualnym) restarcie procesu/uslugi systemd respektujemy
+    # zapisany, trwaly termin nastepnej dozwolonej proby (next_allowed_check_at)
+    # - jesli backoff byl aktywny w chwili zatrzymania procesu, restart NIE
+    # zeruje tego harmonogramu (wymog zadania: "restart procesu lub uslugi
+    # systemd nie moze resetowac aktywnego backoffu"). Jesli zapisany
+    # termin jest juz w przeszlosci (minelo duzo czasu), kontrola wykonuje
+    # sie od razu (delay=0.0) - patrz seconds_until_next_allowed_check().
+    persisted_state = get_blocking_backoff_state()
+    persisted_delay = seconds_until_next_allowed_check(persisted_state)
+    if persisted_delay is not None:
+        next_check_interval = persisted_delay
+        log(
+            f"Wznawiam po restarcie z aktywnym backoffem (porazka "
+            f"#{persisted_state.failure_count} z rzedu, HTTP "
+            f"{persisted_state.last_status_code}) - nastepna proba za "
+            f"{next_check_interval:.0f}s."
+        )
+    else:
+        next_check_interval = compute_jittered_interval()
+
+    # last_ikea_check_monotonic=None oznacza "jeszcze nie sprawdzalismy w
+    # tym procesie" - PIERWSZE sprawdzenie w petli nizej odbywa sie zawsze
+    # po uplywie next_check_interval od startu tej funkcji (z jitterem albo,
+    # jesli byl aktywny trwaly backoff, po persisted_delay), NIE natychmiast -
+    # to jest istniejace, zamierzone zachowanie (pierwsze sprawdzenie w
+    # trybie daemon nie jest natychmiastowe), zachowane tutaj.
+    last_ikea_check_monotonic = time.monotonic()
 
     while not SHUTDOWN_EVENT.is_set():
         if TELEGRAM_ENABLED:
@@ -1747,21 +2096,27 @@ def run_daemon() -> int:
         if SHUTDOWN_EVENT.is_set():
             break
 
-        now = time.time()
-        if now - last_ikea_check >= next_check_interval:
+        if time.monotonic() - last_ikea_check_monotonic >= next_check_interval:
             run_ikea_check_cycle()
-            last_ikea_check = now
-            if CONSECUTIVE_BLOCKED_CYCLES > 0:
+            # Znacznik czasu ostatniego sprawdzenia jest ustawiany PO
+            # zakonczeniu cyklu (nie przed nim) - czas trwania samego
+            # pobierania (sieciowe zapytania, retry, jitter miedzy sklepami)
+            # nie ma wiec szansy "skrocic" kolejny interwal.
+            last_ikea_check_monotonic = time.monotonic()
+
+            backoff_state = get_blocking_backoff_state()
+            if backoff_state.failure_count > 0:
                 # Backoff: konserwatywne, coraz rzadsze proby po kolejnych
-                # 403/429 z rzedu - patrz compute_backoff_delay() i
-                # update_blocking_backoff_state(). To NADPISUJE zwykly,
-                # jittered interwal, dopoki backoff nie zostanie
-                # zresetowany przez pierwsze udane pobranie.
-                next_check_interval = compute_backoff_delay(CONSECUTIVE_BLOCKED_CYCLES)
+                # 403/429 z rzedu - stan (w tym next_allowed_check_at) jest
+                # juz trwale zapisany przez update_blocking_backoff_state()
+                # (wywolane wewnatrz run_ikea_check_cycle()). Przeliczamy go
+                # tu tylko na pozostajacy czas oczekiwania wzgledem
+                # zegara monotonicznego uzywanego przez ta petle.
+                next_check_interval = seconds_until_next_allowed_check(backoff_state) or 0.0
                 log(
-                    f"Backoff po HTTP {LAST_BLOCKED_STATUS_CODE} "
-                    f"(porazka #{CONSECUTIVE_BLOCKED_CYCLES} z rzedu) - "
-                    f"nastepna proba za {next_check_interval:.0f}s."
+                    f"Backoff aktywny (porazka #{backoff_state.failure_count} z rzedu, "
+                    f"HTTP {backoff_state.last_status_code}) - nastepna proba za "
+                    f"{next_check_interval:.0f}s."
                 )
             else:
                 next_check_interval = compute_jittered_interval()
