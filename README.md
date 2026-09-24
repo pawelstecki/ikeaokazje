@@ -1,40 +1,20 @@
 # ikeaokazje
 
-Skrypt, który sprawdza dział "Okazje na okrągło" (second-hand) w wybranych
-sklepach IKEA i wysyła powiadomienie (e-mail i/albo Telegram), jak pojawi
-się produkt, na który czekasz. Jeśli skonfigurujesz Telegrama, możesz
-także zarządzać listą szukanych słów/numerów i monitorowanych sklepów
-prosto z czatu z botem.
+Skrypt sprawdzający dział "Okazje na okrągło" (second-hand) w wybranych
+sklepach IKEA i wysyłający powiadomienie (e-mail i/albo Telegram), gdy
+pojawi się szukany produkt. Przez Telegrama można też zarządzać listą
+szukanych słów/numerów i monitorowanych sklepów bez edycji plików.
 
-Strona "Okazje na okrągło" to SPA, więc cały ruch idzie do prywatnego
-API IKEA - `web-api.ikea.com/circular/circular-asis/...` - znalezionego
-w devtoolsach (zakładka Network) po otwarciu strony.
+Strona "Okazje na okrągło" to SPA - skrypt odpytuje bezpośrednio prywatne
+API IKEA (`web-api.ikea.com/circular/circular-asis/...`), które nie jest
+publicznie dokumentowane i może zniknąć albo się zmienić bez ostrzeżenia.
+To prywatne narzędzie do własnego użytku, nie scraper komercyjny - ma
+tylko zautomatyzować sporadyczne sprawdzanie strony, które i tak
+robiłbyś ręcznie.
 
-## Zanim zaczniesz - ważna uwaga
-
-To API nie jest publicznie dokumentowane. Znalazłem je, bo strona z
-niego korzysta, ale IKEA może je zmienić albo zablokować w każdej chwili,
-bez ostrzeżenia.
-
-Endpoint jest chroniony przez Cloudflare/Akamai na poziomie fingerprintu
-TLS, nie tylko nagłówków HTTP. Dlatego używam `curl_cffi` (a nie zwykłego
-`requests`) - `impersonate=` (profil TLS/JA3) i nagłówki `User-Agent`/
-`sec-ch-ua` w skrypcie muszą się wzajemnie zgadzać (ta sama "wersja
-Chrome"). Skrypt wybiera jeden spójny profil klienta (`CLIENT_PROFILES` w
-kodzie) raz na cały cykl monitoringu - patrz "Rzadkie, prywatne
-sprawdzanie" niżej.
-
-**Ten projekt jest prywatnym narzędziem do osobistego monitorowania ofert,
-nie scraperem komercyjnym ani mechanizmem do obchodzenia zabezpieczeń.**
-Skrypt ma jedynie automatyzować to, co i tak robiłbyś ręcznie w
-przeglądarce (sporadyczne sprawdzenie oferty) - nie próbuje "przepychać"
-ruchu przez blokady ani fałszować mechanizmów ochrony strony.
-
-## Kod vs ustawienia
-
-**Cały kod (`ikea_okazje.py`) możesz spokojnie aktualizować z GitHuba** -
-`git pull` nigdy nie nadpisze Twoich osobistych ustawień, bo one nie są
-w tym pliku - są w `~/.config/ikea-okazje.env`.
+Endpoint jest chroniony fingerprintem TLS (Cloudflare/Akamai), nie tylko
+nagłówkami, więc skrypt używa `curl_cffi` z `impersonate=` zgodnym z
+wysyłanym `User-Agent`/`sec-ch-ua` (patrz `CLIENT_PROFILES` w kodzie).
 
 ## Instalacja
 
@@ -42,9 +22,9 @@ w tym pliku - są w `~/.config/ikea-okazje.env`.
 python3 -m pip install -r requirements.txt
 ```
 
-Jedyna zewnętrzna zależność to `curl_cffi` (patrz `requirements.txt`) -
-wszystko inne w skrypcie korzysta ze standardowej biblioteki Pythona.
-Działa od Pythona 3.8+ (curl_cffi z impersonacją tego wymaga).
+Jedyna zależność to `curl_cffi`, minimalna wymagana wersja `0.7.0`
+(potrzebna do impersonacji Chrome 124 - nie schodź poniżej tej wersji).
+Python 3.8+.
 
 ## Konfiguracja
 
@@ -55,763 +35,259 @@ chmod 600 ~/.config/ikea-okazje.env
 nano ~/.config/ikea-okazje.env
 ```
 
-**Kiedy konfiguracja jest wczytywana i sprawdzana:** `.env`, walidacja
-kanałów powiadomień i dynamiczny stan monitoringu są wczytywane/tworzone
-przy **starcie programu** (`python3 ikea_okazje.py`), nie przy samym
-zaimportowaniu modułu jako biblioteki (np. w testach) - dzięki temu
-importowanie `ikea_okazje.py` do testów jednostkowych nie wymaga
-żadnego `.env` i nie tworzy żadnych plików stanu.
+`ikea_okazje.py` możesz spokojnie aktualizować z GitHuba (`git pull`) -
+ten plik `.env` żyje poza repo i nigdy nie jest nadpisywany.
+
+Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 
 | Pole | Opis | Domyślnie |
 |---|---|---|
-| `SMTP_MODE` | `gmail`, `local587`, `exim` albo `disabled` (dowolna inna wartosc konczy dzialanie skryptu czytelnym bledem) | `gmail` |
-| `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO` | dane logowania do wysyłki maila - **wymagane, jeśli `SMTP_MODE` nie jest `disabled`** | wymagane (poza `disabled`) |
-| `SMTP_HOST` | tylko dla `local587`/`exim`, jeśli nie `localhost` | `localhost` |
-| `VERIFY_TLS` | `false`, jeśli lokalny MTA ma zły certyfikat | `true` |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał + komendy - **muszą być ustawione oba naraz**, patrz niżej | wyłączone |
-| `STORE_IDS` | numery sklepów IKEA, po przecinku - **tylko na starcie**, patrz niżej | `294` |
-| `STORE_URL_SLUGS` | opcjonalne nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji | wbudowana mapa `KNOWN_STORES` |
-| `SEARCH_TERMS` | szukane frazy - **tylko na starcie**, patrz niżej | `Stall` |
-| `SEARCH_ARTICLE_NUMBERS` | numery artykułu - **tylko na starcie**, normalizowane do samych cyfr (można wpisywać z kropkami/spacjami, np. `905.574.19`) | brak |
-| `MIN_DISCOUNT_PERCENT` | minimalny rabat % | brak |
-| `MAX_PRICE` | maksymalna cena | brak |
-| `KEYWORDS_EXCLUDE` | czarna lista słów, po przecinku | brak |
-| `ALERT_EXISTING_ON_FIRST_RUN` | alert od razu na starcie | `false` |
+| `SMTP_MODE` | `gmail`, `local587`, `exim` albo `disabled` | `gmail` |
+| `SMTP_USER`, `SMTP_PASS` | login/haslo SMTP - wymagane dla `gmail`/`local587`, nieużywane dla `exim` (brak autentykacji) | - |
+| `EMAIL_TO` | odbiorca - wymagany, gdy e-mail jest włączony. Jeśli nie podasz `EMAIL_TO`, w trybach `gmail`/`local587` skrypt użyje `SMTP_USER`; w trybie `exim` `EMAIL_TO` trzeba podać jawnie | - |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał powiadomień + komendy - oba naraz albo żaden | wyłączone |
+| `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
+| `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
+| `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone | brak |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko dla `daemon` - bazowy interwał sprawdzania IKEA (sekundy); jeśli jest ustawiony w `.env`, ta wartość ma zawsze pierwszeństwo przed domyślną - patrz "Rzadkie, prywatne sprawdzanie" niżej | `2700` (45 minut) |
-| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko dla `daemon` - co ile sprawdzać komendy Telegrama (sekundy) | `15` |
+| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty | `2700` (45 min) |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy | `15` |
 
-### Kanały powiadomień: e-mail, Telegram albo oba
+Wymagany jest **przynajmniej jeden w pełni skonfigurowany kanał
+powiadomień** - e-mail albo Telegram, może być tylko jeden z nich. Brak
+kompletnej konfiguracji obu kończy start skryptu czytelnym błędem z listą
+brakujących pól. Szczegóły trybów SMTP i wymogi Telegrama (oba pola albo
+żadne) - patrz komentarze w `.env.example`.
 
-E-mail nie jest już obowiązkowy - skrypt wymaga **przynajmniej jednego w
-pełni skonfigurowanego kanału powiadomień**, ale to może być tylko
-Telegram.
+**`SEARCH_TERMS`/`SEARCH_ARTICLE_NUMBERS`/`STORE_IDS` działają tylko przy
+pierwszym uruchomieniu** - zasiewają plik `~/.ikea_okazje_dynamic.json`,
+który od tej pory jest źródłem prawdy. Dalej zarządzasz listami komendami
+Telegrama - to bezpieczniejsza opcja niż ręczna edycja pliku. Jeśli
+edytujesz go wprost, zrób najpierw kopię. Usunięcie tego pliku resetuje
+nie tylko sklepy/słowa/numery do wartości z `.env`, ale też stan backoffu
+i stan alertu o utracie/odzyskaniu dostępu (patrz niżej) - traktuj to
+jako pełny reset, nie tylko zmianę listy wyszukiwania.
 
-- **`SMTP_MODE=disabled`** wyłącza wysyłkę e-mail całkowicie - skrypt nie
-  wymaga wtedy `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`, `SMTP_HOST` ani
-  żadnych ustawień TLS, i nie inicjuje żadnego połączenia SMTP.
-- **Jeśli `SMTP_MODE` jest `gmail`, `local587` albo `exim`, e-mail musi
-  być KOMPLETNIE skonfigurowany** - skrypt sprawdza to od razu przy
-  starcie, a nie dopiero przy pierwszej próbie wysyłki:
-  - `gmail`/`local587` wymagają niepustych `SMTP_USER` i `SMTP_PASS`
-    (obie wartości są używane do `server.login()`) oraz działającego
-    adresu odbiorcy;
-  - `exim` (bez autentykacji - patrz `send_email()`) NIE wymaga
-    `SMTP_USER`/`SMTP_PASS`, ale wymaga jawnie ustawionego `EMAIL_TO`
-    w `.env` (dla `exim` `EMAIL_TO` nie ma sensownego automatycznego
-    fallbacku, bo domyślny `EMAIL_FROM` to tylko placeholder
-    `ikea-watch@localhost`, a nie prawdziwy adres);
-  - dla `gmail`/`local587` `EMAIL_TO` może pozostać nieustawiony w
-    `.env` - wtedy skrypt używa `SMTP_USER` jako odbiorcy (to jest
-    istniejące, zamierzone zachowanie: wysyłasz powiadomienia na tę
-    samą skrzynkę, z której są wysyłane).
-  - brakujące pole(-a) powodują czytelny błąd przy starcie z listą
-    tego, co trzeba uzupełnić.
-- Telegram jest traktowany jako aktywny kanał tylko wtedy, gdy **oba**
-  pola są ustawione: `TELEGRAM_BOT_TOKEN` i `TELEGRAM_CHAT_ID`. Ustawienie
-  tylko jednego z nich (np. tokenu bez chat_id) jest odrzucane przy
-  starcie jako niepełna konfiguracja - to dotyczy zarówno wysyłki
-  powiadomień, jak i sprawdzania komend w Telegramie.
-- Jeśli `SMTP_MODE=disabled` **i** Telegram nie jest w pełni
-  skonfigurowany, skrypt odmawia startu z czytelnym błędem - musisz
-  skonfigurować e-mail (jeden z `gmail`/`local587`/`exim`, kompletnie)
-  albo pełny Telegram.
+Skrypt ma wbudowaną mapę wszystkich sklepów IKEA w Polsce (`KNOWN_STORES`
+w kodzie, dostępna w Telegramie pod `/sklepy`) - do `STORE_IDS` wystarczy
+sam numer, link do rezerwacji dobierze się automatycznie. `STORE_URL_SLUGS`
+w `.env` służy tylko do nadpisania/rozszerzenia tej mapy (nowy sklep albo
+zmiana routingu przez IKEA).
 
-Przykład konfiguracji "tylko Telegram" (bez e-maila) w `.env`:
+### Jak założyć bota Telegrama
 
-```ini
-SMTP_MODE=disabled
-TELEGRAM_BOT_TOKEN=123456789:TWOJ-TOKEN-Z-BOTFATHER
-TELEGRAM_CHAT_ID=987654321
-```
+1. W Telegramie napisz do `@BotFather`, wyślij `/newbot`.
+2. Podaj nazwę i login kończący się na `bot` - dostaniesz token
+   (`TELEGRAM_BOT_TOKEN`).
+3. Napisz cokolwiek do swojego bota (musisz zacząć rozmowę pierwszy).
+4. Wejdź na `https://api.telegram.org/bot<TOKEN>/getUpdates` i znajdź
+   `"chat":{"id": ...}` - to `TELEGRAM_CHAT_ID`. Puste `result: []`
+   znaczy, że jeszcze nie napisałeś do bota.
 
-Jak założyć bota Telegrama - patrz sekcja "Telegram - jak założyć bota"
-niżej.
+## Uruchamianie: cron albo systemd (nigdy oba naraz)
 
-### Mapa sklepów IKEA (storeId i slug)
+Nie uruchamiaj cron i systemd równocześnie dla tego samego skryptu - dwa
+niezależne procesy mogą ze sobą kolidować (np. podwójne powiadomienia
+albo podwójne odpowiedzi na te same komendy Telegrama). Wybierz jeden
+mechanizm.
 
-Skrypt ma wbudowaną, potwierdzoną mapę wszystkich obsługiwanych sklepów
-IKEA w Polsce (stała `KNOWN_STORES` w kodzie). Zawiera zarówno `storeId`
-(do odpytywania API IKEA, pole `STORE_IDS`), jak i slug używany w
-adresach URL działu "Okazje na Okrągło" (do budowania linków rezerwacji):
+Niezależnie od wyboru, **każdy sposób odpalania (cron, systemd, ręczne
+uruchomienie) musi używać tej samej ścieżki skryptu i tego samego pliku
+blokady** przez `flock -n`. `-n` oznacza, że `flock` nie czeka - jeśli
+blokada jest zajęta, ta kopia procesu po prostu wychodzi, więc cykle
+nigdy się nie kolejkują i dwie kopie nigdy nie działają naraz.
 
-| Sklep | storeId | slug |
-|---|---:|---|
-| Bielsko-Biała | 1224 | `bielsko+biala` |
-| IKEA Bydgoszcz | 429 | `bydgoszcz` |
-| IKEA Gdańsk | 203 | `gdańsk` |
-| IKEA Katowice | 306 | `katowice` |
-| IKEA Kraków | 204 | `kraków` |
-| IKEA Łódź | 329 | `łódź` |
-| IKEA Lublin | 311 | `lublin` |
-| IKEA Poznań | 205 | `poznań` |
-| IKEA Szczecin | 583 | `szczecin` |
-| IKEA Warszawa Janki | 188 | `warszawa+janki` |
-| IKEA Warszawa Targówek | 307 | `warszawa+targówek` |
-| IKEA Wrocław | 294 | `wrocław` |
+Przykłady poniżej zakładają repozytorium sklonowane do
+`/home/TWOJ_UZYTKOWNIK/ikeaokazje` i plik blokady
+`/home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock` - podmień obie ścieżki na
+swoje rzeczywiste (skrypt nie musi leżeć bezpośrednio w katalogu
+domowym), ale użyj **tych samych** we wszystkich trzech miejscach
+(cron, systemd, ręczne uruchomienie).
 
-Dla sklepów z tej listy wystarczy wpisać sam numer w `STORE_IDS` - link
-rezerwacji zostanie zbudowany automatycznie z wbudowanej mapy.
+### cron (RUN_MODE=cron, domyślny)
 
-### `STORE_IDS` vs `STORE_URL_SLUGS`
-
-Te dwa pola mają różne role i nie trzeba wypełniać obu:
-
-- **`STORE_IDS`** - decyduje, które sklepy skrypt faktycznie odpytuje w
-  API IKEA (czyli w których szuka ofert). To jest wymagane ustawienie.
-- **`STORE_URL_SLUGS`** - opcjonalne, ręczne mapowanie `storeId:slug`
-  używane tylko do budowania linku rezerwacji w powiadomieniu. Ma
-  pierwszeństwo nad wbudowaną mapą `KNOWN_STORES`, więc używaj go tylko,
-  gdy: (a) monitorujesz sklep spoza powyższej listy, albo (b) IKEA
-  zmieniła routing i wbudowana mapa jest nieaktualna.
-
-Przykład dla samego Wrocławia (slug nie jest wymagany, bo Wrocław jest w
-`KNOWN_STORES`, ale można go jawnie nadpisać):
-
-```ini
-STORE_IDS=294
-STORE_URL_SLUGS=294:wrocław
-```
-
-Przykład dla kilku sklepów:
-
-```ini
-STORE_IDS=1224,306,294
-STORE_URL_SLUGS=1224:bielsko+biala,306:katowice,294:wrocław
-```
-
-Znak `+` w slugach typu `bielsko+biala` czy `warszawa+targówek` jest
-separatorem spacji używanym przez IKEA w trasach URL i skrypt celowo
-zostawia go niezakodowanym (`urllib.parse.quote(..., safe="+")`) - polskie
-znaki (np. `ł`, `ó`) są nadal normalnie kodowane w adresie (np. `wrocław`
-staje się `wroc%C5%82aw`).
-
-### Linki do rezerwacji ofert
-
-Powiadomienia korzystają z `offerNumber` (zwracanego przez API IKEA) oraz
-wbudowanej mapy `KNOWN_STORES` (lub `STORE_URL_SLUGS` z .env, jeśli
-ustawione), aby wygenerować bezpośredni link do konkretnej oferty w
-dziale "Okazje na Okrągło online":
-
-```
-https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/<slug-sklepu>/<offerNumber>
-```
-
-**Zachowanie awaryjne:** jeśli oferta nie ma `offerNumber` lub dla danego
-`storeId` nie ma mapowania na slug (ani w `STORE_URL_SLUGS`, ani w
-`KNOWN_STORES`), skrypt **nie generuje** mylącego linku do standardowego
-produktu IKEA - zamiast tego powiadomienie zawiera numer oferty i
-instrukcję ręcznego wyszukania.
-
-### Ważne: SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/STORE_IDS działają tylko RAZ
-
-`SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` i `STORE_IDS` z `.env` są
-używane wyłącznie do zasiania pliku `~/.ikea_okazje_dynamic.json` **przy
-pierwszym uruchomieniu**. Od tego momentu prawda jest w tym pliku JSON, a
-nie w `.env` - zarządzasz listami komendami w Telegramie (`/dodaj`,
-`/usun`, `/numer`, `/usunnumer`, `/dodajsklep`, `/usunsklep`) albo ręcznie
-edytując ten plik JSON. Jeśli chcesz zresetować wszystko do tego, co masz
-w `.env`, usuń plik:
-
-```
-rm ~/.ikea_okazje_dynamic.json
-```
-
-i uruchom skrypt ponownie - zasieje się na nowo z `.env`.
-
-Jeśli aktualizujesz skrypt ze starszej wersji (bez zarządzania sklepami
-przez Telegram), a plik `~/.ikea_okazje_dynamic.json` już istnieje, ale
-nie ma w nim jeszcze klucza `store_ids`, skrypt automatycznie doda go przy
-najbliższym uruchomieniu, zasiewając wartością z `STORE_IDS` w `.env` -
-nic nie musisz robić ręcznie.
-
-### Komendy Telegrama
-
-Jeśli skonfigurujesz `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, możesz
-pisać do bota:
-
-```
-/dodaj stall          - dodaj słowo kluczowe
-/usun stall            - usuń słowo kluczowe
-/numer 90557419        - dodaj numer artykułu (można też z kropkami/spacjami, np. 905.574.19)
-/usunnumer 90557419    - usuń numer artykułu (również z kropkami/spacjami)
-/sklepy                - pokaż aktywne i dostępne sklepy
-/dodajsklep 1224        - dodaj sklep do monitoringu (po ID)
-/usunsklep 294          - usuń sklep z monitoringu (po ID)
-/status                - pokaż aktualny monitoring (sklepy, słowa, numery, filtry)
-/pomoc                 - lista komend
-```
-
-Dostępne są też opcjonalne angielskie aliasy: `/stores`, `/addstore <ID>`,
-`/removestore <ID>`.
-
-`/dodajsklep` akceptuje tylko ID obecne w wbudowanej mapie `KNOWN_STORES`
-(patrz tabela wyżej) - nieznane ID zostanie odrzucone z podpowiedzią, żeby
-sprawdzić `/sklepy`. Możesz usunąć nawet ostatni aktywny sklep, ale bot Cię
-o tym ostrzeże, bo bez żadnego aktywnego sklepu monitoring nie pobierze
-żadnych ofert.
-
-`/status` pokazuje teraz aktywne sklepy w czytelnej liście, np.:
-
-```
-Aktywne sklepy:
-- IKEA Wrocław (294)
-- Bielsko-Biała (1224)
-```
-
-Bot reaguje tylko na wiadomości z Twojego `TELEGRAM_CHAT_ID` - komendy
-od kogokolwiek innego są ignorowane.
-
-**W trybie `cron`** komendy są sprawdzane raz na starcie każdego
-przebiegu - czyli reakcja przychodzi w ciągu maks. jednego interwału
-crona (np. do 15 minut). **W trybie `daemon`** komendy są sprawdzane co
-`TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie 15 sekund), niezależnie od
-tego, jak rzadko sprawdzane są oferty IKEA - reakcja jest praktycznie
-od razu.
-
-Jak założyć bota - patrz sekcja "Telegram" niżej.
-
-### Filtry
-
-```
-MIN_DISCOUNT_PERCENT=30
-MAX_PRICE=300
-KEYWORDS_EXCLUDE=front,uchwyt,noga,sruba
-```
-
-### Telegram - jak założyć bota
-
-1. W Telegramie wyszukaj `@BotFather`, wyślij `/newbot`.
-2. Podaj nazwę i login kończący się na `bot`.
-3. BotFather odpowie tokenem (`123456789:ABC...`) - to `TELEGRAM_BOT_TOKEN`.
-4. Napisz cokolwiek do swojego nowego bota (musisz zacząć rozmowę pierwszy).
-5. Wejdź na `https://api.telegram.org/bot<TOKEN>/getUpdates`, znajdź
-   `"chat":{"id": ...}` - to `TELEGRAM_CHAT_ID`.
-
-Jeśli `getUpdates` zwraca `{"ok":true,"result":[]}`, jeszcze nie
-wysłałeś wiadomości do bota - zrób to i odśwież ponownie.
-
-## Ochrona przed równoległymi procesami
-
-**Wybierz JEDEN mechanizm trwałego uruchamiania - cron ALBO systemd, nigdy
-oba naraz.** Odpalenie crona i usługi systemd równocześnie dla tego samego
-skryptu powoduje podwójne powiadomienia (dwa niezależne procesy sprawdzają
-te same oferty) oraz podwójne/kolidujące odpowiedzi na te same komendy
-Telegrama.
-
-Niezależnie od wybranego mechanizmu, **wszystkie sposoby odpalania
-skryptu (cron, systemd, ręczne uruchomienie) muszą używać tego samego,
-trwałego pliku blokady** poprzez `flock -n`, np.:
-
-```
-/home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock
-```
-
-Użyj dokładnie tej samej, jawnej ścieżki (w katalogu domowym użytkownika,
-NIE ścieżki względnej zależnej od katalogu roboczego) we wpisie crona,
-w pliku usługi systemd i w każdym ręcznym uruchomieniu.
-
-`flock -n` (flaga `-n` = "nie czekaj") celowo **nie czeka i nie buduje
-kolejki** - jeśli blokada jest już zajęta (bo poprzedni cykl monitoringu
-jeszcze trwa albo działa druga kopia procesu), nowa próba odpalenia po
-prostu nic nie robi i wychodzi. Dzięki temu stare cykle nigdy się nie
-kolejkują i dwie kopie monitoringu nigdy nie działają naraz - to jest
-zamierzone zachowanie, nie błąd.
-
-**Dla usługi systemd** przykładowy plik `ikea-okazje.service` używa
-dodatkowo `flock -n -E 75 ...` w połączeniu z
-`RestartPreventExitStatus=75` w sekcji `[Service]`. Flaga `-E 75` mówi
-`flock`, żeby w sytuacji "blokada jest już zajęta" zakończył się
-dedykowanym kodem wyjścia `75` (a nie standardowym `1`), a
-`RestartPreventExitStatus=75` mówi systemd, żeby **nie** traktował tego
-konkretnego kodu jako awarii i **nie** restartował usługi. Bez tego
-`Restart=on-failure` wchodziłoby w pętlę restartów co `RestartSec`,
-mimo że zajęta blokada jest zamierzonym, a nie błędnym stanem.
-Prawdziwe awarie skryptu (np. błąd zapytania do API IKEA) kończą się
-innymi kodami wyjścia (1, 2 albo 3) i wciąż są normalnie restartowane
-przez systemd.
-
-## Dwa tryby pracy
-
-### Tryb "cron" (domyślny)
-
-Jedno przejście i wyjście - klasyczne użycie z crona.
-
-> **Oferty IKEA są sprawdzane co 15 minut.**
+Jedno przejście i wyjście, sprawdzanie ofert co interwał crona (poniżej:
+15 minut) - to crontab, nie backoff, decyduje o częstotliwości sprawdzeń
+w tym trybie:
 
 ```
 crontab -e
 ```
 
 ```
-*/15 * * * * /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 ~/ikea_okazje.py >> ~/ikea_okazje.log 2>&1
+*/15 * * * * /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py >> /home/TWOJ_UZYTKOWNIK/ikea_okazje.log 2>&1
 ```
 
-Podmień `TWOJ_UZYTKOWNIK` na swojego użytkownika - to musi być **ta sama
-ścieżka pliku blokady**, jaka jest użyta w pliku usługi systemd (patrz
-niżej), jeśli kiedykolwiek przełączysz się między crona a systemd.
+Prostsze, ale reakcja na komendy Telegrama i nowe oferty ograniczona do
+interwału crona.
 
-Prostsze w konfiguracji, ale reakcja na komendy Telegrama i wykrycie
-nowej oferty ograniczone są do interwału crona - komenda albo nowa oferta
-zostaną obsłużone dopiero przy następnym przebiegu skryptu. Tryb `cron`
-pozostaje jednorazowym przebiegiem - wychodzi po jednym cyklu, tak jak
-dotychczas; łagodne zatrzymanie przez `SIGTERM`/`SIGINT` (patrz tryb
-`daemon` niżej) dotyczy tylko pętli daemona.
+### systemd (RUN_MODE=daemon)
 
-### Tryb "daemon" (systemd)
+Działa w tle: oferty sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie
+45 min), komendy Telegrama co `TELEGRAM_POLL_INTERVAL_SECONDS`
+(domyślnie 15 s, praktycznie natychmiast).
 
-Działa cały czas w tle:
-- **oferty IKEA** są sprawdzane w przybliżeniu co `CHECK_INTERVAL_SECONDS` (domyślnie **2700 sekund = 45 minut**; jeśli masz już własną wartość w `.env` - np. starsze 900/15 min albo poprzednie domyślne 3600/1h - ta wartość ma zawsze pierwszeństwo i nie jest nadpisywana) - patrz "Rzadkie, prywatne sprawdzanie: jitter i backoff" niżej po szczegóły;
-- **komendy Telegrama** są sprawdzane co `TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie **15 sekund**) - reakcja jest praktycznie natychmiastowa, niezależnie od tego, jak rzadko sprawdzane są oferty IKEA.
-
-#### Rzadkie, prywatne sprawdzanie: jitter i backoff
-
-To narzędzie ma służyć do **rzadkiego, prywatnego** sprawdzania oferty - w
-przybliżeniu tak często, jak sam sprawdzałbyś stronę ręcznie w
-przeglądarce, a nie do ciągłego, metronomicznego odpytywania:
-
-- **Jitter interwału.** Zamiast sztywnego, w pełni przewidywalnego odstępu
-  między sprawdzeniami, rzeczywisty odstęp to `CHECK_INTERVAL_SECONDS`
-  losowo zmieniony o do ±25% (`CHECK_INTERVAL_JITTER_PERCENT` w kodzie) -
-  **w obie strony**, czyli realny odstęp może wypaść i krócej, i dłużej
-  niż wartość bazowa (dla domyślnych 45 minut: gdzieś między ok. 34 a
-  56 minutami, inny przy każdym cyklu). Celem jest rozbicie sztywnego,
-  przewidywalnego rytmu requestów - nie systematyczne zwiększenie
-  częstotliwości sprawdzania (w długim okresie średnia i tak wypada
-  blisko wartości bazowej). Ten jitter dotyczy **wyłącznie** normalnego,
-  nieblokowanego interwału - backoff po 403/429 (patrz niżej) używa
-  **innego**, jednostronnego jitteru, który nigdy nie skraca oczekiwania.
-- **Spójny profil klienta na cykl.** Skrypt losuje jeden profil klienta
-  (`impersonate` + zgodny `User-Agent`/`sec-ch-ua`, model `BrowserProfile`,
-  patrz stała `CLIENT_PROFILES` w kodzie) na początek każdego cyklu i
-  używa go konsekwentnie dla wszystkich zapytań w tym cyklu (wszystkie
-  strony, wszystkie sklepy) - żadnego mieszania profili w ramach jednej
-  sekwencji requestów.
-- **Globalny, wykładniczy backoff po 403/429 - wspólny dla całego
-  procesu, nie per sklep.** IKEA odpytywana jest przez **jeden, wspólny
-  endpoint/API** dla wszystkich sklepów (`web-api.ikea.com/circular/...`) -
-  jeśli ten endpoint odpowie HTTP 403 (blokada Akamai) albo 429 (rate
-  limit), to jest to blokada klienta wobec **tego serwera jako całości**,
-  niezależnie od tego, który `storeId` akurat odpytywano. Dlatego backoff
-  jest liczony **globalnie dla całego monitora**, a nie osobno dla
-  każdego `STORE_IDS` - wybór innego sklepu w kolejnym cyklu **nie
-  omija** tej blokady i nie resetuje licznika. Skrypt **nie próbuje tego
-  obchodzić** - zamiast tego kolejne cykle z rzędu zakończone 403/429
-  (na **wszystkich** skonfigurowanych sklepach - patrz "Alert o utracie i
-  odzyskaniu dostępu" niżej dla precyzyjnej definicji) wydłużają globalny
-  odstęp do następnej próby.
-
-  **Pierwszy krok backoffu nigdy nie jest krótszy od zwykłego
-  `CHECK_INTERVAL_SECONDS`** - to jest istotne: błąd dostępu nie może
-  paradoksalnie *zwiększyć* częstotliwości zapytań względem normalnej
-  pracy. Kolejne, następujące po sobie blokady podwajają ten odstęp
-  (`CHECK_INTERVAL_SECONDS, 2×, 4×, 8×, ...`), aż do capu, który jest
-  zawsze **większy lub równy** pierwszemu krokowi. Domyślne stałe w
-  kodzie (`BACKOFF_BASE_SECONDS=60s`, `BACKOFF_CAP_SECONDS=1800s`) są więc
-  tylko **dolnymi granicami** - jeśli masz ustawiony dłuższy
-  `CHECK_INTERVAL_SECONDS` (np. 2700s domyślnie), backoff automatycznie
-  startuje od tej większej wartości, nie od 60s. Do tego wyliczonego
-  backoffu jest dodawany jitter (`BACKOFF_JITTER_PERCENT`), ale **tylko w
-  górę** - jitter backoffu nigdy nie skraca finalnego czasu oczekiwania
-  poniżej wyliczonego minimum (w odróżnieniu od jitteru normalnego
-  interwału opisanego wyżej, który jest symetryczny). Stan (licznik
-  kolejnych blokad, ostatni kod HTTP, wyliczony termin kolejnej próby)
-  resetuje się do zera po pierwszym w pełni udanym cyklu (wszystkie
-  skonfigurowane sklepy pobrane bez błędu). W logach zobaczysz np.:
-  ```
-  Blokada/rate limit HTTP 429: porazka #3.
-  Lokalny backoff: 5400 s; Retry-After: 7200 s; nastepna proba nie wcześniej niż za 7200 s.
-  ```
-  Ten backoff **wpływa na harmonogram wyłącznie w trybie `daemon`** - w
-  trybie `cron` stan jest tak samo aktualizowany i zapisywany na dysk
-  (patrz "Trwały backoff po 403/429" niżej), ale nie ma wpływu na
-  zachowanie/kod wyjścia tego jednego przebiegu (każde wywołanie skryptu
-  w trybie `cron` to wciąż jedno, niezależne przejście - patrz "Dwa tryby
-  pracy" wyżej).
-- **Nagłówek `Retry-After`.** Jeśli odpowiedź HTTP 403/429 zawiera
-  nagłówek `Retry-After`, skrypt go odczytuje i respektuje - obsługiwane
-  są zarówno liczba sekund (`Retry-After: 120`), jak i data HTTP
-  (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Błędna, ujemna, pusta
-  albo nieobsługiwana wartość jest cicho traktowana jak brak nagłówka
-  (bez przerywania obsługi błędu). **Rzeczywisty termin kolejnej próby to
-  WIĘKSZA z dwóch wartości: lokalnie wyliczonego backoffu (opisanego
-  wyżej) i `Retry-After` podanego przez serwer** - skrypt nigdy nie
-  próbuje wcześniej, niż wskazuje którakolwiek z tych dwóch wartości.
-  Dla HTTP 403 `Retry-After` jest opcjonalny (Akamai zwykle go nie
-  wysyła) - jeśli go nie ma, liczy się wyłącznie lokalny backoff.
-
-**Ważne: to nie jest mechanizm obchodzenia blokad.** Celem jitteru,
-spójnego profilu klienta, globalnego backoffu i respektowania
-`Retry-After` jest to, żeby prywatny monitor zachowywał się możliwie
-blisko sporadycznego, ręcznego sprawdzania strony w przeglądarce - nie
-zwiększenie skuteczności automatycznego dostępu po odmowie. Jeśli IKEA
-konsekwentnie blokuje żądania, skrypt będzie próbował coraz rzadziej i
-zostawi to jasno w logach, zamiast "przepychać" ruch.
-
-#### Trwały backoff po 403/429 (przetrwa restart procesu/systemd)
-
-Stan globalnego backoffu opisanego wyżej (licznik kolejnych blokad,
-ostatni kod HTTP, wyliczony termin `next_allowed_check_at`, ewentualny
-`Retry-After`) **nie żyje wyłącznie w pamięci procesu** - jest trwale
-zapisywany w tym samym pliku dynamicznego stanu, w którym żyje też lista
-sklepów/słów kluczowych (`~/.ikea_okazje_dynamic.json`, klucz
-`blocking_backoff`), tym samym, atomowym mechanizmem zapisu (plik
-tymczasowy + `os.replace`) co pozostałe pola tego pliku.
-
-Konsekwencje:
-
-- **Restart procesu albo usługi systemd w trakcie aktywnej blokady NIE
-  resetuje backoffu.** Jeśli monitor został zatrzymany (albo padł) w
-  trakcie oczekiwania po 403/429, po ponownym starcie odczyta zapisany
-  termin `next_allowed_check_at` i będzie czekał do tego samego,
-  pierwotnie wyliczonego momentu - restart nie jest sposobem na
-  "przyspieszenie" kolejnej próby.
-- **Jeśli od zapisanego terminu minęło już bardzo dużo czasu** (np.
-  usługa była zatrzymana przez wiele godzin), daemon nie czeka
-  dodatkowo - wykonuje kontrolę od razu przy starcie.
-- Zapis na dysk następuje po **każdym** wykrytym 403/429 (aktualizacja
-  licznika i terminu) oraz po **każdym** pełnym, udanym cyklu (reset do
-  stanu "brak backoffu").
-- **Istniejące pliki dynamicznego stanu z wcześniejszych wersji skryptu**
-  (bez klucza `blocking_backoff`) są automatycznie i bezpiecznie
-  migrowane - przy najbliższym uruchomieniu skrypt dopisze domyślny,
-  "pusty" stan backoffu (bez błędu) i zapisze poprawną strukturę z
-  powrotem na dysk, tak jak już wcześniej robił to dla `store_ids` i
-  `ikea_access_notification`.
-- Ten stan backoffu jest **czymś innym** niż opisywany niżej alert o
-  utracie/odzyskaniu dostępu (`ikea_access_notification`) - obie
-  struktury żyją w tym samym pliku JSON, ale mają niezależną
-  odpowiedzialność: backoff opisuje **harmonogram** kolejnych zapytań do
-  API, alert opisuje **jednorazowe powiadomienie** wysyłane Tobie. Zmiana
-  jednej z nich nie wpływa na drugą.
-
-Technicznie: do zapisu na dysk używany jest czas ścienny (`time.time()`,
-epoch) - `time.monotonic()` (używany do faktycznego odliczania interwału
-w działającej pętli `run_daemon()`) nie jest przenośny między restartami
-procesu (jego "zero" jest umowne, per-proces), więc nie nadaje się do
-zapisu trwałego. Po starcie zapisany, ścienny `next_allowed_check_at`
-jest przeliczany jednorazowo na pozostały czas oczekiwania, a dalsze
-odliczanie w pętli i tak korzysta wyłącznie z `time.monotonic()` - skok
-zegara systemowego/NTP w trakcie działania procesu nie przyspiesza ani
-nie opóźnia zaplanowanej kontroli. Znacznik czasu ostatniego sprawdzenia
-jest ustawiany **po** zakończeniu cyklu (nie przed nim), więc czas
-trwania samego pobierania nie skraca kolejnego interwału.
-
-#### Alert o utracie i odzyskaniu dostępu (HTTP 403/429) - potwierdzenie dwoma kolejnymi cyklami
-
-Niezależnie od backoffu opisanego wyżej (który dotyczy tylko odstępu
-między próbami w trybie `daemon` i żyje w osobnym polu pliku stanu,
-patrz "Trwały backoff po 403/429" wyżej), skrypt wysyła też - przez te
-same, już skonfigurowane kanały (e-mail i/albo Telegram) - krótkie
-powiadomienie o **stanie dostępu** do danych IKEA. **Potwierdzenie
-notyfikacji o dostępie jest całkowicie odrębne od globalnego backoffu** -
-backoff opisuje wyłącznie harmonogram kolejnych zapytań do API, a
-poniższa logika opisuje wyłącznie to, kiedy wysłać powiadomienie
-użytkownikowi; zmiana jednej z nich nie wpływa na drugą.
-
-**Dlaczego dwa cykle, nie jeden.** Pierwsze wersje tego mechanizmu
-wysyłały alert po **jednym** w pełni zablokowanym cyklu, co przy
-pojedynczej, przejściowej blokadzie 403/429 (np. następny zaplanowany
-cykl i tak kończył się sukcesem) generowało niepotrzebną parę wiadomości
-"IKEA odrzuca zapytania monitora" + "Monitor może znów pobierać oferty".
-Żeby ograniczyć ten szum, alert o utracie dostępu wymaga teraz **dwóch
-kolejnych, kwalifikujących się cykli z rzędu**:
-
-- **Pierwszy** w pełni zablokowany cykl (wszystkie skonfigurowane sklepy
-  zawiodły **wyłącznie** z powodu HTTP 403/429) **nie wysyła jeszcze
-  żadnego powiadomienia** - skrypt zapisuje ten fakt jako oczekującą
-  (niepotwierdzoną) utratę dostępu (`pending_outage` w tym samym pliku
-  `~/.ikea_okazje_dynamic.json`, w którym żyje też lista sklepów i
-  szukanych słów). Ten zapis jest trwały, więc restart procesu albo
-  usługi systemd **między** pierwszym i drugim cyklem nie "zapomina" o
-  tej pierwszej porażce.
-- **Drugi, następny z rzędu** w pełni zablokowany cykl **potwierdza**
-  sekwencję - dopiero teraz skrypt wysyła **dokładnie jedno** powiadomienie
-  o utracie dostępu i zapisuje stan jako aktywny. Kolejne, trzecie i
-  dalsze zablokowane cykle **nie** wysyłają kolejnych powiadomień, także
-  po restarcie procesu albo usługi systemd.
-- **Ten drugi cykl to druga faktyczna kontrola IKEA wykonana wtedy, kiedy
-  zezwoli na nią istniejący harmonogram** - globalny backoff
-  (`next_allowed_check_at`) i ewentualny `Retry-After` z serwera (patrz
-  wyżej), **nie** po jakimś ustalonym, sztywnym czasie (np. "85 sekund").
-  W trybie `daemon` może to być więc znacznie później niż minuta czy dwie
-  od pierwszej porażki - backoff rządzi tym, kiedy w ogóle dojdzie do
-  drugiego zapytania, potwierdzenie tylko na nie reaguje. W trybie `cron`
-  te dwa cykle to po prostu dwa **kolejne, osobne odpalenia** skryptu
-  (np. dwa kolejne wywołania z crona) - skrypt nigdy nie usypia się ani
-  nie zapętla czekając na drugie sprawdzenie w tym samym procesie.
-- Jeśli **pełny sukces** (wszystkie sklepy pobrane bez błędu) nastąpi
-  **po pierwszym, ale przed drugim** kwalifikującym się cyklem, oczekujący
-  stan jest po cichu czyszczony - **bez wysyłania żadnego powiadomienia**
-  (ani utraty, ani odzyskania). Monitor po prostu wraca do normalnej
-  pracy, tak jakby nic się nie stało.
-- Kiedy pierwszy późniejszy **pełny** cykl pobierze dane poprawnie ze
-  wszystkich monitorowanych sklepów **po tym, jak alert o utracie dostępu
-  został już faktycznie wysłany**, skrypt wysyła **dokładnie jedno**
-  powiadomienie o odzyskaniu dostępu i resetuje cały stan - kolejne
-  udane cykle nie wysyłają kolejnych komunikatów o odzyskaniu. Jeśli
-  alert o utracie nigdy nie został wysłany (sekwencja była tylko
-  oczekująca i została wyczyszczona pełnym sukcesem, patrz punkt wyżej),
-  **nie ma też żadnego powiadomienia o odzyskaniu** - nie było niczego,
-  o czym trzeba by informować.
-- Kolejna, nowa utrata dostępu (po odzyskaniu) zaczyna całą dwucyklową
-  sekwencję potwierdzania **od nowa** - jeden kwalifikujący się cykl
-  znowu nie wystarcza.
-- **Cykl częściowy/mieszany** (np. jeden sklep zwrócił dane, a inny
-  403/429; albo 403/429 na jednym sklepie i timeout/HTTP 5xx/błąd
-  parsowania na innym) **nie jest** ani kwalifikującą się porażką, ani
-  pełnym sukcesem. Jeśli w takim momencie istniała oczekująca
-  (niepotwierdzona) sekwencja, taki cykl **zeruje ją** - kolejna,
-  przyszła pełna blokada 403/429 zaczyna nowe, dwucyklowe potwierdzanie
-  od nowa (bezpieczna polityka: nie "doliczamy" częściowych wyników do
-  przerwanej sekwencji). Cykl częściowy/mieszany **nie dotyka** już
-  wysłanego alertu (`outage_active`) - odzyskanie wciąż wymaga pełnego
-  sukcesu, zgodnie z niezmienionym wymogiem wyżej.
-- Zwykły błąd pojedynczego sklepu, timeout, HTTP 5xx, błąd parsowania,
-  brak wyników/ofert albo brak skonfigurowanych kryteriów wyszukiwania
-  (i - odrębnie - brak skonfigurowanych sklepów) **nie** są traktowane
-  jako utrata/odzyskanie dostępu i nie wpływają na tę sekwencję
-  potwierdzania (poza opisanym wyżej zerowaniem oczekującej sekwencji dla
-  cykli częściowych/mieszanych).
-- **Dostawa powiadomienia.** Tak jak przy zwykłych powiadomieniach o
-  nowych ofertach, wystarczy, żeby **przynajmniej jeden** z aktywnych
-  kanałów (e-mail/Telegram) się powiódł, żeby stan uznać za "zaalarmowany"
-  - tylko **całkowita** porażka wszystkich aktywnych kanałów (żaden się
-  nie powiódł) nie oznacza alertu jako wysłanego. W takim przypadku:
-  - przy **potwierdzającym** (drugim) cyklu - `pending_outage` zostaje
-    `True`, więc kolejny kwalifikujący się cykl spróbuje dostawy ponownie
-    (bez ponownego przechodzenia przez całą dwucyklową sekwencję od zera);
-  - przy powiadomieniu o **odzyskaniu** - `outage_active` zostaje `True`,
-    więc kolejny pełny sukces spróbuje ponownie.
-  Ten wzorzec ("nie oznaczaj jako wysłane, jeśli dostawa całkowicie
-  zawiodła") jest identyczny z tym, jak skrypt już wcześniej traktował
-  zwykłe powiadomienia o nowych ofertach.
-
-**Migracja ze starszych wersji.** Plik `~/.ikea_okazje_dynamic.json` z
-wcześniejszej wersji tego skryptu (bez pola `pending_outage`, albo nawet
-bez całego klucza `ikea_access_notification`) jest automatycznie i
-bezpiecznie migrowany - brakujące pola są dopisywane z bezpiecznymi
-domyślnymi wartościami. W szczególności: jeśli taki starszy plik miał już
-`outage_active: true` (użytkownik był **już wcześniej** zaalarmowany o
-utracie dostępu), ten fakt **nie jest** reinterpretowany jako pierwsza,
-niepotwierdzona porażka - `pending_outage` jest ustawiane na `False`, a
-kolejny w pełni zablokowany cykl **nie wysyła duplikatu** (alert już
-wcześniej dotarł do użytkownika, przed tą aktualizacją).
-
-Ten mechanizm nie zmienia częstotliwości requestów, retry ani backoffu -
-to tylko dodatkowe, pojedyncze powiadomienie o zmianie stanu dostępu.
-
-**Zatrzymanie jest łagodne (graceful shutdown).** `systemctl stop`/
-`restart` wysyła do procesu sygnał `SIGTERM` - daemon wychwytuje go (a
-także `SIGINT`, czyli Ctrl+C przy odpalaniu w terminalu), przestaje
-planować nowe sprawdzenia Telegrama/IKEA, loguje jedno podsumowanie i
-kończy się ze statusem 0, bez czekania na koniec aktualnego interwału i
-bez naruszania plików stanu.
-
-**Przed odpaleniem usługi ustaw w swoim prywatnym pliku `.env`:**
+W `.env` (**nie** w pliku usługi - `Environment=` tam nie ma
+pierwszeństwa nad `.env`, więc niczego by nie zmieniło):
 
 ```
 RUN_MODE=daemon
 ```
 
-**To jest jedyne miejsce, w którym to ustawiasz.** Plik `.env`
-(`~/.config/ikea-okazje.env`) jest jedynym źródłem konfiguracji w tej
-architekturze - przykładowy plik usługi `ikea-okazje.service` w tym repo
-celowo NIE zawiera `Environment=RUN_MODE=daemon`, bo kod nie daje
-zmiennym środowiskowym systemd priorytetu nad `.env`, więc taki wpis nic
-by nie zmienił. Jeśli zapomnisz ustawić `RUN_MODE=daemon` w `.env`,
-skrypt uruchomiony przez systemd wykona jedno przejście typu "cron" i
-wyjdzie ze statusem 0 - a systemd (przy `Type=simple`) może uznać to za
-normalne zakończenie i nie zrestartować usługi. Skrypt wykrywa ten
-przypadek (po zmiennej `INVOCATION_ID`, którą systemd ustawia dla swoich
-usług) i zapisuje w logach ostrzeżenie - ale nie zmienia trybu
-automatycznie, żeby nie maskować błędnej konfiguracji.
+Jeśli zapomnisz o tym wpisie, skrypt pod systemd wykona jedno przejście
+"cron" i wyjdzie ze statusem 0 - systemd może to uznać za normalne
+zakończenie i nie zrestartować usługi (dostaniesz ostrzeżenie w logach).
 
-Przykładowy plik usługi używa `flock -n` z tym samym, trwałym plikiem
-blokady co przykład crona wyżej - podmień `TWOJ_UZYTKOWNIK` na swojego
-użytkownika (zarówno w ścieżkach, jak i w polu `User=`), a potem
-zainstaluj usługę:
+Instalacja (w pliku usługi podmień `TWOJ_UZYTKOWNIK` w `User=` i
+`WorkingDirectory=`, a w `ExecStart=` ścieżkę do skryptu i pliku blokady
+na te, które faktycznie u siebie używasz - domyślnie w pliku jest to
+`/home/TWOJ_UZYTKOWNIK/ikea_okazje.py`, czyli skrypt bezpośrednio w
+katalogu domowym; jeśli masz repo sklonowane gdzie indziej, popraw tę
+ścieżkę tak samo, jak w przykładach crona/ręcznego uruchomienia wyżej):
 
 ```
 sudo cp ikea-okazje.service /etc/systemd/system/
-sudo nano /etc/systemd/system/ikea-okazje.service   # podmień TWOJ_UZYTKOWNIK
+sudo nano /etc/systemd/system/ikea-okazje.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now ikea-okazje
-sudo systemctl status ikea-okazje
 journalctl -u ikea-okazje -f
 ```
 
-**Ręczne uruchomienie skryptu musi również przechodzić przez tę samą
-blokadę** - samo `python3 ikea_okazje.py` NIE korzysta z `flock` i może
-więc działać równolegle z usługą systemd albo z cronem, powodując
-podwójne odpytywanie Telegrama i zdublowane odpowiedzi. Użyj zamiast
-tego:
+`ikea-okazje.service` używa `flock -n -E 75 ...` z tym samym plikiem
+blokady co cron. `-E 75` daje dedykowany kod wyjścia dla "blokada zajęta",
+a `RestartPreventExitStatus=75` mówi systemd, żeby w tym przypadku NIE
+restartował usługi (to zamierzony, "cudzy" cykl, nie awaria). Prawdziwe
+błędy skryptu (kody 1-3) są restartowane normalnie.
+
+`systemctl stop`/`restart` wysyła `SIGTERM` - daemon kończy bieżący cykl,
+loguje podsumowanie i wychodzi czysto (bez naruszania plików stanu).
+
+### Ręczne uruchomienie
+
+Samo `python3 ikea_okazje.py` nie przechodzi przez `flock` i może
+kolidować z cronem/systemd. Użyj tej samej blokady:
 
 ```
 /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
-  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py
 ```
 
-Podmień `TWOJ_UZYTKOWNIK` na swoją prawdziwą nazwę użytkownika w
-systemie Linux - i użyj **dokładnie tej samej ścieżki pliku blokady**,
-jaka jest skonfigurowana w pliku usługi systemd i w wpisie crontaba
-wyżej. Jeśli ta blokada jest już zajęta (bo usługa systemd albo cron
-właśnie wykonują cykl), `flock -n` celowo **pomija** to ręczne
-uruchomienie - nie czeka i nic nie robi - żeby nie doszło do
-uruchomienia dwóch kopii monitoringu naraz (patrz "Ochrona przed
-równoległymi procesami" wyżej).
+## Wyszukiwanie i powiadomienia
 
-## Użycie
+Pierwsze uruchomienie nie wysyła powiadomienia - zapisuje aktualny stan
+jako "już znany". Ustaw `ALERT_EXISTING_ON_FIRST_RUN=true`, jeśli chcesz
+alert od razu.
 
-```
-python3 ikea_okazje.py
-```
+Każde powiadomienie o ofercie zawiera cenę, rabat, stan produktu, numer
+artykułu, numer oferty i link do rezerwacji (jeśli oferta ma numer
+i skrypt zna slug sklepu - w przeciwnym razie zamiast linku dostajesz
+numer oferty do ręcznego wyszukania).
 
-**Uwaga:** to proste polecenie nie korzysta z pliku blokady i nie
-powinno być używane, jeśli masz już skonfigurowany cron albo usługę
-systemd (patrz "Ochrona przed równoległymi procesami" oraz sekcja
-"Ręczne uruchomienie" w "Tryb daemon" wyżej) - w takiej sytuacji użyj
-zamiast tego tego samego polecenia z `flock -n` i tym samym plikiem
-blokady co cron/systemd:
+### Komendy Telegrama
 
 ```
-/usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock \
-  /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+/dodaj <słowo>       - dodaj słowo kluczowe
+/usun <słowo>        - usuń słowo kluczowe
+/numer <nr>          - dodaj numer artykułu (kropki/spacje są ignorowane)
+/usunnumer <nr>      - usuń numer artykułu
+/sklepy              - pokaż aktywne i dostępne sklepy
+/dodajsklep <ID>     - dodaj sklep do monitoringu (tylko znane ID)
+/usunsklep <ID>      - usuń sklep z monitoringu
+/status              - aktualne sklepy/słowa/numery/filtry
+/pomoc               - lista komend
 ```
 
-Pierwsze uruchomienie nie wyśle powiadomienia, nawet jeśli od razu
-znajdzie dopasowanie - zapisuje aktualny stan jako "już znany". Ustaw
-`ALERT_EXISTING_ON_FIRST_RUN=true`, jeśli chcesz alert od razu.
+Bot reaguje tylko na wiadomości z `TELEGRAM_CHAT_ID` z `.env` - inni
+nadawcy są ignorowani.
 
-Każde powiadomienie zawiera cenę, procent rabatu, stan produktu, numer
-artykułu, numer oferty oraz bezpośredni link do rezerwacji w "Okazje na
-Okrągło" (jeśli dostępny). Logi mają znacznik czasu.
+## Stan na dysku
+
+- `~/.ikea_okazje_dynamic.json` - aktywne sklepy, słowa i numery
+  artykułów (źródło prawdy po pierwszym starcie, patrz wyżej), plus stan
+  backoffu i alertu dostępu (opisane niżej).
+- `~/.ikea_okazje_seen_offers.json` - identyfikatory już znanych ofert,
+  aby nie zgłaszać ich ponownie.
+- `~/.ikea_okazje_telegram_offset.json` - offset ostatnio przetworzonej
+  wiadomości Telegrama.
+
+Zmiana `STORE_IDS`/`SEARCH_TERMS`/`SEARCH_ARTICLE_NUMBERS` w `.env` **nie
+ma efektu**, jeśli `~/.ikea_okazje_dynamic.json` już istnieje - edytuj
+listy przez Telegrama (bezpieczniej) albo zrób kopię i edytuj plik wprost.
+Usunięcie pliku zasieje go na nowo z `.env`, ale zresetuje też backoff i
+alert dostępu - patrz "Konfiguracja" wyżej.
+
+## Zachowanie przy HTTP 403/429
+
+Wszystkie sklepy są odpytywane przez **jeden, wspólny endpoint** API
+IKEA - blokada (403, Akamai) albo rate limit (429) dotyczy więc całego
+procesu, nie pojedynczego sklepu, i backoff jest liczony **globalnie**,
+nie per sklep. Backoff wpływa na harmonogram tylko w trybie `daemon` - w
+trybie `cron` częstotliwość sprawdzeń wyznacza wyłącznie wpis w
+crontabie. Przy aktualnych domyślnych ustawieniach lokalny odstęp między
+próbami po blokadzie wynosi co najmniej 45 minut (`CHECK_INTERVAL_SECONDS`)
+i **nie wydłuża się** po kolejnych blokadach z rzędu - maksymalny odstęp
+(cap) wypada na tę samą wartość co pierwszy krok backoffu. Jednostronny
+jitter (tylko w górę) i nagłówek `Retry-After` z serwera (jeśli poprawny)
+mogą ten czas dodatkowo wydłużyć - liczy się większa z tych wartości.
+Licznik backoffu resetuje się po każdym cyklu bez błędu 403/429, nawet
+jeśli w tym cyklu wystąpił inny błąd pobierania (np. timeout czy HTTP
+5xx na jednym ze sklepów) - liczy się tylko brak blokady/rate limitu.
+Powiadomienie o odzyskaniu dostępu (patrz niżej) to inna zasada i wciąż
+wymaga w pełni udanego cyklu, bez żadnych błędów. Wyliczony termin
+kolejnej próby jest zapisywany na dysku i przetrwa restart procesu albo
+usługi - po restarcie skrypt czeka do tego samego terminu, a nie zaczyna
+od nowa.
+
+Osobno od backoffu, skrypt wysyła powiadomienie o **utracie dostępu**
+dopiero po dwóch kolejnych, w pełni nieudanych cyklach z rzędu (wszystkie
+sklepy, wyłącznie 403/429) - pojedyncza, przejściowa blokada nic nie
+wysyła. Jeśli po pierwszej takiej porażce kolejny cykl się powiedzie,
+żadne powiadomienie nie idzie. Jeśli alert o utracie już wyszedł, przy
+pierwszym późniejszym w pełni udanym cyklu skrypt próbuje wysłać jedno
+powiadomienie o odzyskaniu dostępu.
+
+## Diagnozowanie problemów
+
+**Usługa systemd wychodzi natychmiast ze statusem 0.** Sprawdź
+`RUN_MODE=daemon` w `~/.config/ikea-okazje.env` - patrz wyżej.
+
+**Zdublowane odpowiedzi na Telegramie.** Cron, systemd i/albo ręczne
+uruchomienie działają równocześnie - wybierz jeden mechanizm i sprawdź,
+że wszystkie używają tego samego pliku blokady `flock`.
+
+**403/429.** Sprawdź zgodność wersji Chrome między `impersonate` a
+`User-Agent`/`sec-ch-ua` w każdym profilu `CLIENT_PROFILES`. Poza tym to
+zamierzone zachowanie (patrz "Zachowanie przy HTTP 403/429" wyżej) -
+skrypt nie próbuje tego obchodzić, tylko odczekuje backoff/`Retry-After`.
+
+**`Size must be less than or equal to 64`.** `PAGE_SIZE` już jest `64` -
+to błąd API niezależny od tego ustawienia.
+
+**Telegram nie wysyła / brak `chat_id`.** Napisz najpierw do bota -
+Telegram wymaga, żeby rozmowę zaczynał człowiek.
+
+**Komendy Telegrama nie działają.** Sprawdź, czy piszesz z konta o
+`chat_id` z `.env`. W trybie `cron` komenda zadziała przy następnym
+przebiegu skryptu.
+
+**Brak linku do rezerwacji.** Sklep nie jest w `KNOWN_STORES` - dodaj go
+w `STORE_URL_SLUGS` albo sprawdź `/sklepy` w Telegramie.
 
 ## Testy
-
-Repozytorium zawiera podstawowy zestaw testów jednostkowych w
-`tests/test_ikea_okazje.py` (standardowy `unittest`, bez dodatkowych
-zależności i bez połączenia z IKEA czy Telegramem). Uruchom je z:
 
 ```
 python3 -m unittest tests/test_ikea_okazje.py
 ```
 
-Testy sprawdzają m.in. mapowanie `storeId -> slug` w `KNOWN_STORES`,
-poprawność generowania linków rezerwacji (w tym kodowanie polskich
-znaków i pozostawienie `+` bez zmian), dodawanie/usuwanie sklepów
-komendami Telegrama (bez duplikatów, odrzucanie nieznanych ID), walidację
-`SMTP_MODE` (w tym `disabled`), walidację KOMPLETNOŚCI konfiguracji
-kanałów powiadomień (Telegram-only, odrzucanie niepełnego Telegrama,
-odrzucanie niekompletnego e-maila dla `gmail`/`local587`/`exim`, błąd
-przy braku jakiegokolwiek kanału), pomijanie wysyłki e-mail gdy
-`SMTP_MODE=disabled`, ostrzeżenie o uruchomieniu pod systemd bez
-`RUN_MODE=daemon`, escapowanie HTML w odpowiedziach Telegrama,
-normalizację numerów artykułu, odporność cyklu sprawdzania ofert na
-błąd pojedynczego sklepu, brak efektów pobocznych samego importu modułu
-(`initialize_runtime()` jako jedyne miejsce startu aplikacji, bezpieczne
-do wielokrotnego wywołania), łagodne zatrzymanie pętli daemona po
-`SIGTERM`/`SIGINT`, deterministyczny jitter interwału sprawdzania (z
-mockowanym `random`) i jego zakres, wybór spójnego profilu klienta na
-cykl (i zgodność `User-Agent`/`sec-ch-ua` z tym profilem, bez żadnych
-prawdziwych requestów sieciowych), globalny, wykładniczy backoff po HTTP
-403/429 (`BackoffState` - narastanie, reset po sukcesie, cap,
-jednostronny jitter, pierwszy krok nigdy krótszy niż
-`CHECK_INTERVAL_SECONDS`), parsowanie nagłówka `Retry-After` (liczba
-sekund, data HTTP, wartości błędne/ujemne/puste), wybór dłuższego z
-lokalnego backoffu i `Retry-After`, trwałość stanu backoffu w pliku
-dynamicznego stanu (klucz `blocking_backoff` - migracja starych plików
-bez tego klucza, zapis po każdej blokadzie i po pełnym sukcesie,
-odtworzenie harmonogramu po symulowanym restarcie procesu), respektowanie
-przez `run_daemon()` zapisanego terminu `next_allowed_check_at` po
-restarcie (w tym natychmiastową kontrolę, gdy termin już minął) oraz
-odliczanie interwału w pętli daemona względem `time.monotonic()`,
-domyślny interwał `CHECK_INTERVAL_SECONDS` (45 minut) i jego
-nadpisywanie przez `.env`, oraz alert o utracie/odzyskaniu dostępu przy
-403/429 z **potwierdzeniem dwoma kolejnymi kwalifikującymi się cyklami**
-(pierwszy w pełni zablokowany cykl - tylko `pending_outage`, bez
-powiadomienia; drugi z rzędu - dokładnie jedno powiadomienie o utracie;
-trzeci i kolejne - bez duplikatów; pełny sukces PRZED potwierdzeniem -
-ciche wyczyszczenie stanu bez żadnego powiadomienia; powiadomienie o
-odzyskaniu wyłącznie po faktycznie dostarczonym alercie utraty; cykle
-częściowe/mieszane zerujące oczekującą sekwencję, ale nie wpływające na
-już aktywny alert; całkowita porażka dostawy nieoznaczająca alertu jako
-wysłany; migrację starych plików stanu, w tym `outage_active=true` bez
-`pending_outage`, bez wysyłania duplikatu; przetrwanie oczekującej i
-aktywnej sekwencji przez symulowany restart procesu; tryb `cron` jako
-dwa niezależne, kolejne odpalenia procesu bez żadnego wewnętrznego
-`sleep`/pętli czekającej na drugi cykl; respektowanie przez `run_daemon()`
-zapisanego backoffu przed drugą kontrolą) - wszystko bez prawdziwych
-requestów HTTP, SMTP czy Telegrama.
+Standardowy `unittest`, bez sieci, bez `.env` użytkownika (testy izolują
+`HOME` we własnym tymczasowym katalogu).
 
-## Aktualizacja skryptu
+## Nieoficjalne API i licencja
 
-```
-git pull
-```
+API IKEA użyte tutaj nie jest publicznie dokumentowane i może się zmienić
+albo zniknąć bez ostrzeżenia - patrz uwaga na początku.
 
-Twoje ustawienia w `.env` i dynamiczna lista w `~/.ikea_okazje_dynamic.json`
-zostają nietknięte.
-
-## Typowe problemy
-
-**Usługa systemd wychodzi natychmiast ze statusem 0 / nie zostaje
-uruchomiona na dłużej.** Najpierw sprawdź, czy `RUN_MODE=daemon` jest
-ustawiony w Twoim prywatnym pliku `.env`
-(`~/.config/ikea-okazje.env`) - bez tego skrypt wykonuje tylko jedno
-przejście typu "cron" i wychodzi, co systemd (przy `Type=simple`) może
-zinterpretować jako normalne zakończenie. Skrypt zapisze w logach
-(`journalctl -u ikea-okazje`) ostrzeżenie o tej sytuacji.
-
-**Odpowiedzi na Telegramie są zduplikowane.** Sprawdź, czy nie działają
-jednocześnie cron, usługa systemd i/albo ręcznie odpalony proces
-skryptu - każdy z nich niezależnie odpytuje Telegrama i wysyła
-odpowiedzi. Wybierz jeden mechanizm trwałego uruchamiania (cron albo
-systemd, patrz "Ochrona przed równoległymi procesami") i upewnij się, że
-wszystkie sposoby odpalania używają tego samego pliku blokady `flock`.
-
-**Blokada Cloudflare/Akamai / 403 albo 429.** Sprawdź, czy każdy profil w
-`CLIENT_PROFILES` ma zgodną wersję Chrome między `impersonate` a
-`User-Agent`/`sec-ch-ua`. Pamiętaj, że blokada dotyczy **wspólnego
-endpointu/API IKEA**, nie pojedynczego sklepu - backoff jest więc globalny
-dla całego monitora, niezależnie od tego, ile sklepów masz w `STORE_IDS`
-(patrz "Rzadkie, prywatne sprawdzanie: jitter i backoff" wyżej). W trybie
-`daemon` powtarzające się 403/429 włączają automatycznie coraz dłuższy,
-**trwały** backoff (przetrwa restart procesu/usługi systemd, patrz
-"Trwały backoff po 403/429" wyżej), który respektuje też nagłówek
-`Retry-After`, jeśli serwer go zwróci - to jest zamierzone, konserwatywne
-zachowanie, nie błąd; skrypt celowo nie próbuje obchodzić takiej blokady.
-Dostaniesz też jedno powiadomienie o utracie dostępu, jeśli cały cykl nie
-pobierze danych z żadnego sklepu z tego powodu (patrz "Alert o utracie i
-odzyskaniu dostępu" wyżej) - to jest osobny mechanizm od backoffu.
-
-**`Size must be less than or equal to 64`.** `PAGE_SIZE` już jest na `64`.
-
-**Certyfikat SSL wygasł / hostname mismatch.** Sprawdź
-`sudo certbot certificates` i uprawnienia plików certyfikatu dla Twojego
-MTA.
-
-**Telegram nie wysyła / brak `chat_id`.** Wyślij najpierw jakąś
-wiadomość do bota - Telegram wymaga, żeby rozmowę zaczynał człowiek.
-
-**Komendy w Telegramie nie działają.** Sprawdź, czy piszesz z tego
-samego konta, którego `chat_id` jest w `.env` - bot ignoruje wiadomości
-od innych nadawców. W trybie `cron` komenda zadziała dopiero przy
-następnym przebiegu (do interwału crona).
-
-**Link do rezerwacji nie działa / brak linku.** Sprawdź, czy `storeId`
-Twojego sklepu jest w wbudowanej mapie `KNOWN_STORES` (patrz tabela
-wyżej) albo dodaj go ręcznie w `STORE_URL_SLUGS`. Slug sklepu znajdziesz
-w adresie URL strony "Okazje na Okrągło" po wybraniu sklepu (fragment
-`#/nazwa-sklepu/...`). Jeśli `offerNumber` nie jest zwracany przez API
-dla danej oferty, skrypt celowo nie generuje żadnego linku.
-
-## Licencja
-
-Apache License 2.0 - copyright Paweł Stecki. Zobacz plik [LICENSE](LICENSE)
-w tym repo po pełny tekst.
-
-Możesz swobodnie kopiować, modyfikować i redystrybuować ten kod, w tym
-komercyjnie. Jedyne wymogi: zachowaj oryginalną notatkę o prawach
-autorskich (plik LICENSE i, jeśli redystrybuujesz, plik NOTICE) oraz
-jasno oznacz, które pliki zmodyfikowałeś, jeśli publikujesz fork.
+Apache License 2.0, © Paweł Stecki - pełny tekst w [LICENSE](LICENSE).
+Możesz kopiować, modyfikować i redystrybuować (także komercyjnie);
+zachowaj notatkę o prawach autorskich (LICENSE, przy redystrybucji też
+NOTICE) i oznacz zmienione pliki przy publikowaniu forka.
