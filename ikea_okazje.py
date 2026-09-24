@@ -547,9 +547,43 @@ def default_access_notification_state() -> dict:
     """Domyslny, "pusty" stan bloku 'ikea_access_notification' (patrz
     load_dynamic_state()/get_access_notification_state() nizej) - brak
     aktywnej utraty dostepu, brak zapamietanego ostatniego kodu HTTP
-    blokady. Uzywany do zasiania nowego pliku stanu i jako fallback dla
-    starszych plikow stanu, ktore jeszcze nie mialy tego klucza."""
-    return {"outage_active": False, "last_status_code": None}
+    blokady, brak oczekujacej (niepotwierdzonej) sekwencji. Uzywany do
+    zasiania nowego pliku stanu i jako fallback dla starszych plikow
+    stanu, ktore jeszcze nie mialy tych kluczy.
+
+    pending_outage=True oznacza, ze RAZ (jeden pelny cykl) wszystkie
+    skonfigurowane sklepy zawiodly wylacznie z powodu HTTP 403/429, ale
+    alert JESZCZE NIE zostal wyslany - czeka na potwierdzenie drugim,
+    NASTEPNYM z rzedu, rowniez w pelni zablokowanym cyklem (patrz
+    handle_access_notification_state() - polityka "dwoch kolejnych
+    cykli", wprowadzona, zeby pojedyncza, przejsciowa blokada 403/429 nie
+    generowala pary halasliwych powiadomien utrata/odzyskanie dostepu)."""
+    return {"outage_active": False, "last_status_code": None, "pending_outage": False}
+
+
+def migrate_access_notification_state(raw) -> dict:
+    """Uzupelnia brakujace pola w bloku 'ikea_access_notification' wczytanym
+    z dysku - bez utraty juz obecnych wartosci. Obsluguje w szczegolnosci:
+
+    - stary plik (przed wprowadzeniem polityki "dwoch kolejnych cykli"),
+      ktory mial TYLKO outage_active/last_status_code, bez pending_outage
+      - dopisuje pending_outage=False;
+    - kompletnie brakujacy/niepoprawny wpis - zwraca domyslny, "pusty"
+      stan (patrz default_access_notification_state()).
+
+    WAZNE: outage_active=True odczytane ze starego pliku NIE jest
+    reinterpretowane jako pierwsza, niepotwierdzona porazka - uzytkownik
+    zostal juz raz zaalarmowany przed tym refaktorem, wiec pending_outage
+    jest tu zawsze False (nie ma czego potwierdzac, alert juz wyslany;
+    kontynuacja z outage_active=True po prostu czeka na pierwszy pelny
+    sukces, tak jak wczesniej - patrz handle_access_notification_state())."""
+    if not isinstance(raw, dict):
+        return default_access_notification_state()
+    return {
+        "outage_active": bool(raw.get("outage_active", False)),
+        "last_status_code": raw.get("last_status_code"),
+        "pending_outage": bool(raw.get("pending_outage", False)),
+    }
 
 
 def default_blocking_backoff_state_dict() -> dict:
@@ -580,9 +614,14 @@ def load_dynamic_state() -> dict:
         had_store_ids = "store_ids" in data
         had_access_notification = "ikea_access_notification" in data
         had_blocking_backoff = "blocking_backoff" in data
+        raw_access_notification = data.get("ikea_access_notification")
+        had_pending_outage_field = (
+            isinstance(raw_access_notification, dict)
+            and "pending_outage" in raw_access_notification
+        )
         raw_article_numbers = data.get("search_article_numbers", list(BASE_SEARCH_ARTICLE_NUMBERS))
         normalized_article_numbers = normalize_article_numbers(raw_article_numbers)
-        access_notification = data.get("ikea_access_notification") or default_access_notification_state()
+        access_notification = migrate_access_notification_state(raw_access_notification)
         blocking_backoff = data.get("blocking_backoff") or default_blocking_backoff_state_dict()
         state = {
             "search_terms": data.get("search_terms", list(BASE_SEARCH_TERMS)),
@@ -594,6 +633,7 @@ def load_dynamic_state() -> dict:
         if (
             not had_store_ids
             or not had_access_notification
+            or not had_pending_outage_field
             or not had_blocking_backoff
             or normalized_article_numbers != raw_article_numbers
         ):
@@ -617,15 +657,24 @@ def get_access_notification_state() -> dict:
     return DYNAMIC_STATE.get("ikea_access_notification") or default_access_notification_state()
 
 
-def set_access_notification_state(outage_active: bool, last_status_code) -> None:
+def set_access_notification_state(
+    outage_active: bool, last_status_code, pending_outage: bool = False
+) -> None:
     """Aktualizuje i trwale zapisuje (na dysk, w DYNAMIC_STATE_FILE) stan
     bloku 'ikea_access_notification' - patrz
     handle_access_notification_state(). Zapis na dysk (a nie tylko w
     pamieci) jest tym, co gwarantuje, ze restart procesu/uslugi systemd w
-    trakcie trwajacej blokady 403/429 nie spowoduje ponownego alertu."""
+    trakcie trwajacej blokady 403/429 nie spowoduje ponownego alertu (ani
+    nie zapomni o juz zaobserwowanej, pierwszej niepotwierdzonej porazce -
+    patrz pending_outage w default_access_notification_state()).
+
+    pending_outage=True i outage_active=True nigdy nie wspolistnieja - gdy
+    alert jest juz aktywny (wyslany), nie ma juz nic do "potwierdzenia"
+    (patrz handle_access_notification_state())."""
     DYNAMIC_STATE["ikea_access_notification"] = {
         "outage_active": outage_active,
         "last_status_code": last_status_code,
+        "pending_outage": pending_outage,
     }
     save_dynamic_state(DYNAMIC_STATE)
 
@@ -1370,27 +1419,56 @@ def notify_access_status(email_subject: str, email_body: str, telegram_text: str
 def handle_access_notification_state(all_stores_blocked: bool, blocked_status_code) -> None:
     """Aktualizuje stan powiadomien o dostepie (ikea_access_notification w
     DYNAMIC_STATE, patrz get_access_notification_state()/
-    set_access_notification_state()) na podstawie wyniku JEDNEGO cyklu
-    sprawdzenia ofert (run_ikea_check_cycle()):
+    set_access_notification_state()) na podstawie wyniku JEDNEGO,
+    KWALIFIKUJACEGO SIE (pelny sukces albo pelna blokada 403/429 na
+    WSZYSTKICH skonfigurowanych sklepach) cyklu sprawdzenia ofert
+    (run_ikea_check_cycle()) - cykle czesciowe/mieszane NIE wywoluja tej
+    funkcji w ogole (patrz reset_pending_outage_after_partial_cycle()
+    nizej dla ich odrebnej obslugi).
 
-    - all_stores_blocked=True: caly cykl nie pobral danych z zadnego
-      sklepu z powodu HTTP 403/429 (patrz wywolanie w
-      run_ikea_check_cycle()). Jesli stan nie byl jeszcze aktywny, wysyla
-      DOKLADNIE JEDNO powiadomienie (notify_access_status()) i zapisuje
-      stan jako aktywny - trwale, na dysk, wiec restart procesu/systemd w
-      trakcie trwajacej blokady NIE wysle kolejnego alertu. Jesli stan byl
-      juz aktywny, nic nie robi (brak duplikatow).
-    - all_stores_blocked=False: brak blokady w tym cyklu. Jesli stan byl
-      aktywny (poprzednio wyslano alert o utracie dostepu), wysyla
-      DOKLADNIE JEDNO powiadomienie o odzyskaniu i resetuje stan - kolejne
-      udane cykle nie wysylaja kolejnych komunikatow. Jesli stan nie byl
-      aktywny, nic nie robi.
+    Polityka "DWOCH KOLEJNYCH cykli" (przeciw halasowi z pojedynczej,
+    przejsciowej blokady 403/429 - patrz zadanie/README): pierwszy w
+    pelni zablokowany cykl NIE wysyla jeszcze alertu, tylko oznacza
+    "oczekujaca" (niepotwierdzona) utrate dostepu (pending_outage=True).
+    Alert idzie na zewnatrz wylacznie po DRUGIM, NASTEPNYM z rzedu, w
+    pelni zablokowanym cyklu - to znaczy po drugiej faktycznej kontroli
+    IKEA wykonanej wtedy, kiedy zezwoli na nia istniejacy harmonogram
+    (globalny backoff/next_allowed_check_at/Retry-After - patrz
+    BackoffState/run_daemon()), NIE po ustalonym, sztywnym czasie. Ta
+    funkcja nigdy sama nie planuje/wywoluje kolejnego zapytania do API -
+    tylko reaguje na wynik cyklu, ktory juz sie odbyl.
 
-    Jesli sama dostawa powiadomienia calkowicie zawiedzie (wszystkie
-    aktywne kanaly zwrocily blad - identycznie jak w run_ikea_check_cycle()
-    dla notify(new_offers)), stan NIE jest oznaczany jako
-    wyslany/zresetowany - kolejny cykl z tym samym wynikiem sprobuje
-    wyslac powiadomienie ponownie, zamiast cicho "zgubic" alert."""
+    - all_stores_blocked=True (pelna blokada 403/429 na wszystkich
+      sklepach w tym cyklu):
+        - outage_active juz True -> alert byl juz wyslany, nic nie robi
+          (brak duplikatow).
+        - pending_outage jeszcze False -> to jest PIERWSZY kwalifikujacy
+          cykl z rzedu: zapisuje pending_outage=True (trwale, na dysk) i
+          wychodzi BEZ wysylania jakiegokolwiek powiadomienia.
+        - pending_outage juz True -> to jest DRUGI kwalifikujacy cykl z
+          rzedu (potwierdzenie): wysyla DOKLADNIE JEDNO powiadomienie
+          (notify_access_status()) i zapisuje outage_active=True,
+          pending_outage=False.
+    - all_stores_blocked=False (pelny sukces - wywolywane tylko gdy
+      full_cycle_fetched_successfully() bylo True dla tego cyklu):
+        - pending_outage byl True (pierwszy kwalifikujacy cykl NIE zostal
+          jeszcze potwierdzony drugim) -> pelny sukces PRZED alertem:
+          czysci pending_outage (i cala reszte stanu) do "pustego" stanu,
+          BEZ wysylania jakiegokolwiek powiadomienia (ani utraty, ani
+          odzyskania) - monitor po prostu wraca do normalnej pracy.
+        - outage_active byl False (i pending_outage rowniez False) -> nic
+          do zresetowania, nic nie robi.
+        - outage_active byl True (alert o utracie faktycznie wyslany
+          wczesniej) -> wysyla DOKLADNIE JEDNO powiadomienie o
+          odzyskaniu i resetuje caly stan.
+
+    Jesli sama dostawa powiadomienia (utraty ALBO odzyskania) calkowicie
+    zawiedzie (wszystkie aktywne kanaly zwrocily blad - identycznie jak w
+    run_ikea_check_cycle() dla notify(new_offers)), stan NIE jest
+    oznaczany jako wyslany/zresetowany - kolejny KWALIFIKUJACY cykl z tym
+    samym wynikiem sprobuje wyslac powiadomienie ponownie, zamiast cicho
+    "zgubic" alert (pending_outage/outage_active zostaja takie, jakie
+    byly PRZED ta proba dostawy)."""
     state = get_access_notification_state()
     active_channels = (1 if EMAIL_ENABLED else 0) + (1 if TELEGRAM_ENABLED else 0)
 
@@ -1398,6 +1476,23 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
         if state.get("outage_active"):
             return  # alert juz wyslany - brak duplikatow, patrz opis wyzej
 
+        if not state.get("pending_outage"):
+            # Pierwszy kwalifikujacy cykl z rzedu - oznacz jako oczekujacy
+            # (niepotwierdzony) i NIE wysylaj jeszcze zadnego alertu. Zapis
+            # jest trwaly (na dysk), wiec restart procesu/systemd PRZED
+            # drugim cyklem nie "zapomni" o tej pierwszej porazce.
+            set_access_notification_state(False, blocked_status_code, pending_outage=True)
+            log(
+                "Pierwszy w pelni zablokowany cykl (HTTP 403/429 na wszystkich "
+                "skonfigurowanych sklepach) - oznaczam jako oczekujaca utrata "
+                "dostepu, bez wysylania alertu. Alert pojdzie tylko, jesli "
+                "NASTEPNY kwalifikujacy cykl (wg istniejacego harmonogramu/"
+                "backoffu) rowniez bedzie w pelni zablokowany."
+            )
+            return
+
+        # pending_outage byl juz True -> to jest DRUGI kwalifikujacy cykl z
+        # rzedu - potwierdzenie, wysylamy alert.
         errors = notify_access_status(
             ACCESS_OUTAGE_EMAIL_SUBJECT, ACCESS_OUTAGE_MESSAGE, ACCESS_OUTAGE_TELEGRAM_MESSAGE
         )
@@ -1405,13 +1500,33 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
             log(f"Blad wysylki alertu o utracie dostepu ({err})", to_stderr=True)
         if errors and len(errors) == active_channels:
             # Calkowita porazka dostawy (wszystkie aktywne kanaly) - nie
-            # oznaczaj alertu jako wyslany, zeby kolejny cykl mogl sprobowac
-            # ponownie (patrz docstring).
+            # oznaczaj alertu jako wyslany; pending_outage zostaje True,
+            # wiec kolejny kwalifikujacy cykl sprobuje ponownie (patrz
+            # docstring) - bez ponownego przechodzenia przez caly
+            # dwucyklowy proces potwierdzania od zera.
             return
 
-        set_access_notification_state(True, blocked_status_code)
-        log("Wyslano alert o utracie dostepu do IKEA (HTTP 403/429).")
+        set_access_notification_state(True, blocked_status_code, pending_outage=False)
+        log(
+            "Wyslano alert o utracie dostepu do IKEA (HTTP 403/429) - "
+            "potwierdzone dwoma kolejnymi w pelni zablokowanymi cyklami."
+        )
     else:
+        if state.get("pending_outage"):
+            # Pelny sukces PRZED wyslaniem alertu (pierwszy kwalifikujacy
+            # cykl nie zostal potwierdzony drugim) - czysc oczekujacy stan
+            # calkowicie w cichosci, bez powiadomienia o utracie ANI o
+            # odzyskaniu (nie bylo jeszcze niczego, z czego "odzyskiwac" w
+            # rozumieniu uzytkownika). Monitor po prostu kontynuuje
+            # normalna prace.
+            set_access_notification_state(False, None, pending_outage=False)
+            log(
+                "Pelny sukces po oczekujacej (niepotwierdzonej) utracie "
+                "dostepu - czyszcze stan bez wysylania jakiegokolwiek "
+                "powiadomienia."
+            )
+            return
+
         if not state.get("outage_active"):
             return  # dostep nie byl uznany za utracony - nic do resetowania
 
@@ -1423,8 +1538,55 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
         if errors and len(errors) == active_channels:
             return
 
-        set_access_notification_state(False, None)
+        set_access_notification_state(False, None, pending_outage=False)
         log("Wyslano alert o odzyskaniu dostepu do IKEA.")
+
+
+def reset_pending_outage_after_partial_cycle() -> None:
+    """Cykl CZESCIOWY/MIESZANY (ani pelna blokada 403/429 na wszystkich
+    sklepach - patrz all_stores_blocked_by_403_429(), ani pelny sukces -
+    patrz full_cycle_fetched_successfully()) - np. jeden sklep OK i jeden
+    na 403, albo 403 na jednym sklepie i timeout/5xx/blad parsowania na
+    drugim. Taki cykl NIE jest druga kwalifikujaca sie porazka z rzedu w
+    rozumieniu zadania (wymog: "kazdy sklep musi zawiesc WYLACZNIE z
+    powodu HTTP 403/429").
+
+    Przyjeta, bezpieczna polityka (patrz zadanie, wymog 5): jesli byla
+    aktywna OCZEKUJACA (niepotwierdzona) sekwencja (pending_outage=True),
+    ten cykl ZERUJE ja - kolejna, PRZYSZLA pelna blokada 403/429 zaczyna
+    nowa, dwucyklowa sekwencje potwierdzania od nowa, zamiast "doliczyc"
+    sie do przerwanej sekwencji. Razem z pending_outage czyscimy tez
+    last_status_code TEGO bloku (ikea_access_notification) do None - byl
+    on zapamietany wylacznie na potrzeby jeszcze niepotwierdzonej
+    sekwencji (patrz handle_access_notification_state()), wiec po jej
+    zerowaniu nie ma juz zadnego znaczenia i nie powinien zostawac w
+    trwalym stanie jako "widmowy" kod 403/429. UWAGA: to jest WYLACZNIE
+    last_status_code bloku 'ikea_access_notification' - NIE dotyka to w
+    ogole odrebnego last_status_code w BackoffState/'blocking_backoff'
+    (patrz get_blocking_backoff_state()/update_blocking_backoff_state()),
+    ktory opisuje ostatni kod blokady dla GLOBALNEGO backoffu i jest
+    aktualizowany wylacznie przez update_blocking_backoff_state() -
+    ta funkcja go w zaden sposob nie modyfikuje. Nie dotyka juz WYSLANEGO
+    alertu (outage_active) - jesli byl aktywny, zostaje aktywny do
+    pierwszego PELNEGO sukcesu (patrz full_cycle_fetched_successfully()),
+    zgodnie z istniejacym wymogiem, ze odzyskanie wymaga pelnego sukcesu
+    (a wtedy jego last_status_code jest i tak zerowany osobno, w
+    handle_access_notification_state()). Cykl bez oczekujacej sekwencji
+    nie robi nic (nie ma czego zerowac, brak zapisu na dysk)."""
+    state = get_access_notification_state()
+    if not state.get("pending_outage"):
+        return
+    set_access_notification_state(
+        state.get("outage_active", False),
+        None,
+        pending_outage=False,
+    )
+    log(
+        "Czesciowy/mieszany cykl (nie pelna blokada 403/429, nie pelny "
+        "sukces) - zeruje oczekujaca, niepotwierdzona sekwencje utraty "
+        "dostepu. Kolejna pelna blokada 403/429 zacznie nowe, dwucyklowe "
+        "potwierdzanie od nowa."
+    )
 
 
 # ---------------- KOMENDY TELEGRAMA ----------------
@@ -1907,7 +2069,19 @@ def run_ikea_check_cycle() -> int:
     # zadna strone - to nie jest ani nowa utrata dostepu (patrz
     # all_stores_blocked_by_403_429()), ani "pelny cykl pobrany poprawnie"
     # wymagany do zresetowania alertu (patrz zadanie: wymog 9).
-    if all_stores_blocked_by_403_429(store_errors):
+    if not STORE_IDS:
+        # Brak skonfigurowanych sklepow (np. po /usunsklep na ostatnim
+        # aktywnym sklepie, patrz format_stores_message()) - fetch_all_offers()
+        # nie odpytuje wtedy zadnego API (petla po pustym STORE_IDS), a
+        # store_errors jest wiec zawsze pustym slownikiem. To NIE jest
+        # pelny sukces w rozumieniu zadania (wymog 6: taki przebieg nie
+        # moze liczyc sie jako potwierdzenie odzyskania dostepu ani jako
+        # kwalifikujaca sie porazka) - pomijamy caly dispatch, zamiast
+        # przypadkowo zresetowac/potwierdzic pending_outage albo
+        # outage_active na podstawie przebiegu, ktory w ogole nie
+        # sprawdzil IKEA.
+        pass
+    elif all_stores_blocked_by_403_429(store_errors):
         blocked_status_code = sorted({
             exc.status_code for exc in store_errors.values()
             if isinstance(exc, BlockedByServerError)
@@ -1915,6 +2089,14 @@ def run_ikea_check_cycle() -> int:
         handle_access_notification_state(True, blocked_status_code)
     elif full_cycle_fetched_successfully(store_errors):
         handle_access_notification_state(False, None)
+    else:
+        # Cykl czesciowy/mieszany (patrz
+        # reset_pending_outage_after_partial_cycle()) - nie jest ani nowa
+        # kwalifikujaca sie porazka, ani "pelny cykl pobrany poprawnie"
+        # wymagany do zresetowania/potwierdzenia alertu (patrz zadanie:
+        # wymog 5/9). Zeruje jedynie OCZEKUJACA (niepotwierdzona)
+        # sekwencje, jesli byla aktywna - nie dotyka juz wyslanego alertu.
+        reset_pending_outage_after_partial_cycle()
 
     if store_errors and len(store_errors) >= len(STORE_IDS):
         log(
