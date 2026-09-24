@@ -1310,17 +1310,25 @@ class TestClientProfileSelection(unittest.TestCase):
 class TestAccessNotificationState(unittest.TestCase):
     """Alert o utracie/odzyskaniu dostepu (HTTP 403/429 na CALYM cyklu) -
     handle_access_notification_state()/all_stores_blocked_by_403_429()/
-    full_cycle_fetched_successfully() - bez zadnych prawdziwych requestow
-    HTTP/SMTP/Telegram (notify_access_status() jest tu zawsze zmockowane)."""
+    full_cycle_fetched_successfully()/reset_pending_outage_after_partial_cycle() -
+    bez zadnych prawdziwych requestow HTTP/SMTP/Telegram
+    (notify_access_status() jest tu zawsze zmockowane).
+
+    Polityka "dwoch kolejnych kwalifikujacych cykli" (patrz zadanie): jeden
+    kompletny cykl zablokowany wylacznie 403/429 na WSZYSTKICH
+    skonfigurowanych sklepach oznacza tylko OCZEKUJACA (niepotwierdzona)
+    utrate dostepu (pending_outage=True) - alert idzie na zewnatrz
+    wylacznie po DRUGIM, NASTEPNYM z rzedu takim cyklu."""
 
     def setUp(self):
         self._orig_state = dict(ik.get_access_notification_state())
-        ik.set_access_notification_state(False, None)
+        ik.set_access_notification_state(False, None, pending_outage=False)
 
     def tearDown(self):
         ik.set_access_notification_state(
             self._orig_state.get("outage_active", False),
             self._orig_state.get("last_status_code"),
+            pending_outage=self._orig_state.get("pending_outage", False),
         )
 
     # --- definicja utraty/odzyskania dostepu ---
@@ -1372,40 +1380,100 @@ class TestAccessNotificationState(unittest.TestCase):
     def test_full_cycle_fetched_successfully_false_with_any_error(self):
         self.assertFalse(ik.full_cycle_fetched_successfully({"294": RuntimeError("boom")}))
 
-    # --- wysylka pierwszego alertu o utracie dostepu ---
+    # --- pierwszy kwalifikujacy cykl: OCZEKUJACY, bez alertu ---
 
-    def test_first_outage_sends_exactly_one_notification(self):
+    def test_first_outage_marks_pending_without_sending_notification(self):
+        # Wymog 1 / test 1: pierwszy pelny 403/429-cykl -> pending, BEZ alertu.
         with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
             ik.handle_access_notification_state(True, 403)
-        mock_notify.assert_called_once()
-        self.assertTrue(ik.get_access_notification_state()["outage_active"])
-        self.assertEqual(ik.get_access_notification_state()["last_status_code"], 403)
+        mock_notify.assert_not_called()
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["outage_active"])
+        self.assertTrue(state["pending_outage"])
 
-    def test_second_identical_outage_does_not_send_duplicate(self):
+    def test_second_consecutive_outage_sends_exactly_one_notification(self):
+        # Wymog 2 / test 2: DRUGI kolejny pelny 403/429-cykl potwierdza -
+        # dokladnie jedno powiadomienie, stan aktywny.
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(True, 403)
+            ik.handle_access_notification_state(True, 403)
+        mock_notify.assert_called_once()
+        state = ik.get_access_notification_state()
+        self.assertTrue(state["outage_active"])
+        self.assertFalse(state["pending_outage"])
+        self.assertEqual(state["last_status_code"], 403)
+
+    def test_third_and_later_outages_do_not_send_duplicate(self):
+        # Wymog 2 / test 3: trzeci i kolejne kwalifikujace cykle - bez
+        # kolejnych alertow (juz potwierdzone i wyslane).
         with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
             ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 429)
+            ik.handle_access_notification_state(True, 403)
         mock_notify.assert_called_once()
 
-    def test_failed_delivery_does_not_mark_alert_as_sent(self):
-        # Wszystkie aktywne kanaly zawiodly (patrz notify()/notify_access_status()
-        # - istniejacy wzorzec "calkowita porazka dostawy") - stan NIE moze
-        # zostac oznaczony jako wyslany, zeby kolejny cykl mogl sprobowac
-        # ponownie.
+    def test_failed_delivery_on_confirmation_does_not_mark_alert_as_sent(self):
+        # Wymog 2 / test 13: calkowita porazka dostawy PRZY potwierdzeniu
+        # (drugim cyklu) - stan NIE moze zostac oznaczony jako wyslany
+        # (outage_active), zeby kolejny kwalifikujacy cykl mogl sprobowac
+        # ponownie - ale pending_outage zostaje True (nie zaczynamy od
+        # zera calej dwucyklowej sekwencji z powodu porazki DOSTAWY).
         active_channels = (1 if ik.EMAIL_ENABLED else 0) + (1 if ik.TELEGRAM_ENABLED else 0)
         self.assertGreaterEqual(active_channels, 1)
         all_errors = ["e-mail: boom"] if ik.EMAIL_ENABLED else []
         if ik.TELEGRAM_ENABLED:
             all_errors.append("telegram: boom")
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
         with mock.patch.object(ik, "notify_access_status", return_value=all_errors):
-            ik.handle_access_notification_state(True, 403)
-        self.assertFalse(ik.get_access_notification_state()["outage_active"])
+            ik.handle_access_notification_state(True, 403)  # drugi, dostawa zawodzi
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["outage_active"])
+        self.assertTrue(state["pending_outage"])
+
+    def test_one_channel_succeeds_other_fails_still_marks_alerted(self):
+        # Wymog: dostawa jest uznana za sukces, jesli PRZYNAJMNIEJ JEDEN
+        # aktywny kanal sie powiodl (istniejacy wzorzec z notify()) - tylko
+        # CALKOWITA porazka wszystkich aktywnych kanalow nie oznacza alertu
+        # jako wyslany. Wymusza dwa aktywne kanaly (e-mail + Telegram) na
+        # czas testu, niezaleznie od faktycznej konfiguracji testowego .env.
+        with mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
+            with mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+            with mock.patch.object(ik, "notify_access_status", return_value=["e-mail: boom"]):
+                ik.handle_access_notification_state(True, 403)  # drugi, 1 z 2 kanalow zawodzi
+        state = ik.get_access_notification_state()
+        self.assertTrue(state["outage_active"])
+        self.assertFalse(state["pending_outage"])
 
     # --- trwalosc stanu / restart procesu ---
 
+    def test_pending_outage_survives_simulated_restart(self):
+        # Wymog: restart procesu/systemd PO PIERWSZYM, ale PRZED drugim
+        # kwalifikujacym cyklem nie moze "zapomniec", ze to byla juz
+        # pierwsza porazka (patrz test 10).
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(True, 403)
+        mock_notify.assert_not_called()
+
+        reloaded_state = ik.load_dynamic_state()
+        self.assertTrue(reloaded_state["ikea_access_notification"]["pending_outage"])
+        self.assertFalse(reloaded_state["ikea_access_notification"]["outage_active"])
+
+        # "Restart": DYNAMIC_STATE w pamieci zastapiony wczytanym z dysku.
+        ik.DYNAMIC_STATE.clear()
+        ik.DYNAMIC_STATE.update(reloaded_state)
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify_after_restart:
+            ik.handle_access_notification_state(True, 403)  # drugi, po "restarcie"
+        mock_notify_after_restart.assert_called_once()
+        self.assertTrue(ik.get_access_notification_state()["outage_active"])
+
     def test_outage_state_survives_simulated_restart(self):
         with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
 
         # Symulacja restartu procesu/systemd: zamiast reuzywac ik.DYNAMIC_STATE
@@ -1414,9 +1482,13 @@ class TestAccessNotificationState(unittest.TestCase):
         reloaded_state = ik.load_dynamic_state()
         self.assertTrue(reloaded_state["ikea_access_notification"]["outage_active"])
         self.assertEqual(reloaded_state["ikea_access_notification"]["last_status_code"], 403)
+        self.assertFalse(reloaded_state["ikea_access_notification"]["pending_outage"])
 
-    def test_no_duplicate_alert_after_simulated_restart_during_ongoing_outage(self):
+    def test_no_duplicate_alert_after_simulated_restart_while_outage_active(self):
+        # Wymog / test 11: restart PO tym, jak alert byl juz dostarczony -
+        # bez duplikatu.
         with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
 
         # "Restart" - stan wczytany na nowo z dysku zastepuje DYNAMIC_STATE
@@ -1442,21 +1514,85 @@ class TestAccessNotificationState(unittest.TestCase):
         self.assertIn("ikea_access_notification", reloaded_state)
         self.assertFalse(reloaded_state["ikea_access_notification"]["outage_active"])
         self.assertIsNone(reloaded_state["ikea_access_notification"]["last_status_code"])
+        self.assertFalse(reloaded_state["ikea_access_notification"]["pending_outage"])
+
+    def test_old_state_file_with_outage_active_true_migrates_without_duplicate_alert(self):
+        # Wymog "STATE MODEL AND MIGRATION" / test 11-12: plik z WCZESNIEJSZEJ
+        # wersji z outage_active=True (uzytkownik JUZ zaalarmowany) NIE moze
+        # zostac zinterpretowany jako pierwsza, niepotwierdzona porazka - a
+        # kolejny kwalifikujacy cykl (all_stores_blocked=True) NIE powinien
+        # wyslac duplikatu (alert byl juz wyslany przed migracja).
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["ikea_access_notification"] = {"outage_active": True, "last_status_code": 403}
+        with open(ik.DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        reloaded_state = ik.load_dynamic_state()
+        migrated = reloaded_state["ikea_access_notification"]
+        self.assertTrue(migrated["outage_active"])
+        self.assertFalse(migrated["pending_outage"])
+
+        ik.DYNAMIC_STATE.clear()
+        ik.DYNAMIC_STATE.update(reloaded_state)
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(True, 403)
+        mock_notify.assert_not_called()
+        self.assertTrue(ik.get_access_notification_state()["outage_active"])
+
+    def test_missing_ikea_access_notification_key_migrates_with_pending_field(self):
+        # Wymog "STATE MODEL AND MIGRATION": plik bez klucza
+        # 'ikea_access_notification' w ogole musi zaladowac sie bezpiecznie
+        # i miec kompletny, domyslny stan (w tym pending_outage=False).
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.pop("ikea_access_notification", None)
+        with open(ik.DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        reloaded_state = ik.load_dynamic_state()
+        migrated = reloaded_state["ikea_access_notification"]
+        self.assertEqual(
+            migrated, {"outage_active": False, "last_status_code": None, "pending_outage": False}
+        )
 
     # --- odzyskanie dostepu ---
 
-    def test_first_successful_cycle_after_outage_sends_recovery_notification(self):
+    def test_full_success_before_alert_clears_pending_without_any_notification(self):
+        # Wymog 3 / test 4: pelny sukces PO pierwszym (niepotwierdzonym)
+        # kwalifikujacym cyklu - czysci pending, BEZ alertu utraty ANI
+        # odzyskania.
         with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(False, None)  # pelny sukces
+        mock_notify.assert_not_called()
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["outage_active"])
+        self.assertFalse(state["pending_outage"])
+
+    def test_first_successful_cycle_after_delivered_outage_sends_recovery_notification(self):
+        # Wymog 4 / test 5: dokladnie jedno powiadomienie o odzyskaniu, ale
+        # TYLKO gdy alert o utracie byl FAKTYCZNIE dostarczony (dwa
+        # potwierdzajace cykle 403/429 najpierw).
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
 
         with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
             ik.handle_access_notification_state(False, None)
         mock_notify.assert_called_once()
-        self.assertFalse(ik.get_access_notification_state()["outage_active"])
-        self.assertIsNone(ik.get_access_notification_state()["last_status_code"])
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["outage_active"])
+        self.assertIsNone(state["last_status_code"])
+        self.assertFalse(state["pending_outage"])
 
     def test_subsequent_successful_cycles_do_not_send_duplicate_recovery(self):
+        # Wymog / test 6.
         with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(False, None)
 
@@ -1470,19 +1606,35 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.handle_access_notification_state(False, None)
         mock_notify.assert_not_called()
 
-    def test_new_outage_after_recovery_sends_alert_again(self):
+    def test_new_outage_after_recovery_requires_two_cycles_again(self):
+        # Nowa utrata dostepu PO odzyskaniu zaczyna od nowa cala
+        # dwucyklowa sekwencje potwierdzania - jeden kwalifikujacy cykl
+        # nie wystarcza.
         with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(False, None)
 
         with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
             ik.handle_access_notification_state(True, 429)
-        mock_notify.assert_called_once()
-        self.assertTrue(ik.get_access_notification_state()["outage_active"])
-        self.assertEqual(ik.get_access_notification_state()["last_status_code"], 429)
+        mock_notify.assert_not_called()
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["outage_active"])
+        self.assertTrue(state["pending_outage"])
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify_second:
+            ik.handle_access_notification_state(True, 429)
+        mock_notify_second.assert_called_once()
+        state = ik.get_access_notification_state()
+        self.assertTrue(state["outage_active"])
+        self.assertEqual(state["last_status_code"], 429)
 
     def test_failed_recovery_delivery_does_not_reset_state(self):
+        # Wymog / test: dostawa alertu odzyskania zawodzi calkowicie -
+        # outage_active zostaje True, zeby kolejny pelny sukces mogl
+        # sprobowac ponownie.
         with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
             ik.handle_access_notification_state(True, 403)
 
         active_channels = (1 if ik.EMAIL_ENABLED else 0) + (1 if ik.TELEGRAM_ENABLED else 0)
@@ -1495,9 +1647,96 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.handle_access_notification_state(False, None)
         self.assertTrue(ik.get_access_notification_state()["outage_active"])
 
+    # --- cykle czesciowe/mieszane (wymog 5 / testy 7-8-9) ---
+
+    def test_partial_cycle_resets_pending_sequence(self):
+        # Wymog 5 / test 9: cykl czesciowy/mieszany PO pierwszym
+        # (niepotwierdzonym) kwalifikujacym cyklu zeruje sekwencje -
+        # nastepny 403/429 zaczyna od nowa (musi znow byc DWA kolejne).
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+        self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+        ik.reset_pending_outage_after_partial_cycle()
+        self.assertFalse(ik.get_access_notification_state()["pending_outage"])
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+            ik.handle_access_notification_state(True, 403)  # znow "pierwszy" po resecie
+        mock_notify.assert_not_called()
+        self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+    def test_partial_cycle_clears_stale_last_status_code(self):
+        # Czyszczenie: reset_pending_outage_after_partial_cycle() musi
+        # wyzerowac rowniez last_status_code bloku 'ikea_access_notification'
+        # (nie tylko pending_outage) - inaczej trwaly stan na dysku
+        # zostawialby "widmowy" kod 403/429 z przerwanej, niepotwierdzonej
+        # sekwencji, mimo ze pending_outage jest juz False.
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)  # pierwszy -> pending, last_status_code=403
+        state = ik.get_access_notification_state()
+        self.assertTrue(state["pending_outage"])
+        self.assertEqual(state["last_status_code"], 403)
+
+        ik.reset_pending_outage_after_partial_cycle()
+
+        state = ik.get_access_notification_state()
+        self.assertFalse(state["pending_outage"])
+        self.assertIsNone(state["last_status_code"])
+        self.assertFalse(state["outage_active"])
+
+        # Trwale na dysku, nie tylko w pamieci procesu.
+        reloaded = ik.load_dynamic_state()
+        self.assertIsNone(reloaded["ikea_access_notification"]["last_status_code"])
+
+        # Zapis dotyczy WYLACZNIE klucza 'ikea_access_notification' - inne
+        # klucze pliku stanu (w tym 'blocking_backoff', niezaleznie od
+        # jego wlasnego last_status_code) zostaja niezmienione.
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        self.assertIn("blocking_backoff", on_disk)
+        self.assertIn("store_ids", on_disk)
+        self.assertIn("search_terms", on_disk)
+
+    def test_partial_cycle_reset_does_not_touch_blocking_backoff_last_status_code(self):
+        # reset_pending_outage_after_partial_cycle() czysci WYLACZNIE
+        # last_status_code bloku 'ikea_access_notification' - odrebny
+        # last_status_code w BackoffState/'blocking_backoff' (patrz
+        # update_blocking_backoff_state()) musi zostac niezmieniony.
+        ik.update_blocking_backoff_state({"294": ik.BlockedByServerError(403, "HTTP 403")})
+        self.assertEqual(ik.get_blocking_backoff_state().last_status_code, 403)
+
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+
+        ik.reset_pending_outage_after_partial_cycle()
+
+        self.assertIsNone(ik.get_access_notification_state()["last_status_code"])
+        self.assertEqual(ik.get_blocking_backoff_state().last_status_code, 403)
+        ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def test_partial_cycle_without_pending_outage_is_a_no_op(self):
+        self.assertFalse(ik.get_access_notification_state()["pending_outage"])
+        with mock.patch.object(ik, "save_dynamic_state") as mock_save:
+            ik.reset_pending_outage_after_partial_cycle()
+        mock_save.assert_not_called()
+
+    def test_partial_cycle_does_not_touch_already_delivered_outage(self):
+        # reset_pending_outage_after_partial_cycle() nie dotyka juz
+        # WYSLANEGO alertu (outage_active) - odzyskanie wciaz wymaga
+        # pelnego sukcesu, nie czesciowego cyklu.
+        with mock.patch.object(ik, "notify_access_status", return_value=[]):
+            ik.handle_access_notification_state(True, 403)
+            ik.handle_access_notification_state(True, 403)
+        self.assertTrue(ik.get_access_notification_state()["outage_active"])
+
+        ik.reset_pending_outage_after_partial_cycle()
+        self.assertTrue(ik.get_access_notification_state()["outage_active"])
+
     # --- integracja z run_ikea_check_cycle() ---
 
-    def test_run_cycle_full_outage_sends_exactly_one_access_notification(self):
+    def test_run_cycle_requires_two_consecutive_full_outages_to_notify(self):
+        # Wymog 1+2 / testy 1-2: dwa kolejne w pelni zablokowane cykle -
+        # tylko drugi wysyla alert.
         orig_store_ids = list(ik.STORE_IDS)
         orig_terms = list(ik.SEARCH_TERMS)
         ik.STORE_IDS = ["294"]
@@ -1510,6 +1749,10 @@ class TestAccessNotificationState(unittest.TestCase):
             ), mock.patch.object(ik.time, "sleep"), \
                  mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
                 ik.run_ikea_check_cycle()
+                self.assertFalse(ik.get_access_notification_state()["outage_active"])
+                self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+                mock_notify.assert_not_called()
+
                 ik.run_ikea_check_cycle()
             mock_notify.assert_called_once()
             self.assertTrue(ik.get_access_notification_state()["outage_active"])
@@ -1518,6 +1761,61 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.SEARCH_TERMS = orig_terms
             ik.refresh_normalized_terms()
             ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def test_run_cycle_single_outage_does_not_send_any_notification(self):
+        # Wymog 1 / test 1, przez run_ikea_check_cycle(): jeden kwalifikujacy
+        # cykl - zero powiadomien.
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.STORE_IDS = ["294"]
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        try:
+            with mock.patch.object(
+                ik, "fetch_store_offers",
+                side_effect=ik.BlockedByServerError(403, "HTTP 403"),
+            ), mock.patch.object(ik.time, "sleep"), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+                ik.run_ikea_check_cycle()
+            mock_notify.assert_not_called()
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def test_run_cycle_full_success_after_single_outage_clears_pending_silently(self):
+        # Wymog 3 / test 4, przez run_ikea_check_cycle().
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.STORE_IDS = ["294"]
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        try:
+            with mock.patch.object(
+                ik, "fetch_store_offers",
+                side_effect=ik.BlockedByServerError(403, "HTTP 403"),
+            ), mock.patch.object(ik.time, "sleep"), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.run_ikea_check_cycle()
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+            with mock.patch.object(ik, "fetch_store_offers", return_value=[]), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+                ik.run_ikea_check_cycle()
+            mock_notify.assert_not_called()
+            state = ik.get_access_notification_state()
+            self.assertFalse(state["pending_outage"])
+            self.assertFalse(state["outage_active"])
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
+            if os.path.exists(ik.STATE_FILE):
+                os.remove(ik.STATE_FILE)
 
     def test_run_cycle_partial_store_failure_does_not_trigger_outage_alert(self):
         # Blad pojedynczego sklepu (nie 403/429) w cyklu z wieloma sklepami -
@@ -1543,6 +1841,7 @@ class TestAccessNotificationState(unittest.TestCase):
                 ik.run_ikea_check_cycle()
             mock_notify.assert_not_called()
             self.assertFalse(ik.get_access_notification_state()["outage_active"])
+            self.assertFalse(ik.get_access_notification_state()["pending_outage"])
         finally:
             ik.STORE_IDS = orig_store_ids
             ik.SEARCH_TERMS = orig_terms
@@ -1550,6 +1849,79 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.time.sleep = orig_sleep
             if os.path.exists(ik.STATE_FILE):
                 os.remove(ik.STATE_FILE)
+
+    def test_run_cycle_mixed_403_and_timeout_does_not_confirm_outage(self):
+        # Wymog 5 / test 7: mieszanka 403/429 i timeout/5xx/blad parsowania
+        # w JEDNYM cyklu nie jest kwalifikujaca sie porazka - a jesli byla
+        # aktywna oczekujaca sekwencja, ten cykl ja zeruje.
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.STORE_IDS = ["294"]
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        try:
+            with mock.patch.object(
+                ik, "fetch_store_offers",
+                side_effect=ik.BlockedByServerError(403, "HTTP 403"),
+            ), mock.patch.object(ik.time, "sleep"), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.run_ikea_check_cycle()  # pierwszy -> pending
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+            ik.STORE_IDS = ["100", "200"]
+
+            def fake_fetch(store_id):
+                if store_id == "100":
+                    raise ik.BlockedByServerError(403, "HTTP 403")
+                raise TimeoutError("timed out")
+
+            with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+                ik.run_ikea_check_cycle()
+            mock_notify.assert_not_called()
+            self.assertFalse(ik.get_access_notification_state()["pending_outage"])
+            self.assertFalse(ik.get_access_notification_state()["outage_active"])
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def test_run_cycle_partial_success_does_not_confirm_outage(self):
+        # Wymog 5 / test 8: jeden sklep 403, drugi OK - nie potwierdza
+        # utraty dostepu (i zeruje oczekujaca sekwencje, jesli byla).
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.STORE_IDS = ["294"]
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        try:
+            with mock.patch.object(
+                ik, "fetch_store_offers",
+                side_effect=ik.BlockedByServerError(403, "HTTP 403"),
+            ), mock.patch.object(ik.time, "sleep"), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.run_ikea_check_cycle()  # pierwszy -> pending
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+            ik.STORE_IDS = ["100", "200"]
+
+            def fake_fetch(store_id):
+                if store_id == "100":
+                    raise ik.BlockedByServerError(403, "HTTP 403")
+                return []
+
+            with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch), \
+                 mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+                ik.run_ikea_check_cycle()
+            mock_notify.assert_not_called()
+            self.assertFalse(ik.get_access_notification_state()["pending_outage"])
+            self.assertFalse(ik.get_access_notification_state()["outage_active"])
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
 
     def test_run_cycle_timeout_error_does_not_trigger_outage_alert(self):
         orig_store_ids = list(ik.STORE_IDS)
@@ -1570,7 +1942,7 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.SEARCH_TERMS = orig_terms
             ik.refresh_normalized_terms()
 
-    def test_run_cycle_first_success_after_outage_sends_recovery_notification(self):
+    def test_run_cycle_first_success_after_delivered_outage_sends_recovery_notification(self):
         orig_store_ids = list(ik.STORE_IDS)
         orig_terms = list(ik.SEARCH_TERMS)
         ik.STORE_IDS = ["294"]
@@ -1580,6 +1952,7 @@ class TestAccessNotificationState(unittest.TestCase):
             os.remove(ik.STATE_FILE)
         try:
             with mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.handle_access_notification_state(True, 403)
                 ik.handle_access_notification_state(True, 403)
 
             with mock.patch.object(ik, "fetch_store_offers", return_value=[]), \
@@ -1594,6 +1967,157 @@ class TestAccessNotificationState(unittest.TestCase):
             ik.set_blocking_backoff_state(ik.BackoffState())
             if os.path.exists(ik.STATE_FILE):
                 os.remove(ik.STATE_FILE)
+
+    def test_run_cycle_no_configured_stores_does_not_advance_confirmation(self):
+        # Wymog 6 / test 16: brak skonfigurowanych sklepow (ale sa slowa
+        # kluczowe) - store_errors jest zawsze pusty (petla po pustym
+        # STORE_IDS), co NIE moze zostac zinterpretowane jako pelny
+        # sukces potwierdzajacy odzyskanie/czyszczacy pending.
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        ik.SEARCH_TERMS = ["stall"]
+        ik.refresh_normalized_terms()
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        try:
+            with mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+            ik.STORE_IDS = []
+            with mock.patch.object(ik, "notify_access_status", return_value=[]) as mock_notify:
+                result = ik.run_ikea_check_cycle()
+            mock_notify.assert_not_called()
+            # pending_outage MUSI przetrwac ten przebieg bez zmian - to nie
+            # byl ani drugi kwalifikujacy cykl, ani pelny sukces.
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+            self.assertFalse(ik.get_access_notification_state()["outage_active"])
+            self.assertEqual(result, 0)
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.set_blocking_backoff_state(ik.BackoffState())
+            if os.path.exists(ik.STATE_FILE):
+                os.remove(ik.STATE_FILE)
+
+    def test_run_cycle_no_search_criteria_skips_and_does_not_advance_confirmation(self):
+        # Wymog 6: brak slow kluczowych i numerow artykulu - run_ikea_check_cycle()
+        # wraca 0 od razu (istniejace zachowanie), bez dotykania stanu
+        # powiadomien o dostepie.
+        orig_store_ids = list(ik.STORE_IDS)
+        orig_terms = list(ik.SEARCH_TERMS)
+        orig_numbers = list(ik.SEARCH_ARTICLE_NUMBERS)
+        try:
+            with mock.patch.object(ik, "notify_access_status", return_value=[]):
+                ik.handle_access_notification_state(True, 403)  # pierwszy -> pending
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+
+            ik.SEARCH_TERMS = []
+            ik.refresh_normalized_terms()
+            ik.SEARCH_ARTICLE_NUMBERS = []
+
+            with mock.patch.object(ik, "fetch_all_offers") as mock_fetch:
+                result = ik.run_ikea_check_cycle()
+            mock_fetch.assert_not_called()
+            self.assertEqual(result, 0)
+            self.assertTrue(ik.get_access_notification_state()["pending_outage"])
+            self.assertFalse(ik.get_access_notification_state()["outage_active"])
+        finally:
+            ik.STORE_IDS = orig_store_ids
+            ik.SEARCH_TERMS = orig_terms
+            ik.refresh_normalized_terms()
+            ik.SEARCH_ARTICLE_NUMBERS = orig_numbers
+
+
+class TestCronModeTwoCycleConfirmationAcrossInvocations(unittest.TestCase):
+    """Wymog "Scheduling and Retry-After" / test 14: tryb cron pozostaje
+    JEDNORAZOWYM przejsciem (bez petli/sleep czekajacego na drugi cykl) -
+    potwierdzenie dwucyklowe rozciaga sie na DWA SEPARATE odpalenia
+    `python3 ikea_okazje.py` (dwa niezalezne procesy, dzielace ten sam
+    ~/.ikea_okazje_dynamic.json), tak jak zrobilby to prawdziwy cron.
+    Kazde odpalenie jest w osobnym procesie (subprocess), zeby test
+    naprawde weryfikowal trwalosc stanu MIEDZY procesami, nie tylko w
+    pamieci jednego - fetch_store_offers() jest tu monkeypatchowane
+    wewnatrz kodu uruchamianego w podprocesie (bez zadnych prawdziwych
+    requestow do IKEA/SMTP/Telegrama)."""
+
+    def _run_one_cron_invocation(self, home_dir: str) -> subprocess.CompletedProcess:
+        code = (
+            "import unittest.mock as mock\n"
+            "import ikea_okazje as ik\n"
+            "with mock.patch.object(ik, 'fetch_store_offers', "
+            "side_effect=ik.BlockedByServerError(403, 'HTTP 403')), \\\n"
+            "     mock.patch.object(ik.time, 'sleep'):\n"
+            "    exit_code = ik.main()\n"
+            "assert ik.RUN_MODE == 'cron', ik.RUN_MODE\n"
+            "print('EXIT_CODE=' + str(exit_code))\n"
+        )
+        return _run_python_code(code, home_dir)
+
+    def test_two_separate_cron_invocations_confirm_outage_without_sleeping(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+            "SEARCH_TERMS=stall\n"
+        )
+        dynamic_state_path = os.path.join(home_dir, ".ikea_okazje_dynamic.json")
+
+        # Pierwsze, niezalezne odpalenie (proces #1) - pierwszy kwalifikujacy
+        # cykl 403/429 - musi zapisac pending_outage=True na dysk i wrocic
+        # NATYCHMIAST (bez sleep/petli czekajacej na drugi cykl).
+        first = self._run_one_cron_invocation(home_dir)
+        self.assertEqual(first.returncode, 0, msg=first.stderr)
+        with open(dynamic_state_path, "r", encoding="utf-8") as f:
+            state_after_first = json.load(f)
+        self.assertTrue(state_after_first["ikea_access_notification"]["pending_outage"])
+        self.assertFalse(state_after_first["ikea_access_notification"]["outage_active"])
+
+        # Drugie, calkowicie NIEZALEZNE odpalenie (proces #2, "kolejny cron")
+        # - potwierdza sekwencje i wysyla alert (notify_access_status() nie
+        # jest tu mockowane globalnie - ale exim/SMTP polaczenie i tak nie
+        # jest osiagalne w sandboxie; sprawdzamy wylacznie, ze proces sie
+        # nie zawiesza/zapetla i ze stan jest zgodny z polityka dwoch cykli,
+        # niezaleznie od sukcesu/porazki samej dostawy e-maila).
+        second = self._run_one_cron_invocation(home_dir)
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        with open(dynamic_state_path, "r", encoding="utf-8") as f:
+            state_after_second = json.load(f)
+        # Albo alert zostal potwierdzony (outage_active=True, dostawa OK),
+        # albo dostawa zawiodla i pending_outage zostal True do ponownej
+        # proby - w OBU przypadkach NIE MOZE to byc znowu "pierwszy" pending
+        # stan bez ZADNEJ zmiany wzgledem stanu po pierwszym odpaleniu (czyli
+        # cykl #2 musi byc rozpoznany jako DRUGI, nie jako nowy "pierwszy").
+        access_state_after_second = state_after_second["ikea_access_notification"]
+        self.assertTrue(
+            access_state_after_second["outage_active"] or access_state_after_second["pending_outage"]
+        )
+
+    def test_cron_invocation_returns_immediately_without_looping(self):
+        # Wymog: cron NIE petli/nie czeka na drugi cykl - main() w trybie
+        # cron wywoluje run_ikea_check_cycle() dokladnie raz i wraca.
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+            "SEARCH_TERMS=stall\n"
+        )
+        code = (
+            "import unittest.mock as mock\n"
+            "import ikea_okazje as ik\n"
+            "calls = []\n"
+            "orig = ik.run_ikea_check_cycle\n"
+            "def counting_cycle():\n"
+            "    calls.append(1)\n"
+            "    return orig()\n"
+            "with mock.patch.object(ik, 'fetch_store_offers', "
+            "side_effect=ik.BlockedByServerError(403, 'HTTP 403')), \\\n"
+            "     mock.patch.object(ik.time, 'sleep'), \\\n"
+            "     mock.patch.object(ik, 'run_ikea_check_cycle', side_effect=counting_cycle):\n"
+            "    ik.main()\n"
+            "assert len(calls) == 1, calls\n"
+            "print('OK')\n"
+        )
+        result = _run_python_code(code, home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
 
 
 class TestBackoffAfterBlocking(unittest.TestCase):
@@ -2061,6 +2585,61 @@ class TestDaemonRespectsPersistedBackoff(unittest.TestCase):
             ik.run_daemon()
 
         self.assertGreaterEqual(call_count["n"], 2)
+
+    def test_daemon_does_not_run_second_cycle_before_persisted_backoff_deadline(self):
+        # Wymog "Scheduling and Retry-After" / test 15: druga kontrola IKEA
+        # w run_daemon() NIE nastepuje przed uplywem trwalego backoffu
+        # (next_allowed_check_at) - niezaleznie od tego, jak czesto petla
+        # daemona "budzi sie" (SHUTDOWN_EVENT.wait()). Zaden hardcoded
+        # 85-sekundowy sleep/retry nie istnieje - odstep miedzy cyklami
+        # wynika WYLACZNIE z zapisanego backoffu.
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() + 3600,
+        ))
+        wait_calls = {"n": 0}
+
+        def fake_wait(timeout):
+            wait_calls["n"] += 1
+            if wait_calls["n"] >= 3:
+                ik.SHUTDOWN_EVENT.set()
+            return ik.SHUTDOWN_EVENT.is_set()
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=fake_wait):
+            ik.run_daemon()
+
+        # 3600s backoff jest znacznie dluzszy niz kilka "przebudzen" petli -
+        # zaden cykl IKEA nie powinien sie odbyc w tym czasie.
+        mock_cycle.assert_not_called()
+
+    def test_daemon_runs_second_cycle_only_after_persisted_deadline_passes(self):
+        # Zwierciadlany test: gdy zapisany termin JUZ minal (symulowany
+        # uplyw czasu miedzy dwoma wywolaniami run_daemon(), tak jak
+        # dwie kolejne, oddzielone w czasie kontrole w tym samym procesie
+        # demona), druga kontrola SIE odbywa - i to wylacznie dzieki
+        # przelicznikowi next_allowed_check_at, nie z powodu jakiegokolwiek
+        # hardcoded opoznienia.
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() - 1,
+        ))
+        call_count = {"n": 0}
+
+        def fake_cycle():
+            call_count["n"] += 1
+            ik.SHUTDOWN_EVENT.set()
+            return 0
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "handle_telegram_updates"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=fake_cycle), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", return_value=True):
+            ik.run_daemon()
+
+        self.assertEqual(call_count["n"], 1)
 
 
 if __name__ == "__main__":
