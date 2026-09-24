@@ -497,29 +497,106 @@ nie opóźnia zaplanowanej kontroli. Znacznik czasu ostatniego sprawdzenia
 jest ustawiany **po** zakończeniu cyklu (nie przed nim), więc czas
 trwania samego pobierania nie skraca kolejnego interwału.
 
-#### Alert o utracie i odzyskaniu dostępu (HTTP 403/429)
+#### Alert o utracie i odzyskaniu dostępu (HTTP 403/429) - potwierdzenie dwoma kolejnymi cyklami
 
 Niezależnie od backoffu opisanego wyżej (który dotyczy tylko odstępu
 między próbami w trybie `daemon` i żyje w osobnym polu pliku stanu,
 patrz "Trwały backoff po 403/429" wyżej), skrypt wysyła też - przez te
 same, już skonfigurowane kanały (e-mail i/albo Telegram) - krótkie
-powiadomienie o **stanie dostępu** do danych IKEA:
+powiadomienie o **stanie dostępu** do danych IKEA. **Potwierdzenie
+notyfikacji o dostępie jest całkowicie odrębne od globalnego backoffu** -
+backoff opisuje wyłącznie harmonogram kolejnych zapytań do API, a
+poniższa logika opisuje wyłącznie to, kiedy wysłać powiadomienie
+użytkownikowi; zmiana jednej z nich nie wpływa na drugą.
 
-- Jeśli **cały** cykl sprawdzania nie pobrał danych z żadnego
-  monitorowanego sklepu wyłącznie z powodu HTTP 403/429, a stan dostępu
-  nie był już oznaczony jako utracony, skrypt wysyła **dokładnie jedno**
-  powiadomienie o utracie dostępu i zapisuje ten fakt trwale (w tym samym
-  pliku `~/.ikea_okazje_dynamic.json`, w którym żyje też lista sklepów i
-  szukanych słów). Kolejne cykle z tym samym błędem **nie** wysyłają
-  kolejnych powiadomień, także po restarcie procesu albo usługi systemd.
+**Dlaczego dwa cykle, nie jeden.** Pierwsze wersje tego mechanizmu
+wysyłały alert po **jednym** w pełni zablokowanym cyklu, co przy
+pojedynczej, przejściowej blokadzie 403/429 (np. następny zaplanowany
+cykl i tak kończył się sukcesem) generowało niepotrzebną parę wiadomości
+"IKEA odrzuca zapytania monitora" + "Monitor może znów pobierać oferty".
+Żeby ograniczyć ten szum, alert o utracie dostępu wymaga teraz **dwóch
+kolejnych, kwalifikujących się cykli z rzędu**:
+
+- **Pierwszy** w pełni zablokowany cykl (wszystkie skonfigurowane sklepy
+  zawiodły **wyłącznie** z powodu HTTP 403/429) **nie wysyła jeszcze
+  żadnego powiadomienia** - skrypt zapisuje ten fakt jako oczekującą
+  (niepotwierdzoną) utratę dostępu (`pending_outage` w tym samym pliku
+  `~/.ikea_okazje_dynamic.json`, w którym żyje też lista sklepów i
+  szukanych słów). Ten zapis jest trwały, więc restart procesu albo
+  usługi systemd **między** pierwszym i drugim cyklem nie "zapomina" o
+  tej pierwszej porażce.
+- **Drugi, następny z rzędu** w pełni zablokowany cykl **potwierdza**
+  sekwencję - dopiero teraz skrypt wysyła **dokładnie jedno** powiadomienie
+  o utracie dostępu i zapisuje stan jako aktywny. Kolejne, trzecie i
+  dalsze zablokowane cykle **nie** wysyłają kolejnych powiadomień, także
+  po restarcie procesu albo usługi systemd.
+- **Ten drugi cykl to druga faktyczna kontrola IKEA wykonana wtedy, kiedy
+  zezwoli na nią istniejący harmonogram** - globalny backoff
+  (`next_allowed_check_at`) i ewentualny `Retry-After` z serwera (patrz
+  wyżej), **nie** po jakimś ustalonym, sztywnym czasie (np. "85 sekund").
+  W trybie `daemon` może to być więc znacznie później niż minuta czy dwie
+  od pierwszej porażki - backoff rządzi tym, kiedy w ogóle dojdzie do
+  drugiego zapytania, potwierdzenie tylko na nie reaguje. W trybie `cron`
+  te dwa cykle to po prostu dwa **kolejne, osobne odpalenia** skryptu
+  (np. dwa kolejne wywołania z crona) - skrypt nigdy nie usypia się ani
+  nie zapętla czekając na drugie sprawdzenie w tym samym procesie.
+- Jeśli **pełny sukces** (wszystkie sklepy pobrane bez błędu) nastąpi
+  **po pierwszym, ale przed drugim** kwalifikującym się cyklem, oczekujący
+  stan jest po cichu czyszczony - **bez wysyłania żadnego powiadomienia**
+  (ani utraty, ani odzyskania). Monitor po prostu wraca do normalnej
+  pracy, tak jakby nic się nie stało.
 - Kiedy pierwszy późniejszy **pełny** cykl pobierze dane poprawnie ze
-  wszystkich monitorowanych sklepów (bez żadnego 403/429), skrypt wysyła
-  **dokładnie jedno** powiadomienie o odzyskaniu dostępu i resetuje stan -
-  kolejne udane cykle nie wysyłają kolejnych komunikatów o odzyskaniu.
-  Kolejna, nowa utrata dostępu może potem znów wygenerować jeden alert.
+  wszystkich monitorowanych sklepów **po tym, jak alert o utracie dostępu
+  został już faktycznie wysłany**, skrypt wysyła **dokładnie jedno**
+  powiadomienie o odzyskaniu dostępu i resetuje cały stan - kolejne
+  udane cykle nie wysyłają kolejnych komunikatów o odzyskaniu. Jeśli
+  alert o utracie nigdy nie został wysłany (sekwencja była tylko
+  oczekująca i została wyczyszczona pełnym sukcesem, patrz punkt wyżej),
+  **nie ma też żadnego powiadomienia o odzyskaniu** - nie było niczego,
+  o czym trzeba by informować.
+- Kolejna, nowa utrata dostępu (po odzyskaniu) zaczyna całą dwucyklową
+  sekwencję potwierdzania **od nowa** - jeden kwalifikujący się cykl
+  znowu nie wystarcza.
+- **Cykl częściowy/mieszany** (np. jeden sklep zwrócił dane, a inny
+  403/429; albo 403/429 na jednym sklepie i timeout/HTTP 5xx/błąd
+  parsowania na innym) **nie jest** ani kwalifikującą się porażką, ani
+  pełnym sukcesem. Jeśli w takim momencie istniała oczekująca
+  (niepotwierdzona) sekwencja, taki cykl **zeruje ją** - kolejna,
+  przyszła pełna blokada 403/429 zaczyna nowe, dwucyklowe potwierdzanie
+  od nowa (bezpieczna polityka: nie "doliczamy" częściowych wyników do
+  przerwanej sekwencji). Cykl częściowy/mieszany **nie dotyka** już
+  wysłanego alertu (`outage_active`) - odzyskanie wciąż wymaga pełnego
+  sukcesu, zgodnie z niezmienionym wymogiem wyżej.
 - Zwykły błąd pojedynczego sklepu, timeout, HTTP 5xx, błąd parsowania,
   brak wyników/ofert albo brak skonfigurowanych kryteriów wyszukiwania
-  **nie** są traktowane jako utrata dostępu i nie wywołują tego alertu.
+  (i - odrębnie - brak skonfigurowanych sklepów) **nie** są traktowane
+  jako utrata/odzyskanie dostępu i nie wpływają na tę sekwencję
+  potwierdzania (poza opisanym wyżej zerowaniem oczekującej sekwencji dla
+  cykli częściowych/mieszanych).
+- **Dostawa powiadomienia.** Tak jak przy zwykłych powiadomieniach o
+  nowych ofertach, wystarczy, żeby **przynajmniej jeden** z aktywnych
+  kanałów (e-mail/Telegram) się powiódł, żeby stan uznać za "zaalarmowany"
+  - tylko **całkowita** porażka wszystkich aktywnych kanałów (żaden się
+  nie powiódł) nie oznacza alertu jako wysłanego. W takim przypadku:
+  - przy **potwierdzającym** (drugim) cyklu - `pending_outage` zostaje
+    `True`, więc kolejny kwalifikujący się cykl spróbuje dostawy ponownie
+    (bez ponownego przechodzenia przez całą dwucyklową sekwencję od zera);
+  - przy powiadomieniu o **odzyskaniu** - `outage_active` zostaje `True`,
+    więc kolejny pełny sukces spróbuje ponownie.
+  Ten wzorzec ("nie oznaczaj jako wysłane, jeśli dostawa całkowicie
+  zawiodła") jest identyczny z tym, jak skrypt już wcześniej traktował
+  zwykłe powiadomienia o nowych ofertach.
+
+**Migracja ze starszych wersji.** Plik `~/.ikea_okazje_dynamic.json` z
+wcześniejszej wersji tego skryptu (bez pola `pending_outage`, albo nawet
+bez całego klucza `ikea_access_notification`) jest automatycznie i
+bezpiecznie migrowany - brakujące pola są dopisywane z bezpiecznymi
+domyślnymi wartościami. W szczególności: jeśli taki starszy plik miał już
+`outage_active: true` (użytkownik był **już wcześniej** zaalarmowany o
+utracie dostępu), ten fakt **nie jest** reinterpretowany jako pierwsza,
+niepotwierdzona porażka - `pending_outage` jest ustawiane na `False`, a
+kolejny w pełni zablokowany cykl **nie wysyła duplikatu** (alert już
+wcześniej dotarł do użytkownika, przed tą aktualizacją).
 
 Ten mechanizm nie zmienia częstotliwości requestów, retry ani backoffu -
 to tylko dodatkowe, pojedyncze powiadomienie o zmianie stanu dostępu.
@@ -651,9 +728,21 @@ restarcie (w tym natychmiastową kontrolę, gdy termin już minął) oraz
 odliczanie interwału w pętli daemona względem `time.monotonic()`,
 domyślny interwał `CHECK_INTERVAL_SECONDS` (45 minut) i jego
 nadpisywanie przez `.env`, oraz alert o utracie/odzyskaniu dostępu przy
-403/429 (dokładnie jedno powiadomienie w każdą stronę, tłumienie
-duplikatów po restarcie, brak alertu dla błędu pojedynczego sklepu/5xx/
-timeoutu) - wszystko bez prawdziwych requestów HTTP, SMTP czy Telegrama.
+403/429 z **potwierdzeniem dwoma kolejnymi kwalifikującymi się cyklami**
+(pierwszy w pełni zablokowany cykl - tylko `pending_outage`, bez
+powiadomienia; drugi z rzędu - dokładnie jedno powiadomienie o utracie;
+trzeci i kolejne - bez duplikatów; pełny sukces PRZED potwierdzeniem -
+ciche wyczyszczenie stanu bez żadnego powiadomienia; powiadomienie o
+odzyskaniu wyłącznie po faktycznie dostarczonym alercie utraty; cykle
+częściowe/mieszane zerujące oczekującą sekwencję, ale nie wpływające na
+już aktywny alert; całkowita porażka dostawy nieoznaczająca alertu jako
+wysłany; migrację starych plików stanu, w tym `outage_active=true` bez
+`pending_outage`, bez wysyłania duplikatu; przetrwanie oczekującej i
+aktywnej sekwencji przez symulowany restart procesu; tryb `cron` jako
+dwa niezależne, kolejne odpalenia procesu bez żadnego wewnętrznego
+`sleep`/pętli czekającej na drugi cykl; respektowanie przez `run_daemon()`
+zapisanego backoffu przed drugą kontrolą) - wszystko bez prawdziwych
+requestów HTTP, SMTP czy Telegrama.
 
 ## Aktualizacja skryptu
 
