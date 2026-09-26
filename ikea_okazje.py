@@ -1192,6 +1192,72 @@ def flatten_matching_offers(content: list) -> list:
     return result
 
 
+def _offer_group_key(o: dict) -> tuple:
+    """Klucz grupowania ofert na potrzeby powiadomien - dwie oferty trafiaja
+    do tej samej grupy WYLACZNIE gdy WSZYSTKIE pola wspolne (wyswietlane w
+    naglowku grupy) sa identyczne. Porownywanie jest deterministyczne (==),
+    bez fuzzy matchingu. article_numbers jest sortowane i zamrazane, zeby
+    kolejnosc z API nie powodowala roznych kluczy dla tego samego produktu."""
+    an = tuple(sorted(o.get("article_numbers") or []))
+    return (
+        o.get("title"),
+        o.get("description"),
+        an,
+        o.get("currency"),
+        o.get("price"),
+        o.get("original_price"),
+        o.get("discount_percent"),
+        o.get("condition"),
+        o.get("condition_desc"),
+        o.get("reason_discount"),
+        o.get("additional_info"),
+        o.get("hero_image"),
+        o.get("store_id"),
+    )
+
+
+def group_offers_for_notification(offers: list) -> list:
+    """Grupuje oferty o identycznych wspolnych polach na potrzeby tresci
+    powiadomienia. Zachowuje kolejnosc pierwszego wystapienia grupy i
+    kolejnosc ofert w obrebie grupy (stabilna, z API/flatten).
+
+    Zwraca liste slownikow, kazdy z kluczami:
+      - "shared": dict ze wspolnymi polami (title, description, ...)
+      - "items": list[dict] z offer_uuid, offer_number, reservation_link
+
+    Nie zmienia semantyki offer_uuid ani pliku seen_offers - grupowanie
+    jest WYLACZNIE na potrzeby formatowania wiadomosci."""
+    from collections import OrderedDict
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+    for o in offers:
+        key = _offer_group_key(o)
+        if key not in groups:
+            groups[key] = {
+                "shared": {
+                    "title": o.get("title"),
+                    "description": o.get("description"),
+                    "article_numbers": o.get("article_numbers"),
+                    "currency": o.get("currency"),
+                    "price": o.get("price"),
+                    "original_price": o.get("original_price"),
+                    "discount_percent": o.get("discount_percent"),
+                    "condition": o.get("condition"),
+                    "condition_desc": o.get("condition_desc"),
+                    "reason_discount": o.get("reason_discount"),
+                    "additional_info": o.get("additional_info"),
+                    "hero_image": o.get("hero_image"),
+                    "store_id": o.get("store_id"),
+                },
+                "items": [],
+            }
+        groups[key]["items"].append({
+            "offer_uuid": o.get("offer_uuid"),
+            "offer_number": o.get("offer_number"),
+            "reservation_link": o.get("reservation_link"),
+        })
+    return list(groups.values())
+
+
 def load_seen_uuids() -> set:
     if not os.path.exists(STATE_FILE):
         return set()
@@ -1232,6 +1298,41 @@ def format_offer_block(o: dict) -> str:
     return "\n".join(lines)
 
 
+def format_offer_group_email(group: dict) -> str:
+    """Formatuje grupe ofert dla e-maila: wspolny opis + lista egzemplarzy."""
+    s = group["shared"]
+    discount_txt = f"{s['discount_percent']}%" if s.get("discount_percent") is not None else "n/d"
+    lines = [
+        f"Produkt: {s['title']} - {s['description']}",
+        f"Cena: {s['price']} {s['currency']} (cena wyjsciowa: {s['original_price']} {s['currency']}, rabat: {discount_txt})",
+        f"Stan: {s['condition']} ({s.get('condition_desc', '')})",
+        f"Powod przeceny: {s.get('reason_discount', '')}",
+        f"Info: {s.get('additional_info', '')}",
+        f"Numer artykulu: {', '.join(s.get('article_numbers') or [])}",
+        f"Sklep (storeId): {s['store_id']} - {store_display_name(s['store_id'])}",
+        f"Zdjecie: {s.get('hero_image', '')}",
+    ]
+    items = group["items"]
+    if len(items) == 1:
+        item = items[0]
+        lines.append(f"Numer oferty: {item['offer_number']}")
+        if item.get("reservation_link"):
+            lines.append(f"Link do rezerwacji: {item['reservation_link']}")
+        else:
+            lines.append(
+                "Rezerwacja: otwórz stronę \"Okazje na Okrągło online\", "
+                "wybierz właściwy sklep i znajdź ofertę po numerze oferty."
+            )
+    else:
+        lines.append(f"{len(items)} sztuk(i):")
+        for item in items:
+            if item.get("reservation_link"):
+                lines.append(f"  - oferta {item['offer_number']} — {item['reservation_link']}")
+            else:
+                lines.append(f"  - oferta {item['offer_number']} — link niedostepny")
+    return "\n".join(lines)
+
+
 def deliver_email_message(subject: str, body: str) -> None:
     """Buduje i wysyla jedna wiadomosc e-mail (naglowki From/To + tresc
     tekstowa) przez aktualnie skonfigurowany SMTP - wspolna, niska warstwa
@@ -1261,10 +1362,11 @@ def deliver_email_message(subject: str, body: str) -> None:
 
 
 def send_email(new_offers) -> None:
-    titles = ", ".join(sorted({o["title"] for o in new_offers}))
+    groups = group_offers_for_notification(new_offers)
+    titles = ", ".join(sorted({g["shared"]["title"] for g in groups if g["shared"].get("title")}))
     subject = f"IKEA Okazje: nowa oferta - {titles}"
 
-    blocks = [format_offer_block(o) for o in new_offers]
+    blocks = [format_offer_group_email(g) for g in groups]
     body = (
         "Znaleziono nowe oferty dla: " + ", ".join(SEARCH_TERMS) + "\n\n"
         + "\n\n".join(blocks)
@@ -1302,6 +1404,152 @@ def format_offer_telegram(o: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_group_header_telegram(shared: dict) -> str:
+    """Formatuje naglowek grupy ofert dla Telegrama (wspolne pola produktu).
+    Uzywany przez format_offer_group_telegram() i jako skrocony naglowek
+    kontynuacji przy podziale grupy na wiele wiadomosci."""
+    title = escape_html(shared.get("title") or "")
+    description = escape_html(shared.get("description") or "")
+    currency = escape_html(str(shared["currency"])) if shared.get("currency") is not None else ""
+    condition = escape_html(str(shared["condition"])) if shared.get("condition") is not None else "n/d"
+    price_txt = escape_html(str(shared["price"])) if shared.get("price") is not None else "n/d"
+    original_price_txt = escape_html(str(shared["original_price"])) if shared.get("original_price") is not None else "n/d"
+    discount_txt = f"{shared['discount_percent']}%" if shared.get("discount_percent") is not None else "n/d"
+    if shared.get("store_id"):
+        store_name = escape_html(store_display_name(shared["store_id"]))
+    else:
+        store_name = "brak"
+
+    return (
+        f"<b>{title}</b> — {description}\n"
+        f"{store_name} | {price_txt} {currency} "
+        f"(z {original_price_txt}, rabat {discount_txt}) | stan: {condition}"
+    )
+
+
+def _format_offer_item_telegram(item: dict) -> str:
+    """Formatuje jeden egzemplarz oferty (numer + link) dla Telegrama."""
+    offer_number = item.get("offer_number")
+    offer_number_txt = escape_html(str(offer_number)) if offer_number else "brak"
+    if item.get("reservation_link"):
+        safe_link = escape_html_attr(item["reservation_link"])
+        return f'• oferta {offer_number_txt} — <a href="{safe_link}">Rezerwuj</a>'
+    else:
+        return f"• oferta {offer_number_txt} — link niedostępny"
+
+
+def format_offer_group_telegram(group: dict) -> str:
+    """Formatuje cala grupe (naglowek + wszystkie egzemplarze) jako jeden
+    blok tekstu Telegram HTML. Uzywany gdy cala grupa miesci sie w jednej
+    wiadomosci."""
+    shared = group["shared"]
+    items = group["items"]
+    header = _format_group_header_telegram(shared)
+
+    if len(items) == 1:
+        item_line = _format_offer_item_telegram(items[0])
+        return f"{header}\n{item_line}"
+
+    lines = [header, f"{len(items)} nowych sztuk:"]
+    for item in items:
+        lines.append(_format_offer_item_telegram(item))
+    return "\n".join(lines)
+
+
+# Telegram API limit to 4096 znakow. Uzywamy bezpiecznego marginesu.
+TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
+TELEGRAM_SAFE_LIMIT = 4000
+
+
+def split_telegram_messages(groups: list) -> list:
+    """Dzieli liste grup ofert na wiele wiadomosci Telegrama, z
+    gwarancja, ze:
+    - zadna wiadomosc nie przekracza TELEGRAM_SAFE_LIMIT znakow
+    - nie dzielimy wewnatrz tagu HTML / encji / wiersza z linkiem
+    - kazda oferta (numer + link) pojawia sie w dokladnie jednej wiadomosci
+    - jesli grupa nie miesci sie w jednej wiadomosci, jej egzemplarze sa
+      rozdzielane miedzy wiadomosci z powtorzonym naglowkiem grupy
+    - nie stosujemy "(...)" ani innego obcinania
+
+    Zwraca liste gotowych stringow HTML (kazdy <= TELEGRAM_SAFE_LIMIT)."""
+    if not groups:
+        return []
+
+    banner = "<b>IKEA Okazje - nowa oferta</b>"
+    messages = []
+    current_parts = [banner]
+    current_len = len(banner)
+
+    for group in groups:
+        shared = group["shared"]
+        items = group["items"]
+        header = _format_group_header_telegram(shared)
+
+        # Sprobuj umiescic cala grupe w jednej wiadomosci
+        full_block = format_offer_group_telegram(group)
+        separator = "\n\n"
+        needed = len(separator) + len(full_block)
+
+        if current_len + needed <= TELEGRAM_SAFE_LIMIT:
+            current_parts.append(full_block)
+            current_len += needed
+            continue
+
+        # Cala grupa nie miesci sie w biezacej wiadomosci.
+        # Zamknij biezaca wiadomosc (jesli ma cos poza bannerem) i zacznij nowa.
+        if len(current_parts) > 1:
+            messages.append("\n\n".join(current_parts))
+            current_parts = [banner]
+            current_len = len(banner)
+
+        # Sprawdz, czy cala grupa mieści sie w pustej wiadomosci
+        if len(banner) + len(separator) + len(full_block) <= TELEGRAM_SAFE_LIMIT:
+            current_parts.append(full_block)
+            current_len = len(banner) + len(separator) + len(full_block)
+            continue
+
+        # Grupa jest za duza na jedną wiadomosc - dzielimy po egzemplarzach
+        count_label = f"{len(items)} nowych sztuk:" if len(items) > 1 else ""
+        group_header_block = header + ("\n" + count_label if count_label else "")
+
+        item_lines = [_format_offer_item_telegram(item) for item in items]
+        continuation_idx = 0
+
+        while continuation_idx < len(item_lines):
+            if continuation_idx == 0:
+                msg_header = banner + separator + group_header_block
+            else:
+                msg_header = banner + separator + header + "\n(cd.)"
+
+            msg_parts = [msg_header]
+            msg_len = len(msg_header)
+
+            while continuation_idx < len(item_lines):
+                line = item_lines[continuation_idx]
+                line_needed = 1 + len(line)  # "\n" + line
+                if msg_len + line_needed > TELEGRAM_SAFE_LIMIT:
+                    if len(msg_parts) == 1:
+                        # Nawet jeden egzemplarz nie miesci sie - i tak go dodaj
+                        msg_parts.append(line)
+                        continuation_idx += 1
+                    break
+                msg_parts.append(line)
+                msg_len += line_needed
+                continuation_idx += 1
+
+            messages.append("\n".join(msg_parts))
+
+        # Po podziale grupy, resetuj akumulator
+        current_parts = [banner]
+        current_len = len(banner)
+
+    # Zamknij ostatnia wiadomosc
+    if len(current_parts) > 1:
+        messages.append("\n\n".join(current_parts))
+
+    return messages
+
+
 def escape_html(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -1318,8 +1566,6 @@ def escape_html_attr(text: str) -> str:
 
 def telegram_send_message(text: str, chat_id=None) -> None:
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
-    if len(text) > 4000:
-        text = text[:3990] + "\n\n(...)"
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({
@@ -1341,30 +1587,50 @@ def telegram_send_message(text: str, chat_id=None) -> None:
 
 
 def send_telegram(new_offers) -> None:
-    text = "\n\n".join(format_offer_telegram(o) for o in new_offers)
-    text = f"<b>IKEA Okazje - nowa oferta</b>\n\n{text}"
-    telegram_send_message(text)
+    """Wysyla powiadomienie o nowych ofertach przez Telegrama. Grupuje oferty,
+    dzieli na wiele wiadomosci i wysyla kazda z nich. Jesli ktoras wiadomosc
+    sie nie wyśle, rzuca wyjatek (nawet jesli czesc wiadomosci juz doszla)."""
+    groups = group_offers_for_notification(new_offers)
+    messages = split_telegram_messages(groups)
+    if not messages:
+        return
+
+    sent_count = 0
+    for msg in messages:
+        try:
+            telegram_send_message(msg)
+            sent_count += 1
+        except Exception:
+            raise RuntimeError(
+                f"Telegram: wyslano {sent_count}/{len(messages)} wiadomosci, "
+                f"blad przy wiadomosci #{sent_count + 1}"
+            )
 
 
-def notify(new_offers) -> list:
+def notify(new_offers) -> dict:
     """Wysyla powiadomienie tylko przez faktycznie skonfigurowane i wlaczone
     kanaly. Gdy SMTP_MODE='disabled', e-mail jest calkowicie pomijany (bez
-    inicjowania jakiegokolwiek polaczenia SMTP)."""
-    errors = []
+    inicjowania jakiegokolwiek polaczenia SMTP).
+
+    Zwraca slownik z kluczami 'email' i 'telegram', kazdemu odpowiada
+    None (sukces/nieskonf.) albo string z opisem bledu. Pozwala
+    run_ikea_check_cycle() podejmowac decyzje o zapisie seen_offers
+    per kanal."""
+    result = {"email": None, "telegram": None}
 
     if EMAIL_ENABLED:
         try:
             send_email(new_offers)
         except Exception as exc:
-            errors.append(f"e-mail: {exc}")
+            result["email"] = f"e-mail: {exc}"
 
     if TELEGRAM_ENABLED:
         try:
             send_telegram(new_offers)
         except Exception as exc:
-            errors.append(f"telegram: {exc}")
+            result["telegram"] = f"telegram: {exc}"
 
-    return errors
+    return result
 
 
 # ---------------- POWIADOMIENIA O UTRACIE/ODZYSKANIU DOSTEPU (403/429) ----------------
@@ -2141,14 +2407,21 @@ def run_ikea_check_cycle() -> int:
     ]
 
     if new_offers:
-        errors = notify(new_offers)
+        delivery_result = notify(new_offers)
+        errors = [v for v in delivery_result.values() if v is not None]
         if errors:
             for err in errors:
                 log(f"Blad wysylki powiadomienia ({err})", to_stderr=True)
-            active_channels = (1 if EMAIL_ENABLED else 0) + (1 if TELEGRAM_ENABLED else 0)
-            if len(errors) == active_channels:
-                return 2
+            # Jesli chocby jeden wlaczony kanal powiadomien zawiodl (lub ktorakolwiek
+            # wiadomosc z serii Telegrama), NIE oznaczamy nowych ofert jako znane.
+            # Zwracamy kod 2 (blad dostawy), aby w kolejnym cyklu oferty zostaly
+            # ponowione i zaden kanal nie stracil ich bezpowrotnie.
+            # Akceptowany kompromis: kanal, ktory odebral alert przed awaria
+            # innego kanalu, moze otrzymac duplikat przy ponowieniu (brak exactly-once).
+            return 2
 
+        # Wszystkie wlaczone kanaly zakonczyly sie pelnym sukcesem (dla Telegrama:
+        # pomyslnie wyslano cala serie podzielonych wiadomosci).
         sent_uuids = {o["offer_uuid"] for o in new_offers if o.get("offer_uuid")}
         try:
             save_seen_uuids(seen_uuids | sent_uuids)
