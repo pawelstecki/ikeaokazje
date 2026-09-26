@@ -5,6 +5,7 @@ Uruchomienie: python3 -m unittest tests/test_ikea_okazje.py
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -3150,6 +3151,230 @@ class TestHtmlEscapingInGroups(unittest.TestCase):
         group = ik.group_offers_for_notification([_make_offer(reservation_link='http://link"onclick="alert(1)')])[0]
         item = ik._format_offer_item_telegram(group["items"][0])
         self.assertIn('&quot;', item)
+
+
+class TestTelegramSplittingSafeLimitAndEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self._orig_store_ids = list(ik.STORE_IDS)
+        self._orig_terms = list(ik.SEARCH_TERMS)
+        self._orig_numbers = list(ik.SEARCH_ARTICLE_NUMBERS)
+        self._orig_sleep = ik.time.sleep
+        ik.time.sleep = lambda *a, **k: None
+        ik.SEARCH_TERMS = ["stol"]
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = []
+        ik.STORE_IDS = ["294"]
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        ik.save_seen_uuids(set())
+
+    def tearDown(self):
+        ik.STORE_IDS = self._orig_store_ids
+        ik.SEARCH_TERMS = self._orig_terms
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = self._orig_numbers
+        ik.time.sleep = self._orig_sleep
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+
+    def test_single_offer_with_description_longer_than_4000_chars(self):
+        # Opis dluzszy niz 4000 znakow - naglowek zostaje bezpiecznie skrocony,
+        # dlugosc calosci <= TELEGRAM_SAFE_LIMIT, tytul, cena, numer i link zachowane
+        offer = _make_offer(
+            offer_uuid="u-long-desc",
+            offer_number="87724701",
+            title="Kanonviska",
+            description="Bardzo dlugi opis produktu z wieloma szczegolami " * 120,
+            reservation_link="https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroclaw/87724701",
+        )
+        groups = ik.group_offers_for_notification([offer])
+        msgs = ik.split_telegram_messages(groups)
+
+        self.assertEqual(len(msgs), 1)
+        msg = msgs[0]
+        self.assertLessEqual(len(msg), ik.TELEGRAM_SAFE_LIMIT)
+        self.assertIn("Kanonviska", msg)
+        self.assertIn("87724701", msg)
+        self.assertIn('href="https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroclaw/87724701"', msg)
+        self.assertIn("Rezerwuj", msg)
+        self.assertIn("…", msg)
+        self.assertNotIn("(...)", msg)
+        # Poprawnosc tagow HTML
+        self.assertEqual(msg.count("<b>"), msg.count("</b>"))
+        self.assertEqual(msg.count("<a "), msg.count("</a>"))
+
+    def test_single_offer_with_very_long_title_and_html_special_chars(self):
+        # Bardzo dlugi tytul ze znakami HTML (&, <, >, ", ') - bezpieczne skrocenie
+        # przed escapowaniem HTML, brak uszkodzonych encji czy tagow
+        long_title = 'Stol & lawa <dla "wymagajacych"> ' * 200
+        offer = _make_offer(
+            offer_uuid="u-long-title",
+            offer_number="87724702",
+            title=long_title,
+            description="Krotki opis",
+            reservation_link="https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroclaw/87724702",
+        )
+        groups = ik.group_offers_for_notification([offer])
+        msgs = ik.split_telegram_messages(groups)
+
+        self.assertEqual(len(msgs), 1)
+        msg = msgs[0]
+        self.assertLessEqual(len(msg), ik.TELEGRAM_SAFE_LIMIT)
+        self.assertIn("87724702", msg)
+        self.assertIn("Rezerwuj", msg)
+        self.assertNotIn("<dla", msg)
+        self.assertIn("&lt;dla", msg)
+        self.assertIn("&amp;", msg)
+        self.assertIn("…", msg)
+        self.assertNotIn("(...)", msg)
+        self.assertEqual(msg.count("<b>"), msg.count("</b>"))
+        self.assertEqual(msg.count("<a "), msg.count("</a>"))
+
+    def test_single_impossible_link_raises_explicit_error_and_no_sends_or_seen(self):
+        # Pojedynczy link, ktorego nie da sie zmiescic nawet z minimalnym naglowkiem
+        impossible_link = "https://www.ikea.com/" + ("x" * 4000)
+        offer = _make_offer(
+            offer_uuid="u-impossible",
+            offer_number="87724703",
+            reservation_link=impossible_link,
+        )
+        groups = ik.group_offers_for_notification([offer])
+
+        # 1. split_telegram_messages zglasza jawny ValueError
+        with self.assertRaises(ValueError) as ctx:
+            ik.split_telegram_messages(groups)
+        self.assertIn("87724703", str(ctx.exception))
+
+        # 2. send_telegram zglasza blad i wykonuje DOKLADNIE ZERO prob wyslania
+        with mock.patch.object(ik, "telegram_send_message") as mock_send:
+            with self.assertRaises(ValueError):
+                ik.send_telegram([offer])
+            mock_send.assert_not_called()
+
+        # 3. W cyklu sprawdzania: brak zapisu UUID do seen_offers, return code 2
+        fake_product = {
+            "title": "Stol",
+            "description": "opis",
+            "originalPrice": 200,
+            "articleNumbers": ["12345678"],
+            "currency": "PLN",
+            "storeId": "294",
+            "offers": [{
+                "offerUuid": "u-impossible",
+                "offerNumber": "87724703",
+                "price": 100,
+                "productConditionTitle": "Nowy",
+                "productConditionDescription": "brak",
+                "reasonDiscount": "wystawowy",
+                "additionalInfo": None,
+            }],
+            "heroImage": None,
+        }
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[fake_product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "telegram_send_message") as mock_send:
+            with mock.patch.object(ik, "build_offer_reservation_link", return_value=impossible_link):
+                ret = ik.run_ikea_check_cycle()
+
+            mock_send.assert_not_called()
+            self.assertEqual(ret, 2)
+            seen = ik.load_seen_uuids()
+            self.assertNotIn("u-impossible", seen)
+
+    def test_multiple_offers_with_later_impossible_link_aborts_without_sending_any(self):
+        # Wiele ofert, z ktorych dopiero ostatnia ma niemozliwy link - zadna wiadomosc
+        # nie moze zostac wyslana, zaden UUID nie moze zostac zapisany
+        o1 = _make_offer(offer_uuid="u1", offer_number="101", reservation_link="http://link1")
+        o2 = _make_offer(offer_uuid="u2", offer_number="102", reservation_link="http://link2")
+        o3 = _make_offer(offer_uuid="u3", offer_number="103", reservation_link="http://link3" + ("z" * 4000))
+
+        with mock.patch.object(ik, "telegram_send_message") as mock_send:
+            with self.assertRaises(ValueError):
+                ik.send_telegram([o1, o2, o3])
+            mock_send.assert_not_called()
+
+        fake_product = {
+            "title": "Stol",
+            "description": "opis",
+            "originalPrice": 200,
+            "articleNumbers": ["12345678"],
+            "currency": "PLN",
+            "storeId": "294",
+            "offers": [
+                {"offerUuid": "u1", "offerNumber": "101", "price": 100, "productConditionTitle": "Nowy", "productConditionDescription": "", "reasonDiscount": "", "additionalInfo": None},
+                {"offerUuid": "u2", "offerNumber": "102", "price": 100, "productConditionTitle": "Nowy", "productConditionDescription": "", "reasonDiscount": "", "additionalInfo": None},
+                {"offerUuid": "u3", "offerNumber": "103", "price": 100, "productConditionTitle": "Nowy", "productConditionDescription": "", "reasonDiscount": "", "additionalInfo": None},
+            ],
+            "heroImage": None,
+        }
+        def fake_link(sid, onum):
+            if onum == "103":
+                return "http://link3" + ("z" * 4000)
+            return f"http://link/{onum}"
+
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[fake_product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "build_offer_reservation_link", side_effect=fake_link), \
+             mock.patch.object(ik, "telegram_send_message") as mock_send:
+            ret = ik.run_ikea_check_cycle()
+
+            mock_send.assert_not_called()
+            self.assertEqual(ret, 2)
+            seen = ik.load_seen_uuids()
+            self.assertNotIn("u1", seen)
+            self.assertNotIn("u2", seen)
+            self.assertNotIn("u3", seen)
+
+    def test_all_returned_messages_invariant_and_html_validity(self):
+        # Roznorodne grupy: duza grupa, dlugi opis, znaki HTML, brak linku
+        offers = []
+        for i in range(25):
+            offers.append(_make_offer(
+                offer_uuid=f"g1-{i}",
+                offer_number=f"100{i}",
+                title="Szafa PAX",
+                description="Opis szafy " * 20,
+                reservation_link=f"http://link/pax/{i}",
+            ))
+        offers.append(_make_offer(
+            offer_uuid="g2-1",
+            offer_number="2001",
+            title="Biurko BEKANT & <nowe>",
+            description="Bardzo dlugi opis biurka " * 150,
+            reservation_link="http://link/bekant/1",
+        ))
+        for i in range(3):
+            offers.append(_make_offer(
+                offer_uuid=f"g3-{i}",
+                offer_number=f"300{i}",
+                title='Komoda MALM <4 "szuflady">',
+                description="Opis komody & mebli",
+                reservation_link=None,
+            ))
+
+        groups = ik.group_offers_for_notification(offers)
+        msgs = ik.split_telegram_messages(groups)
+
+        self.assertGreater(len(msgs), 1)
+        all_text = "\n".join(msgs)
+
+        for idx, m in enumerate(msgs, 1):
+            self.assertLessEqual(len(m), ik.TELEGRAM_SAFE_LIMIT, f"Wiadomosc #{idx} przekracza limit")
+            self.assertNotIn("(...)", m)
+            self.assertEqual(m.count("<b>"), m.count("</b>"), f"Niezbalansowane <b> w #{idx}")
+            self.assertEqual(m.count("<a "), m.count("</a>"), f"Niezbalansowane <a> w #{idx}")
+            tag_stripped = re.sub(r"<b>|</b>|<a\s+href=\"[^\"]*\">|</a>", "", m)
+            self.assertNotIn("<", tag_stripped, f"Surowy znak < w #{idx}")
+            self.assertNotIn(">", tag_stripped, f"Surowy znak > w #{idx}")
+
+        for o in offers:
+            self.assertIn(o["offer_number"], all_text)
+            if o["reservation_link"]:
+                self.assertIn(o["reservation_link"], all_text)
+            else:
+                self.assertIn(f"oferta {o['offer_number']} — link niedostępny", all_text)
 
 
 if __name__ == "__main__":
