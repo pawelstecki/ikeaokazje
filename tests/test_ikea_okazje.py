@@ -3377,5 +3377,81 @@ class TestTelegramSplittingSafeLimitAndEdgeCases(unittest.TestCase):
                 self.assertIn(f"oferta {o['offer_number']} — link niedostępny", all_text)
 
 
+class TestTelegramTitlePreservationAndSplitting(unittest.TestCase):
+    def test_split_preserves_full_product_title_across_split_messages(self):
+        # Jedna grupa z dosc dluga, ale mieszczaca sie przy pojedynczej ofercie nazwa produktu;
+        # tyle egzemplarzy, ze cala grupa nie miesci sie w jednej wiadomosci, lecz po podziale
+        # na dwie wiadomosci pelna nazwa miesci sie w obu.
+        long_title = "Stół do jadalni rozkładany dębowy model Stockholm 2026 super stan i elegancja"
+        offers = [
+            _make_offer(
+                offer_uuid=f"stockholm-{i}",
+                offer_number=f"705574{i:02d}",
+                title=long_title,
+                description="Stan idealny, brak widocznych śladów użytkowania.",
+                reservation_link=f"https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroclaw/705574{i:02d}",
+            )
+            for i in range(50)
+        ]
+        groups = ik.group_offers_for_notification(offers)
+        self.assertEqual(len(groups), 1)
+
+        msgs = ik.split_telegram_messages(groups)
+        self.assertGreaterEqual(len(msgs), 2, "Oferty powinny zostac podzielone na co najmniej 2 wiadomosci")
+
+        escaped_title = ik.escape_html(long_title)
+        for idx, msg in enumerate(msgs):
+            self.assertLessEqual(len(msg), ik.TELEGRAM_SAFE_LIMIT, f"Wiadomosc #{idx+1} przekracza limit")
+            self.assertNotIn("(...)", msg)
+            # Asercja: w wygenerowanych wiadomosciach pojawia sie PELNA nazwa produktu
+            self.assertIn(f"<b>{escaped_title}</b>", msg, f"Wiadomosc #{idx+1} nie zawiera pelnego tytulu")
+            if idx > 0:
+                self.assertIn("(cd.)", msg, f"Wiadomosc kontynuacji #{idx+1} powinna miec oznaczenie (cd.)")
+
+        # Kazdy numer oferty i link do rezerwacji jest obecny
+        all_text = "\n".join(msgs)
+        for o in offers:
+            self.assertIn(o["offer_number"], all_text)
+            self.assertIn(o["reservation_link"], all_text)
+
+    def test_extreme_long_title_truncates_longest_prefix_with_ellipsis(self):
+        # Skrajna sytuacja: nazwa produktu jest tak dluga (np. 4500 znakow), ze nawet
+        # z pojedyncza oferta przekracza limit — zachowany mozliwie dlugi poczatek
+        # nazwy z '…', brak bledu, zachowany numer oferty i link do rezerwacji.
+        extreme_title = "Stół dębowy konferencyjny z regulowaną wysokością blatu " * 80  # ~4500 znakow
+        offer = _make_offer(
+            offer_uuid="extreme-title-1",
+            offer_number="87724799",
+            title=extreme_title,
+            description="Krotki opis",
+            reservation_link="https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroclaw/87724799",
+        )
+        groups = ik.group_offers_for_notification([offer])
+        self.assertEqual(len(groups), 1)
+
+        msgs = ik.split_telegram_messages(groups)
+        self.assertEqual(len(msgs), 1)
+        msg = msgs[0]
+
+        self.assertLessEqual(len(msg), ik.TELEGRAM_SAFE_LIMIT)
+        self.assertNotIn("(...)", msg)
+        self.assertIn("…", msg)
+        # Nie moze zredukowac tytulu do samego wielokropka '<b>…</b>':
+        self.assertNotIn("<b>…</b>", msg)
+        # Zachowuje mozliwie dlugi poczatek nazwy (duza dlugosc wiadomosci i poczatek tytulu):
+        self.assertIn("<b>Stół dębowy konferencyjny", msg)
+        self.assertGreater(len(msg), 3500, "Wiadomosc powinna wykorzystac wiekszosc dostepnego miejsca")
+        # Kompletny numer oferty i link
+        self.assertIn("87724799", msg)
+        self.assertIn(offer["reservation_link"], msg)
+        self.assertIn("Rezerwuj", msg)
+        # Poprawnosc HTML
+        self.assertEqual(msg.count("<b>"), msg.count("</b>"))
+        self.assertEqual(msg.count("<a "), msg.count("</a>"))
+        tag_stripped = re.sub(r"<b>|</b>|<a\s+href=\"[^\"]*\">|</a>", "", msg)
+        self.assertNotIn("<", tag_stripped)
+        self.assertNotIn(">", tag_stripped)
+
+
 if __name__ == "__main__":
     unittest.main()

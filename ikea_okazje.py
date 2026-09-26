@@ -1477,6 +1477,16 @@ def _minimal_group_header_telegram(shared: dict) -> str:
     return f"<b>…</b>\n{meta_line}"
 
 
+def _full_title_min_header_telegram(shared: dict) -> str:
+    """Zwraca naglowek grupy z pelnym tytulem i metadanymi (sklep, cena, stan),
+    ale bez opisu. Okresla minimalna ilosc miejsca potrzebna, aby pokazac pelny
+    tytul produktu wraz ze wspolnymi danymi grupy."""
+    raw_title = str(shared.get("title") or "")
+    safe_title = escape_html(raw_title)
+    meta_line = _format_meta_line_telegram(shared)
+    return f"<b>{safe_title}</b>\n{meta_line}"
+
+
 def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
     """Formatuje naglowek grupy ofert dla Telegrama (wspolne pola produktu).
     Uzywany przez format_offer_group_telegram() i jako naglowek
@@ -1567,8 +1577,15 @@ def split_telegram_messages(groups: list) -> list:
     - zadna wiadomosc nie przekracza TELEGRAM_SAFE_LIMIT znakow
     - nie dzielimy wewnatrz tagu HTML / encji / wiersza z linkiem
     - kazda oferta (numer + link) pojawia sie w dokladnie jednej wiadomosci
-    - jesli grupa nie miesci sie w jednej wiadomosci, jej egzemplarze sa
-      rozdzielane miedzy wiadomosci z powtorzonym naglowkiem grupy
+    - priorytetem jest zachowanie pelnej nazwy produktu oraz wspolnych danych
+      grupy (sklep, cena, stan); tytul nie jest skracany tylko po to, aby
+      upchnac wszystkie linki w jednej wiadomosci. Jesli pelny naglowek wraz
+      ze wszystkimi egzemplarzami nie miesci sie w jednej wiadomosci, egzemplarze
+      sa dzielone na kilka wiadomosci z powtorzonym czytelnym naglowkiem.
+    - opis produktu moze byc skrocony, jesli jest dlugi, ale pelny tytul jest
+      zachowywany, o ile miesci sie z pojedyncza oferta. Tytul skracany jest
+      wylacznie w skrajnym przypadku, gdy nawet z pojedyncza oferta przekracza
+      limit (zachowujac mozliwie dlugi poczatek tytulu z '…').
     - teksty tytulu lub opisu sa skracane wylacznie przed escapowaniem HTML,
       tak aby nigdy nie uszkodzic tagu HTML ani encji
     - kazdy numer oferty i pelny link do rezerwacji sa zawsze zachowywane;
@@ -1618,46 +1635,43 @@ def split_telegram_messages(groups: list) -> list:
             count_label = f"{len(items)} nowych sztuk:"
             items_overhead = len("\n") + len(count_label) + sum(1 + len(l) for l in item_lines)
 
-        min_hdr_len = len(_minimal_group_header_telegram(shared))
+        full_hdr = _format_group_header_telegram(shared)
+        full_hdr_len = len(full_hdr)
 
-        # Proba 1: Czy cala grupa moze dolaczyc do biezacej wiadomosci (current_parts)?
+        # Proba 1: Czy cala grupa moze dolaczyc do biezacej wiadomosci (current_parts) z pelnym naglowkiem?
         avail_space_in_current = TELEGRAM_SAFE_LIMIT - current_len - len(separator)
-        if items_overhead + min_hdr_len <= avail_space_in_current:
-            candidate_hdr = _format_group_header_telegram(shared, max_len=avail_space_in_current - items_overhead)
-            if len(candidate_hdr) + items_overhead <= avail_space_in_current:
-                if len(items) == 1:
-                    full_group_block = f"{candidate_hdr}\n{item_lines[0]}"
-                else:
-                    full_group_block = f"{candidate_hdr}\n{count_label}\n" + "\n".join(item_lines)
+        if items_overhead + full_hdr_len <= avail_space_in_current:
+            if len(items) == 1:
+                full_group_block = f"{full_hdr}\n{item_lines[0]}"
+            else:
+                full_group_block = f"{full_hdr}\n{count_label}\n" + "\n".join(item_lines)
 
-                if current_len + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
-                    current_parts.append(full_group_block)
-                    current_len += len(separator) + len(full_group_block)
-                    continue
+            if current_len + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
+                current_parts.append(full_group_block)
+                current_len += len(separator) + len(full_group_block)
+                continue
 
-        # Proba 2: Grupa nie miesci sie w biezacej wiadomosci.
+        # Proba 2: Grupa nie miesci sie w biezacej wiadomosci z pelnym naglowkiem.
         # Jesli w current_parts sa juz wczesniejsze grupy, zamykamy biezaca wiadomosc.
         if len(current_parts) > 1:
             messages.append("\n\n".join(current_parts))
             current_parts = [banner]
             current_len = len(banner)
 
-        # Proba 3: Czy cala grupa zmiesci sie w nowej, pustej wiadomosci?
+        # Proba 3: Czy cala grupa zmiesci sie w nowej, pustej wiadomosci z pelnym naglowkiem?
         avail_space_fresh = TELEGRAM_SAFE_LIMIT - len(banner) - len(separator)
-        if items_overhead + min_hdr_len <= avail_space_fresh:
-            candidate_hdr = _format_group_header_telegram(shared, max_len=avail_space_fresh - items_overhead)
-            if len(candidate_hdr) + items_overhead <= avail_space_fresh:
-                if len(items) == 1:
-                    full_group_block = f"{candidate_hdr}\n{item_lines[0]}"
-                else:
-                    full_group_block = f"{candidate_hdr}\n{count_label}\n" + "\n".join(item_lines)
+        if items_overhead + full_hdr_len <= avail_space_fresh:
+            if len(items) == 1:
+                full_group_block = f"{full_hdr}\n{item_lines[0]}"
+            else:
+                full_group_block = f"{full_hdr}\n{count_label}\n" + "\n".join(item_lines)
 
-                if len(banner) + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
-                    current_parts.append(full_group_block)
-                    current_len = len(banner) + len(separator) + len(full_group_block)
-                    continue
+            if len(banner) + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
+                current_parts.append(full_group_block)
+                current_len = len(banner) + len(separator) + len(full_group_block)
+                continue
 
-        # Proba 4: Grupa jest zbyt duza, aby zmiescic sie w jednej wiadomosci -
+        # Proba 4: Grupa jest zbyt duza, aby zmiescic sie w jednej wiadomosci z pelnym naglowkiem -
         # dzielimy jej pozycje na wiele wiadomosci.
         if len(current_parts) > 1:
             messages.append("\n\n".join(current_parts))
