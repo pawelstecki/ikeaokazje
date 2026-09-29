@@ -183,6 +183,13 @@ artykułu, numer oferty i link do rezerwacji (jeśli oferta ma numer
 i skrypt zna slug sklepu - w przeciwnym razie zamiast linku dostajesz
 numer oferty do ręcznego wyszukania).
 
+Gdy IKEA wystawia kilka egzemplarzy tego samego produktu (identyczna
+nazwa, sklep, cena, stan), powiadomienie zawiera jeden wspólny opis
+i listę osobnych linków do rezerwacji każdego egzemplarza. Jeśli łączna
+treść powiadomienia Telegrama przekracza limit API, alert jest
+automatycznie dzielony na wiele wiadomości — żaden egzemplarz nie zostaje
+pominięty. Wiadomości e-mail używają analogicznego grupowania.
+
 ### Komendy Telegrama
 
 ```
@@ -206,7 +213,12 @@ nadawcy są ignorowani.
   artykułów (źródło prawdy po pierwszym starcie, patrz wyżej), plus stan
   backoffu i alertu dostępu (opisane niżej).
 - `~/.ikea_okazje_seen_offers.json` - identyfikatory już znanych ofert,
-  aby nie zgłaszać ich ponownie.
+  aby nie zgłaszać ich ponownie. Nowe oferty są dopisywane do tego pliku
+  wyłącznie wtedy, gdy wszystkie włączone kanały (e-mail, cała seria
+  wiadomości Telegrama) zakończą się pełnym sukcesem. W razie awarii
+  któregokolwiek kanału oferty nie są oznaczane jako znane i zostaną
+  ponowione w kolejnym cyklu (kanał, który wcześniej odebrał wiadomość,
+  może otrzymać duplikat; brak gwarancji exactly-once).
 - `~/.ikea_okazje_telegram_offset.json` - offset ostatnio przetworzonej
   wiadomości Telegrama.
 
