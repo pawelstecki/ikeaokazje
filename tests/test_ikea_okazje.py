@@ -3933,7 +3933,10 @@ class TestPerChannelDeliveryState(unittest.TestCase):
                       "UUID ze sklepu A musi byc w pending po czesciowym sukcesie")
 
         # Cykl 2: sklep 294 (A) pada - store_errors niepuste.
-        # UUID-y z pending nalezace do sklepu A NIE moga byc usuwane.
+        # Dodatkowo, wylaczamy email (SMTP_MODE=disabled) - co w normalnych
+        # warunkach awansowaloby oferte wylacznie-telegramowa do seen,
+        # ALE poniewaz sklep A jest niedostepny, nie promujemy w ciemno.
+        # UUID-y z pending nalezace do sklepu A NIE moga byc usuwane ani promowane.
         def fake_fetch_cycle2(store_id):
             if store_id == "294":
                 raise RuntimeError("sklep 294 tymczasowo niedostepny")
@@ -3941,20 +3944,76 @@ class TestPerChannelDeliveryState(unittest.TestCase):
 
         tg_calls_2 = []
         with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch_cycle2), \
-             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
              mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
              mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
              mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
             result2 = ik.run_ikea_check_cycle()
 
-        # Cykl kontynuuje ze sklepem 999 (kod 0 lub 2 gdy e-mail pada),
-        # ale UUID ze sklepu A MUSI przetrwac w pending
+        # Cykl kontynuuje ze sklepem 999 (kod 0 gdy e-mail jest juz wylaczony),
+        # ale UUID ze sklepu A MUSI przetrwac w pending bez zmian
+        self.assertEqual(result2, 0)
         state_after_2 = ik.load_seen_state()
         self.assertIn(uuid_sklep_a, state_after_2["pending"],
                       "UUID ze sklepu A NIE moze byc usuniety z pending gdy sklep byl niedostepny")
+        self.assertNotIn(uuid_sklep_a, state_after_2["seen"],
+                         "UUID ze sklepu A NIE moze zostac awansowany do seen, skoro sklep padl")
         # Telegram nie powinien dostac duplikatu (nadal jest w pending jako dostarczony)
         self.assertEqual(len(tg_calls_2), 0,
                          "Telegram NIE powinien ponawiac UUID ktory juz dostarczyl")
+
+
+    def test_state_bug_promotion_without_new_offers(self):
+        """Regresja: Jeśli oferta jest w pending i wyłączymy niedziałający kanał,
+        to w kolejnym cyklu oferta ta musi zostać w pełni awansowana do seen
+        (i usunięta z pending), NAWET jeśli w tym cyklu nie ma żadnych nowych ofert
+        do wysłania."""
+        product = self._fake_product("uuid-bug", "oferta")
+
+        # Cykl 1: email i telegram włączone. Email pada, Telegram dostarcza.
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("email fail")), \
+             mock.patch.object(ik, "send_telegram"):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)
+        state1 = ik.load_seen_state()
+        self.assertNotIn("uuid-bug", state1["seen"])
+        self.assertEqual(state1["pending"].get("uuid-bug"), ["telegram"])
+
+        # Cykl 2: użytkownik wyłącza email (SMTP_MODE=disabled).
+        # Telegram to jedyny aktywny kanał i już dostarczył tę ofertę, więc nie ma co wysyłać.
+        # Spodziewany wynik: uuid-bug trafia do seen, ORAZ znika z pending!
+        tg_calls_2 = []
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email"), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result2, 0)
+        self.assertEqual(len(tg_calls_2), 0, "Telegram nie powinien dostać duplikatu")
+
+        state2 = ik.load_seen_state()
+        self.assertIn("uuid-bug", state2["seen"], "UUID powinno trafić do seen po wyłączeniu blokującego kanału")
+        self.assertNotIn("uuid-bug", state2["pending"], "UUID powinno ZNIKNĄĆ z pending po awansie do seen")
+
+        # Cykl 3: upewnijmy się, że w kolejnym cyklu nadal nic się nie wysyła i stan pozostaje stabilny
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email"), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result3 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result3, 0)
+        self.assertEqual(len(tg_calls_2), 0)
+        state3 = ik.load_seen_state()
+        self.assertIn("uuid-bug", state3["seen"])
+        self.assertNotIn("uuid-bug", state3["pending"])
 
 
 if __name__ == "__main__":
