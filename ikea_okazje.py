@@ -1259,16 +1259,63 @@ def group_offers_for_notification(offers: list) -> list:
 
 
 def load_seen_uuids() -> set:
+    """Zwraca zbior UUID-ow juz w pelni dostarczonych (klucz 'seen').
+    Stary plik bez klucza 'pending' nadal dziala poprawnie.\""""
     if not os.path.exists(STATE_FILE):
         return set()
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return set(json.load(f).get("seen", []))
 
 
+def load_seen_state() -> dict:
+    """Wczytuje pelny stan plikow ofert: klucz 'seen' (zbior UUID w pelni
+    dostarczonych) i 'pending' (slownik uuid -> lista kanalow, ktore juz
+    dostarczyly). Stary plik bez klucza 'pending' zwraca pusty slownik
+    dla pending - wstecznie kompatybilne.\""""
+    if not os.path.exists(STATE_FILE):
+        return {"seen": set(), "pending": {}}
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        "seen": set(data.get("seen", [])),
+        "pending": {
+            uuid: list(channels)
+            for uuid, channels in (data.get("pending") or {}).items()
+        },
+    }
+
+
 def save_seen_uuids(uuids: set) -> None:
+    """Zapisuje tylko klucz 'seen', zachowujac istniejacy klucz 'pending'
+    z dysku (atomowy zapis przez .tmp, nie gubi pending).\""""
+    # Wczytaj istniejacy pending, zeby go nie zgubic przy zapisie seen
+    existing_pending = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                existing_pending = (json.load(f).get("pending") or {})
+        except (OSError, json.JSONDecodeError):
+            existing_pending = {}
+
+    _write_seen_state(uuids, existing_pending)
+
+
+def save_seen_state(seen: set, pending: dict) -> None:
+    """Atomowo zapisuje pelny stan: klucz 'seen' i 'pending'.\""""
+    _write_seen_state(seen, pending)
+
+
+def _write_seen_state(seen: set, pending: dict) -> None:
+    """Wspolny, atomowy zapis stanu ofert na dysk.\""""
     tmp_path = STATE_FILE + ".tmp"
+    payload = {"seen": sorted(seen)}
+    if pending:
+        payload["pending"] = {
+            uuid: sorted(channels)
+            for uuid, channels in pending.items()
+        }
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump({"seen": sorted(uuids)}, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
@@ -2471,9 +2518,31 @@ def update_blocking_backoff_state(store_errors: dict) -> BackoffState:
     return state
 
 
-# ---------------- GLOWNA LOGIKA (jeden cykl sprawdzenia ofert) ----------------
+def _enabled_channels() -> list:
+    """Zwraca posortowana liste nazw aktualnie wlaczonych kanalow
+    powiadomien ('email', 'telegram'). Kolejnosc jest deterministyczna -
+    uzywana do porownywania zbiorow dostarczonych kanalow z pending.\""""
+    channels = []
+    if EMAIL_ENABLED:
+        channels.append("email")
+    if TELEGRAM_ENABLED:
+        channels.append("telegram")
+    return channels
+
 
 def run_ikea_check_cycle() -> int:
+    """Jeden cykl sprawdzenia ofert z dostawą per kanał.
+
+    Klucz 'pending' w pliku stanu (STATE_FILE) przechowuje slownik
+    {uuid: [kanaly, ktore juz dostarczyly]} - umozliwia ponowienie
+    wylacznie do kanalow, ktore jeszcze nie otrzymaly danej oferty.
+
+    Semantyka kodu wyjscia:
+      0 - sukces lub brak nowych ofert
+      1 - blad pobierania wszystkich sklepow
+      2 - przynajmniej jeden kanal zawiodl (ale postep sprawnych zapisany)
+      3 - blad zapisu pliku stanu po sukcesie dostawy
+    """
     if not SEARCH_TERMS and not SEARCH_ARTICLE_NUMBERS:
         log(
             "Brak aktywnych slow kluczowych i numerow artykulow - "
@@ -2559,15 +2628,18 @@ def run_ikea_check_cycle() -> int:
     current_uuids = {o["offer_uuid"] for o in matching_offers if o.get("offer_uuid")}
 
     try:
-        seen_uuids = load_seen_uuids()
+        state = load_seen_state()
     except (OSError, json.JSONDecodeError) as exc:
         log(f"Blad odczytu pliku stanu: {exc}", to_stderr=True)
         return 1
 
+    seen_uuids = state["seen"]
+    pending = state["pending"]   # {uuid: [channels_delivered]}
+
     first_run = not os.path.exists(STATE_FILE)
     if first_run and not ALERT_EXISTING_ON_FIRST_RUN:
         try:
-            save_seen_uuids(current_uuids)
+            save_seen_state(current_uuids, {})
         except OSError as exc:
             log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
             return 3
@@ -2577,39 +2649,92 @@ def run_ikea_check_cycle() -> int:
         )
         return 0
 
-    new_offers = [
-        o for o in matching_offers
-        if o.get("offer_uuid") and o["offer_uuid"] not in seen_uuids
-    ]
+    # Krok 1: Usun z pending UUID-y, ktorych nie ma juz w aktualnych wynikach API
+    # (wymog 5: znikniecie oferty z API oczyszcza pending - oferta nie zostanie
+    # doreczona nigdy, wiec nie blokuje pending na zawsze).
+    pending = {uuid: ch for uuid, ch in pending.items() if uuid in current_uuids}
+
+    # Aktualnie wlaczone kanaly - tylko one licza sie przy decyzji o promocji
+    # do seen (wymog 7: zmiana konfiguracji kanalow nie zostawia ofert w pending).
+    active_channels = _enabled_channels()
+    active_channels_set = set(active_channels)
+
+    # Krok 2: Wyznacz oferty, ktore PRZYNAJMNIEJ JEDEN aktywny kanal jeszcze
+    # nie dostarczyl (nie sa w seen i nie sa w pelni dostarczone przez pending).
+    new_offers = []
+    for o in matching_offers:
+        uuid = o.get("offer_uuid")
+        if not uuid:
+            continue
+        if uuid in seen_uuids:
+            continue
+        delivered_so_far = set(pending.get(uuid, []))
+        # Uwzgledniamy tylko aktywne kanaly - wyłaczone sa ignorowane (wymog 7)
+        remaining = active_channels_set - delivered_so_far
+        if remaining:
+            new_offers.append(o)
 
     if new_offers:
-        delivery_result = notify(new_offers)
-        errors = [v for v in delivery_result.values() if v is not None]
-        if errors:
-            for err in errors:
-                log(f"Blad wysylki powiadomienia ({err})", to_stderr=True)
-            # Jesli chocby jeden wlaczony kanal powiadomien zawiodl (lub ktorakolwiek
-            # wiadomosc z serii Telegrama), NIE oznaczamy nowych ofert jako znane.
-            # Zwracamy kod 2 (blad dostawy), aby w kolejnym cyklu oferty zostaly
-            # ponowione i zaden kanal nie stracil ich bezpowrotnie.
-            # Akceptowany kompromis: kanal, ktory odebral alert przed awaria
-            # innego kanalu, moze otrzymac duplikat przy ponowieniu (brak exactly-once).
-            return 2
+        # Dostawa per kanal: wysylamy do kazdego aktywnego kanalu tylko oferty,
+        # ktorych ten kanal jeszcze nie dostarczyl.
+        any_channel_failed = False
 
-        # Wszystkie wlaczone kanaly zakonczyly sie pelnym sukcesem (dla Telegrama:
-        # pomyslnie wyslano cala serie podzielonych wiadomosci).
-        sent_uuids = {o["offer_uuid"] for o in new_offers if o.get("offer_uuid")}
+        for channel in active_channels:
+            # Oferty, ktore ten kanal jeszcze nie odebral
+            channel_offers = [
+                o for o in new_offers
+                if channel not in set(pending.get(o["offer_uuid"], []))
+            ]
+            if not channel_offers:
+                continue
+
+            channel_error = None
+            try:
+                if channel == "email":
+                    send_email(channel_offers)
+                elif channel == "telegram":
+                    send_telegram(channel_offers)
+            except Exception as exc:
+                channel_error = str(exc)
+                log(f"Blad wysylki powiadomienia ({channel}: {channel_error})", to_stderr=True)
+                any_channel_failed = True
+
+            if channel_error is None:
+                # Kanal dostarczyl - zapisz postep w pending
+                for o in channel_offers:
+                    uuid = o["offer_uuid"]
+                    already = pending.get(uuid, [])
+                    if channel not in already:
+                        pending[uuid] = sorted(set(already) | {channel})
+
+        # Krok 3: Promote UUID-y, dla ktorych WSZYSTKIE aktywne kanaly dostarczyly
+        newly_seen = set()
+        for uuid, delivered_channels in list(pending.items()):
+            if active_channels_set <= set(delivered_channels):
+                newly_seen.add(uuid)
+                del pending[uuid]
+
+        # Rowniez UUID-y, dla ktorych nie bylo zadnego aktywnego kanalu
+        # (nie powinno sie zdarzyc, ale defensywnie: all channels delivered = 0 channels needed)
+        if not active_channels:
+            newly_seen = {o["offer_uuid"] for o in new_offers if o.get("offer_uuid")}
+            pending = {}
+
         try:
-            save_seen_uuids(seen_uuids | sent_uuids)
+            save_seen_state(seen_uuids | newly_seen, pending)
         except OSError as exc:
-            log(f"Powiadomienie wyslane, ale nie udalo sie zapisac stanu: {exc}", to_stderr=True)
+            log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
             return 3
+
+        if any_channel_failed:
+            # Zwracamy kod 2, ale postep sprawnych kanalow jest juz utrwalony
+            return 2
 
         log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
         return 0
 
     try:
-        save_seen_uuids(seen_uuids | current_uuids)
+        save_seen_state(seen_uuids | current_uuids, pending)
     except OSError as exc:
         log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
         return 3
