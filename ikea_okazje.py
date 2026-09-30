@@ -2683,11 +2683,10 @@ def run_ikea_check_cycle() -> int:
         if remaining:
             new_offers.append(o)
 
+    any_channel_failed = False
     if new_offers:
         # Dostawa per kanal: wysylamy do kazdego aktywnego kanalu tylko oferty,
         # ktorych ten kanal jeszcze nie dostarczyl.
-        any_channel_failed = False
-
         for channel in active_channels:
             # Oferty, ktore ten kanal jeszcze nie odebral
             channel_offers = [
@@ -2716,39 +2715,37 @@ def run_ikea_check_cycle() -> int:
                     if channel not in already:
                         pending[uuid] = sorted(set(already) | {channel})
 
-        # Krok 3: Promote UUID-y, dla ktorych WSZYSTKIE aktywne kanaly dostarczyly
+    # Krok 3: Promote UUID-y, dla ktorych WSZYSTKIE aktywne kanaly dostarczyly
+    # (nawet jesli new_offers bylo puste, bo np. wylaczono kanal, ktory wczesniej zawodzil)
+    if active_channels_set:
         newly_seen = set()
         for uuid, delivered_channels in list(pending.items()):
+            # Wymog 3: Nie promujemy w ciemno UUID z pending nalezacego do sklepu, ktory
+            # wlasnie padl (czesciowy cykl) - czekamy na jego pelny powrot, aby byc pewnym.
+            if store_errors and uuid not in current_uuids:
+                continue
+
             if active_channels_set <= set(delivered_channels):
                 newly_seen.add(uuid)
                 del pending[uuid]
 
-        # Rowniez UUID-y, dla ktorych nie bylo zadnego aktywnego kanalu
-        # (nie powinno sie zdarzyc, ale defensywnie: all channels delivered = 0 channels needed)
-        if not active_channels:
-            newly_seen = {o["offer_uuid"] for o in new_offers if o.get("offer_uuid")}
-            pending = {}
-
-        try:
-            save_seen_state(seen_uuids | newly_seen, pending)
-        except OSError as exc:
-            log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
-            return 3
-
-        if any_channel_failed:
-            # Zwracamy kod 2, ale postep sprawnych kanalow jest juz utrwalony
-            return 2
-
-        log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
-        return 0
+        seen_uuids |= newly_seen
 
     try:
-        save_seen_state(seen_uuids | current_uuids, pending)
+        save_seen_state(seen_uuids, pending)
     except OSError as exc:
         log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
         return 3
 
-    log(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
+    if any_channel_failed:
+        # Zwracamy kod 2, ale postep sprawnych kanalow jest juz utrwalony
+        return 2
+
+    if new_offers:
+        log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
+    else:
+        log(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
+
     return 0
 
 
