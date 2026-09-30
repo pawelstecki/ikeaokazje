@@ -294,6 +294,18 @@ python3 -m unittest tests/test_ikea_okazje.py
 Standardowy `unittest`, bez sieci, bez `.env` użytkownika (testy izolują
 `HOME` we własnym tymczasowym katalogu).
 
+## Stan dostawy per kanał
+
+Plik `~/.ikea_okazje_seen_offers.json` przechowuje teraz dwa klucze: `seen`
+(UUID-y w pełni dostarczone przez wszystkie aktywne kanały) i `pending` (UUID-y
+częściowo dostarczone — słownik `{uuid: [kanały, które już dostarczyły]}`).
+Dzięki temu gdy jeden kanał (np. SMTP z wygasłym certyfikatem) pada trwale,
+sprawny kanał (np. Telegram) dostarcza ofertę tylko raz — przy kolejnym cyklu
+nie dostaje duplikatu. UUID trafia do `seen` dopiero gdy wszystkie aktualnie
+włączone kanały go dostarczą. Wyłączenie kanału jest od razu respektowane —
+oferty w `pending` nie czekają wiecznie. Stare pliki bez klucza `pending`
+działają bez modyfikacji (migracja jest transparentna).
+
 ## Nieoficjalne API i licencja
 
 API IKEA użyte tutaj nie jest publicznie dokumentowane i może się zmienić

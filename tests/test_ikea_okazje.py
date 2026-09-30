@@ -3016,9 +3016,11 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(len(email_calls), 1)
         seen = ik.load_seen_uuids()
-        self.assertNotIn("uuid-4", seen)
+        self.assertNotIn("uuid-4", seen)  # nie w seen, tylko w pending
 
-        # Drugi cykl - Telegram odzyskuje sprawnosc i odbiera oferte
+        # Drugi cykl - Telegram odzyskuje sprawnosc i odbiera oferte.
+        # Z dostawą per kanał: e-mail juz dostarczyl w cyklu 1 (jest w pending),
+        # wiec TYLKO Telegram dostaje oferte w cyklu 2 - e-mail nie dostaje duplikatu.
         with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
              mock.patch.object(ik, "EMAIL_ENABLED", True), \
              mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
@@ -3027,7 +3029,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
             result2 = ik.run_ikea_check_cycle()
 
         self.assertEqual(result2, 0)
-        self.assertEqual(len(email_calls), 2)  # e-mail dostaje duplikat przy ponowieniu
+        self.assertEqual(len(email_calls), 1)  # e-mail juz dostarczyl w cyklu 1 - brak duplikatu
         self.assertEqual(len(tg_calls), 1)     # Telegram pomyslnie otrzymuje oferty
         seen2 = ik.load_seen_uuids()
         self.assertIn("uuid-4", seen2)
@@ -3048,9 +3050,11 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(len(tg_calls), 1)
         seen = ik.load_seen_uuids()
-        self.assertNotIn("uuid-5", seen)
+        self.assertNotIn("uuid-5", seen)  # nie w seen, tylko w pending
 
-        # Drugi cykl - e-mail odzyskuje sprawnosc i odbiera oferte
+        # Drugi cykl - e-mail odzyskuje sprawnosc i odbiera oferte.
+        # Z dostawą per kanał: Telegram juz dostarczyl w cyklu 1 (jest w pending),
+        # wiec TYLKO e-mail dostaje oferte w cyklu 2 - Telegram nie dostaje duplikatu.
         with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
              mock.patch.object(ik, "EMAIL_ENABLED", True), \
              mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
@@ -3060,14 +3064,14 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
 
         self.assertEqual(result2, 0)
         self.assertEqual(len(email_calls), 1)  # e-mail pomyslnie otrzymuje oferty
-        self.assertEqual(len(tg_calls), 2)     # Telegram dostaje duplikat przy ponowieniu
+        self.assertEqual(len(tg_calls), 1)     # Telegram juz dostarczyl w cyklu 1 - brak duplikatu
         seen2 = ik.load_seen_uuids()
         self.assertIn("uuid-5", seen2)
 
     def test_telegram_message_2_fails_while_email_succeeds(self):
         # Integracyjny test: wiadomosc Telegrama podzielona na serie;
         # czesc 1 dociera, czesc 2 zawodzi. Mimo ze e-mail dotarl,
-        # oferty NIE sa zapisywane jako seen.
+        # oferty NIE sa zapisywane jako seen (Telegram nie zakonczyl serii).
         uuids = [f"uuid-split-{i}" for i in range(150)]
         product = self._fake_api_product(uuids)
 
@@ -3093,7 +3097,9 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         for u in uuids:
             self.assertNotIn(u, seen)
 
-        # Drugi cykl: Telegram dziala bezblednie dla wszystkich czesci serii
+        # Drugi cykl: Telegram dziala bezblednie dla wszystkich czesci serii.
+        # Z dostawą per kanał: e-mail juz dostarczyl w cyklu 1 (jest w pending),
+        # wiec TYLKO Telegram dostaje oferty w cyklu 2 - e-mail nie dostaje duplikatu.
         tg_delivered = []
         with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
              mock.patch.object(ik, "EMAIL_ENABLED", True), \
@@ -3103,8 +3109,8 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
             result2 = ik.run_ikea_check_cycle()
 
         self.assertEqual(result2, 0)
-        self.assertEqual(len(email_delivered), 2)  # powtorny email
-        self.assertGreater(len(tg_delivered), 1)   # potwierdzenie podzialu na wiele wiadomosci
+        self.assertEqual(len(email_delivered), 1)  # e-mail juz dostarczyl w cyklu 1 - brak duplikatu
+        self.assertGreater(len(tg_delivered), 1)   # Telegram dostarcza cala serie wiadomosci
         seen2 = ik.load_seen_uuids()
         for u in uuids:
             self.assertIn(u, seen2)
@@ -3451,6 +3457,563 @@ class TestTelegramTitlePreservationAndSplitting(unittest.TestCase):
         tag_stripped = re.sub(r"<b>|</b>|<a\s+href=\"[^\"]*\">|</a>", "", msg)
         self.assertNotIn("<", tag_stripped)
         self.assertNotIn(">", tag_stripped)
+
+
+
+class TestPerChannelDeliveryState(unittest.TestCase):
+    """Testy dla stanu dostawy per kanal (klucz 'pending' w pliku stanu).
+
+    Scenariusz z opisu bledu: gdy e-mail (SMTP) pada trwale, Telegram
+    nie powinien dostawac tej samej oferty przy kazdym cyklu - po
+    pierwszym sukcesie Telegrama UUID trafia do 'pending' i w kolejnych
+    cyklach Telegram jest pomijany (dostarczyl), dopoki e-mail nie
+    zostanie naprawiony.
+
+    Wymagania z zadania:
+    1. E-mail pada trwale - Telegram w 2. cyklu nie dostaje juz tej samej oferty.
+    2. Po naprawie e-maila oferta laduje w seen.
+    3. Stary plik stanu (bez 'pending') dziala poprawnie.
+    4. Wylaczenie kanalu nie blokuje pending na zawsze.
+    5. Znikniecie oferty z API oczyszcza pending.
+    6. Zapis stanu po czesciowym sukcesie (przed wyjsciem z kodem 2).
+    """
+
+    def setUp(self):
+        self._orig_store_ids = list(ik.STORE_IDS)
+        self._orig_terms = list(ik.SEARCH_TERMS)
+        self._orig_numbers = list(ik.SEARCH_ARTICLE_NUMBERS)
+        self._orig_sleep = ik.time.sleep
+        ik.time.sleep = lambda *a, **k: None
+        ik.SEARCH_TERMS = ["stol"]
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = []
+        ik.STORE_IDS = ["294"]
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        ik.save_seen_uuids(set())   # nie-first-run
+
+    def tearDown(self):
+        ik.STORE_IDS = self._orig_store_ids
+        ik.SEARCH_TERMS = self._orig_terms
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = self._orig_numbers
+        ik.time.sleep = self._orig_sleep
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+
+    def _fake_product(self, uuid, offer_number="12345"):
+        return {
+            "title": "Stol drewniany",
+            "description": "opis",
+            "originalPrice": 200,
+            "articleNumbers": ["12345678"],
+            "currency": "PLN",
+            "storeId": "294",
+            "offers": [{
+                "offerUuid": uuid,
+                "offerNumber": offer_number,
+                "price": 100,
+                "productConditionTitle": "Nowy",
+                "productConditionDescription": "brak",
+                "reasonDiscount": "wystawowy",
+                "additionalInfo": None,
+            }],
+            "heroImage": None,
+        }
+
+    # --- Wymog 1: e-mail pada trwale, Telegram nie dostaje duplikatu ---
+
+    def test_email_permanent_failure_telegram_not_resent_in_cycle2(self):
+        """Scenariusz z raportu bledu: SMTP pada, a Telegram dostal juz
+        oferte w cyklu 1. W cyklu 2 Telegram NIE dostaje duplikatu."""
+        product = self._fake_product("uuid-A")
+        tg_calls = []
+
+        # Cykl 1: e-mail pada, Telegram dostarcza
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("cert expired")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda offers: tg_calls.append(offers)):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)   # blad (e-mail zawiodl)
+        self.assertEqual(len(tg_calls), 1, "Telegram powinien dostarczyc w cyklu 1")
+        seen1 = ik.load_seen_uuids()
+        self.assertNotIn("uuid-A", seen1, "UUID nie powinien byc w seen - e-mail jeszcze nie dostarczyl")
+
+        # Sprawdz, ze pending zapisany
+        state1 = ik.load_seen_state()
+        self.assertIn("uuid-A", state1["pending"], "UUID powinien byc w pending po czesciowym sukcesie")
+        self.assertIn("telegram", state1["pending"]["uuid-A"], "Telegram powinien byc w pending jako dostarczony")
+
+        # Cykl 2: e-mail pada dalej. Telegram juz dostarczyl - NIE powinien dostac duplikatu.
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("cert expired")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda offers: tg_calls.append(offers)):
+            result2 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result2, 2)    # dalej blad (e-mail ciągle nie działa)
+        self.assertEqual(len(tg_calls), 1, "Telegram NIE powinien dostac duplikatu w cyklu 2")
+
+    # --- Wymog 2: Po naprawie e-maila oferta laduje w seen ---
+
+    def test_offer_moves_to_seen_after_email_repair(self):
+        """Po naprawie e-maila (cykl 3) UUID przenosi sie z pending do seen."""
+        product = self._fake_product("uuid-B")
+        email_calls = []
+        tg_calls = []
+
+        # Cykl 1: e-mail pada, Telegram dostarcza
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            ik.run_ikea_check_cycle()
+
+        # Cykl 2: e-mail naprawiony - dostarcza; UUID powinien trafic do seen
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=lambda o: email_calls.append(o)), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            result = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(email_calls), 1, "E-mail powinien dostarczyc w cyklu naprawy")
+        self.assertEqual(len(tg_calls), 1, "Telegram nie powinien dostac duplikatu po naprawie e-maila")
+        seen = ik.load_seen_uuids()
+        self.assertIn("uuid-B", seen, "UUID powinien byc w seen po naprawie e-maila")
+        state = ik.load_seen_state()
+        self.assertNotIn("uuid-B", state["pending"], "UUID nie powinien byc w pending po przeniesieniu do seen")
+
+    # --- Wymog 3: Stary plik stanu (bez 'pending') dziala ---
+
+    def test_old_state_file_without_pending_key_works(self):
+        """Stary plik stanu bez klucza 'pending' jest wczytywany poprawnie."""
+        # Zapisz plik TYLKO z kluczem 'seen' (stary format)
+        old_state = {"seen": ["old-uuid-1", "old-uuid-2"]}
+        with open(ik.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(old_state, f)
+
+        # Nowa oferta - stary plik nie ma 'pending'
+        product = self._fake_product("uuid-new")
+        tg_calls = []
+
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            result = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(tg_calls), 1)
+        seen = ik.load_seen_uuids()
+        self.assertIn("uuid-new", seen)
+        self.assertIn("old-uuid-1", seen, "Stare UUID musza zostac zachowane")
+        self.assertIn("old-uuid-2", seen, "Stare UUID musza zostac zachowane")
+
+    def test_load_seen_state_old_file_returns_empty_pending(self):
+        """load_seen_state() na starym pliku bez 'pending' zwraca pusty slownik."""
+        old_state = {"seen": ["uuid-X", "uuid-Y"]}
+        with open(ik.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(old_state, f)
+
+        state = ik.load_seen_state()
+        self.assertEqual(state["seen"], {"uuid-X", "uuid-Y"})
+        self.assertEqual(state["pending"], {})
+
+    # --- Wymog 4: Wylaczenie kanalu nie blokuje pending na zawsze ---
+
+    def test_disabling_channel_does_not_leave_offer_in_pending_forever(self):
+        """Gdy jeden kanal jest wylaczony, liczy sie tylko drugi.
+        Po dostarczeniu przez jedyny aktywny kanal UUID trafia do seen."""
+        product = self._fake_product("uuid-C")
+        tg_calls = []
+
+        # Cykl 1: oba kanaly wlaczone; e-mail pada, Telegram dostarcza
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)
+
+        # Cykl 2: uzytkownik WYLACZA email (disabled). Teraz tylko Telegram
+        # jest aktywny i juz dostarczyl. UUID powinien trafic do seen.
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result2, 0)
+        self.assertEqual(len(tg_calls), 1, "Telegram nie powinien dostac duplikatu po wylaczeniu e-maila")
+        seen = ik.load_seen_uuids()
+        self.assertIn("uuid-C", seen, "UUID powinien byc w seen gdy jedyny aktywny kanal dostarczyl")
+
+    def test_disabling_already_delivered_channel_does_not_resend(self):
+        """Gdy kanal, ktory juz dostarczyl, zostaje wylaczony - oferta
+        nie jest ponawiana (do zadnego innego kanalu) - trafia do seen."""
+        product = self._fake_product("uuid-D")
+        email_calls = []
+        tg_calls = []
+
+        # Cykl 1: oba kanaly wlaczone; Telegram dostarcza, e-mail pada
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("no SMTP")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            ik.run_ikea_check_cycle()
+
+        # Cykl 2: uzytkownik WYLACZA Telegram. Teraz tylko email jest aktywny.
+        # Dopiero email musi dostarczyc; Telegram jest juz nieistotny (wylaczony).
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "send_email", side_effect=lambda o: email_calls.append(o)):
+            result = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(email_calls), 1, "Email powinien dostarczyc po wylaczeniu Telegrama")
+        seen = ik.load_seen_uuids()
+        self.assertIn("uuid-D", seen)
+
+    # --- Wymog 5: Znikniecie oferty z API oczyszcza pending ---
+
+    def test_offer_disappearing_from_api_clears_pending(self):
+        """UUID w pending, ktorego nie ma juz w API, jest usuwany z pending."""
+        product = self._fake_product("uuid-E")
+        tg_calls = []
+
+        # Cykl 1: e-mail pada, Telegram dostarcza (uuid-E trafia do pending)
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            ik.run_ikea_check_cycle()
+
+        state_after_1 = ik.load_seen_state()
+        self.assertIn("uuid-E", state_after_1["pending"])
+
+        # Cykl 2: oferta ZNIKLA z API (puste wyniki)
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result2, 0)   # brak bledow (nic nie bylo do wyslania)
+        state_after_2 = ik.load_seen_state()
+        self.assertNotIn("uuid-E", state_after_2["pending"], "Zniknieta oferta powinna byc usunieta z pending")
+        # Nie trafia tez do seen (nie bylo pelnej dostawy)
+        self.assertNotIn("uuid-E", state_after_2["seen"])
+
+    # --- Wymog 6: Zapis stanu po czesciowym sukcesie ---
+
+    def test_progress_saved_before_returning_code_2(self):
+        """Po czesciowym sukcesie (jeden kanal zawodzi) stan jest zapisywany
+        PRZED zwroceniem kodu 2 - nastepny cykl zna juz postep."""
+        product = self._fake_product("uuid-F")
+        email_calls = []
+        tg_calls = []
+
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=lambda o: email_calls.append(o)), \
+             mock.patch.object(ik, "send_telegram", side_effect=RuntimeError("tg down")):
+            result = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result, 2)
+        self.assertEqual(len(email_calls), 1)
+
+        # Stan MUSI byc zapisany PRZED powrotem z kodem 2
+        state = ik.load_seen_state()
+        self.assertIn("uuid-F", state["pending"], "Postep e-maila musi byc zapisany w pending")
+        self.assertIn("email", state["pending"]["uuid-F"])
+        self.assertNotIn("telegram", state["pending"]["uuid-F"])
+        self.assertNotIn("uuid-F", state["seen"], "UUID nie powinien byc w seen - Telegram nie dostarczyl")
+
+    # --- Wymog 7: save_seen_uuids() nie gubi klucza 'pending' ---
+
+    def test_save_seen_uuids_preserves_pending_key(self):
+        """save_seen_uuids() (wolana przez zewnetrzny kod) nie usuwa istniejacego
+        klucza 'pending' z pliku stanu - klucz jest zachowywany atomowo."""
+        existing_state = {
+            "seen": ["s1", "s2"],
+            "pending": {"p1": ["email"], "p2": ["telegram"]}
+        }
+        with open(ik.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing_state, f)
+
+        # Wywolanie save_seen_uuids z nowym zbiorom seen
+        ik.save_seen_uuids({"s1", "s2", "s3"})
+
+        state = ik.load_seen_state()
+        self.assertIn("s3", state["seen"], "Nowe UUID musi byc w seen")
+        self.assertIn("p1", state["pending"], "Klucz 'pending' musi byc zachowany")
+        self.assertIn("p2", state["pending"], "Klucz 'pending' musi byc zachowany")
+        self.assertEqual(state["pending"]["p1"], ["email"])
+
+    # --- Testy _enabled_channels() ---
+
+    def test_enabled_channels_email_only(self):
+        with mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False):
+            self.assertEqual(ik._enabled_channels(), ["email"])
+
+    def test_enabled_channels_telegram_only(self):
+        with mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
+            self.assertEqual(ik._enabled_channels(), ["telegram"])
+
+    def test_enabled_channels_both(self):
+        with mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
+            channels = ik._enabled_channels()
+            self.assertIn("email", channels)
+            self.assertIn("telegram", channels)
+            self.assertEqual(len(channels), 2)
+
+    def test_enabled_channels_none(self):
+        with mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False):
+            self.assertEqual(ik._enabled_channels(), [])
+
+    # --- Testy load_seen_state() i save_seen_state() ---
+
+    def test_save_seen_state_and_load_seen_state_roundtrip(self):
+        """Zapisany stan (seen + pending) jest identycznie odczytywany."""
+        seen = {"u1", "u2"}
+        pending = {"u3": ["email"], "u4": ["email", "telegram"]}
+        ik.save_seen_state(seen, pending)
+
+        state = ik.load_seen_state()
+        self.assertEqual(state["seen"], seen)
+        self.assertEqual(set(state["pending"]["u3"]), {"email"})
+        self.assertEqual(set(state["pending"]["u4"]), {"email", "telegram"})
+
+    def test_save_seen_state_empty_pending_not_written(self):
+        """Pusty pending nie jest zapisywany jako klucz w pliku JSON."""
+        ik.save_seen_state({"u1"}, {})
+        with open(ik.STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertNotIn("pending", data, "Pusty pending nie powinien byc zapisywany")
+
+    def test_load_seen_state_nonexistent_file_returns_empty(self):
+        """Brak pliku stanu zwraca pusty stan."""
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        state = ik.load_seen_state()
+        self.assertEqual(state["seen"], set())
+        self.assertEqual(state["pending"], {})
+
+    # --- Scenariusz pelny: 6 razy ta sama oferta na Telegramie ---
+
+    def test_telegram_not_spammed_when_email_fails_permanently(self):
+        """Odwzorowanie scenariusza z opisu bledu: e-mail pada przy kazdym cyklu.
+        Telegram dostaje oferte DOKLADNIE RAZ (cykl 1), a nie przy kazdym cyklu."""
+        product = self._fake_product("uuid-spam")
+        tg_calls = []
+        email_failures = []
+
+        def always_fail_email(offers):
+            email_failures.append(offers)
+            raise RuntimeError("SMTP cert expired - permanent")
+
+        for cycle in range(4):
+            with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+                 mock.patch.object(ik, "EMAIL_ENABLED", True), \
+                 mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+                 mock.patch.object(ik, "send_email", side_effect=always_fail_email), \
+                 mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls.append(o)):
+                ik.run_ikea_check_cycle()
+
+        self.assertEqual(len(tg_calls), 1,
+                         f"Telegram powinien dostac oferte tylko RAZ, a nie {len(tg_calls)} razy")
+
+    # --- Integracja: brak regresji w zachowaniu kodu wyjscia ---
+
+    def test_all_channels_success_returns_zero(self):
+        """Gdy oba kanaly dostarczaja pomyslnie, kod wyjscia to 0."""
+        product = self._fake_product("uuid-ok")
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email"), \
+             mock.patch.object(ik, "send_telegram"):
+            result = ik.run_ikea_check_cycle()
+        self.assertEqual(result, 0)
+        seen = ik.load_seen_uuids()
+        self.assertIn("uuid-ok", seen)
+
+    def test_all_channels_fail_returns_two_and_no_seen(self):
+        """Gdy oba kanaly zawodza, kod wyjscia to 2 i UUID nie jest w seen."""
+        product = self._fake_product("uuid-fail")
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("email")), \
+             mock.patch.object(ik, "send_telegram", side_effect=RuntimeError("tg")):
+            result = ik.run_ikea_check_cycle()
+        self.assertEqual(result, 2)
+        seen = ik.load_seen_uuids()
+        self.assertNotIn("uuid-fail", seen)
+
+    def test_telegram_grouping_preserved_for_channel_offers(self):
+        """Telegram jest dostarczony dopiero po wyslaniu calej serii wiadomosci -
+        grupowanie i limit dlugosci pozostaja niezmienione.\""""
+        # 150 ofert tego samego produktu -> wymusza wiele wiadomosci Telegrama
+        offers = []
+        for i in range(30):
+            product = self._fake_product(f"uuid-group-{i}", f"offer-{i}")
+            offers.append(product)
+
+        tg_msg_count = {"n": 0}
+        email_calls = []
+
+        def fake_tg_send(msg, **kwargs):
+            tg_msg_count["n"] += 1
+
+        with mock.patch.object(ik, "fetch_store_offers", return_value=offers), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "deliver_email_message", side_effect=lambda s, b: email_calls.append(b)), \
+             mock.patch.object(ik, "telegram_send_message", side_effect=fake_tg_send):
+            result = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(email_calls), 1, "E-mail wyslany dokladnie raz")
+        self.assertGreaterEqual(tg_msg_count["n"], 1, "Telegram wyslal przynajmniej jedna wiadomosc")
+
+    # --- Regresja: pruning pending tylko przy pelnym pobieraniu sklepow ---
+
+    def test_pending_not_pruned_when_store_fetch_fails(self):
+        """Regresja: UUID w pending z niedostepnego sklepu NIE moze byc usuniety
+        z pending podczas czesciowego cyklu pobierania.
+
+        Scenariusz: dwa sklepy (A=294, B=999). W cyklu 1 oba sklepy dzialaja -
+        e-mail pada, Telegram dostarcza oferty sklepu A (trafiaja do pending).
+        W cyklu 2 sklep A jest niedostepny (tylko sklep B odpowiada). UUID-y
+        z pending, ktore naleza do sklepu A, NIE moga byc usuwane z pending
+        tylko dlatego, ze sklepu A tym razem nie udalo sie pobrac - oferta
+        moze wciaz istniec w API.\""""
+        uuid_sklep_a = "uuid-store-a"
+        product_a = self._fake_product(uuid_sklep_a, "offer-a")
+        product_a["storeId"] = "294"
+
+        # Ustaw dwa sklepy
+        ik.STORE_IDS = ["294", "999"]
+
+        # Cykl 1: oba sklepy dzialaja; e-mail pada, Telegram dostarcza oferty sklepu A
+        def fake_fetch_cycle1(store_id):
+            if store_id == "294":
+                return [product_a]
+            return []   # sklep 999 - brak ofert pasujacych
+
+        with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch_cycle1), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
+             mock.patch.object(ik, "send_telegram"):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)
+        state_after_1 = ik.load_seen_state()
+        self.assertIn(uuid_sklep_a, state_after_1["pending"],
+                      "UUID ze sklepu A musi byc w pending po czesciowym sukcesie")
+
+        # Cykl 2: sklep 294 (A) pada - store_errors niepuste.
+        # Dodatkowo, wylaczamy email (SMTP_MODE=disabled) - co w normalnych
+        # warunkach awansowaloby oferte wylacznie-telegramowa do seen,
+        # ALE poniewaz sklep A jest niedostepny, nie promujemy w ciemno.
+        # UUID-y z pending nalezace do sklepu A NIE moga byc usuwane ani promowane.
+        def fake_fetch_cycle2(store_id):
+            if store_id == "294":
+                raise RuntimeError("sklep 294 tymczasowo niedostepny")
+            return []   # sklep 999 - brak ofert
+
+        tg_calls_2 = []
+        with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch_cycle2), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        # Cykl kontynuuje ze sklepem 999 (kod 0 gdy e-mail jest juz wylaczony),
+        # ale UUID ze sklepu A MUSI przetrwac w pending bez zmian
+        self.assertEqual(result2, 0)
+        state_after_2 = ik.load_seen_state()
+        self.assertIn(uuid_sklep_a, state_after_2["pending"],
+                      "UUID ze sklepu A NIE moze byc usuniety z pending gdy sklep byl niedostepny")
+        self.assertNotIn(uuid_sklep_a, state_after_2["seen"],
+                         "UUID ze sklepu A NIE moze zostac awansowany do seen, skoro sklep padl")
+        # Telegram nie powinien dostac duplikatu (nadal jest w pending jako dostarczony)
+        self.assertEqual(len(tg_calls_2), 0,
+                         "Telegram NIE powinien ponawiac UUID ktory juz dostarczyl")
+
+
+    def test_state_bug_promotion_without_new_offers(self):
+        """Regresja: Jeśli oferta jest w pending i wyłączymy niedziałający kanał,
+        to w kolejnym cyklu oferta ta musi zostać w pełni awansowana do seen
+        (i usunięta z pending), NAWET jeśli w tym cyklu nie ma żadnych nowych ofert
+        do wysłania."""
+        product = self._fake_product("uuid-bug", "oferta")
+
+        # Cykl 1: email i telegram włączone. Email pada, Telegram dostarcza.
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("email fail")), \
+             mock.patch.object(ik, "send_telegram"):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)
+        state1 = ik.load_seen_state()
+        self.assertNotIn("uuid-bug", state1["seen"])
+        self.assertEqual(state1["pending"].get("uuid-bug"), ["telegram"])
+
+        # Cykl 2: użytkownik wyłącza email (SMTP_MODE=disabled).
+        # Telegram to jedyny aktywny kanał i już dostarczył tę ofertę, więc nie ma co wysyłać.
+        # Spodziewany wynik: uuid-bug trafia do seen, ORAZ znika z pending!
+        tg_calls_2 = []
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email"), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result2, 0)
+        self.assertEqual(len(tg_calls_2), 0, "Telegram nie powinien dostać duplikatu")
+
+        state2 = ik.load_seen_state()
+        self.assertIn("uuid-bug", state2["seen"], "UUID powinno trafić do seen po wyłączeniu blokującego kanału")
+        self.assertNotIn("uuid-bug", state2["pending"], "UUID powinno ZNIKNĄĆ z pending po awansie do seen")
+
+        # Cykl 3: upewnijmy się, że w kolejnym cyklu nadal nic się nie wysyła i stan pozostaje stabilny
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[product]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email"), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result3 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result3, 0)
+        self.assertEqual(len(tg_calls_2), 0)
+        state3 = ik.load_seen_state()
+        self.assertIn("uuid-bug", state3["seen"])
+        self.assertNotIn("uuid-bug", state3["pending"])
 
 
 if __name__ == "__main__":
