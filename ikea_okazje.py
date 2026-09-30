@@ -2652,12 +2652,21 @@ def run_ikea_check_cycle() -> int:
     # Krok 1: Usun z pending UUID-y, ktorych nie ma juz w aktualnych wynikach API
     # (wymog 5: znikniecie oferty z API oczyszcza pending - oferta nie zostanie
     # doreczona nigdy, wiec nie blokuje pending na zawsze).
-    pending = {uuid: ch for uuid, ch in pending.items() if uuid in current_uuids}
+    #
+    # WAZNE: pruning jest bezpieczny TYLKO gdy mamy kompletne dane ze WSZYSTKICH
+    # monitorowanych sklepow (store_errors pusty). Przy czesciowym pobieraniu
+    # (chocby jeden sklep zawiodl) UUID z niedostepnego sklepu nie bedzie w
+    # current_uuids - jego usuniecie z pending byloby bledne (oferta mogla
+    # dalej istniec w API sklepu, ktory tym razem nie odpowiedzial). Przy
+    # czesciowym cyklu pomijamy wiec pruning w calosci.
+    if not store_errors:
+        pending = {uuid: ch for uuid, ch in pending.items() if uuid in current_uuids}
 
     # Aktualnie wlaczone kanaly - tylko one licza sie przy decyzji o promocji
     # do seen (wymog 7: zmiana konfiguracji kanalow nie zostawia ofert w pending).
     active_channels = _enabled_channels()
     active_channels_set = set(active_channels)
+
 
     # Krok 2: Wyznacz oferty, ktore PRZYNAJMNIEJ JEDEN aktywny kanal jeszcze
     # nie dostarczyl (nie sa w seen i nie sa w pelni dostarczone przez pending).

@@ -3895,6 +3895,67 @@ class TestPerChannelDeliveryState(unittest.TestCase):
         self.assertEqual(len(email_calls), 1, "E-mail wyslany dokladnie raz")
         self.assertGreaterEqual(tg_msg_count["n"], 1, "Telegram wyslal przynajmniej jedna wiadomosc")
 
+    # --- Regresja: pruning pending tylko przy pelnym pobieraniu sklepow ---
+
+    def test_pending_not_pruned_when_store_fetch_fails(self):
+        """Regresja: UUID w pending z niedostepnego sklepu NIE moze byc usuniety
+        z pending podczas czesciowego cyklu pobierania.
+
+        Scenariusz: dwa sklepy (A=294, B=999). W cyklu 1 oba sklepy dzialaja -
+        e-mail pada, Telegram dostarcza oferty sklepu A (trafiaja do pending).
+        W cyklu 2 sklep A jest niedostepny (tylko sklep B odpowiada). UUID-y
+        z pending, ktore naleza do sklepu A, NIE moga byc usuwane z pending
+        tylko dlatego, ze sklepu A tym razem nie udalo sie pobrac - oferta
+        moze wciaz istniec w API.\""""
+        uuid_sklep_a = "uuid-store-a"
+        product_a = self._fake_product(uuid_sklep_a, "offer-a")
+        product_a["storeId"] = "294"
+
+        # Ustaw dwa sklepy
+        ik.STORE_IDS = ["294", "999"]
+
+        # Cykl 1: oba sklepy dzialaja; e-mail pada, Telegram dostarcza oferty sklepu A
+        def fake_fetch_cycle1(store_id):
+            if store_id == "294":
+                return [product_a]
+            return []   # sklep 999 - brak ofert pasujacych
+
+        with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch_cycle1), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
+             mock.patch.object(ik, "send_telegram"):
+            result1 = ik.run_ikea_check_cycle()
+
+        self.assertEqual(result1, 2)
+        state_after_1 = ik.load_seen_state()
+        self.assertIn(uuid_sklep_a, state_after_1["pending"],
+                      "UUID ze sklepu A musi byc w pending po czesciowym sukcesie")
+
+        # Cykl 2: sklep 294 (A) pada - store_errors niepuste.
+        # UUID-y z pending nalezace do sklepu A NIE moga byc usuwane.
+        def fake_fetch_cycle2(store_id):
+            if store_id == "294":
+                raise RuntimeError("sklep 294 tymczasowo niedostepny")
+            return []   # sklep 999 - brak ofert
+
+        tg_calls_2 = []
+        with mock.patch.object(ik, "fetch_store_offers", side_effect=fake_fetch_cycle2), \
+             mock.patch.object(ik, "EMAIL_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email", side_effect=RuntimeError("smtp down")), \
+             mock.patch.object(ik, "send_telegram", side_effect=lambda o: tg_calls_2.append(o)):
+            result2 = ik.run_ikea_check_cycle()
+
+        # Cykl kontynuuje ze sklepem 999 (kod 0 lub 2 gdy e-mail pada),
+        # ale UUID ze sklepu A MUSI przetrwac w pending
+        state_after_2 = ik.load_seen_state()
+        self.assertIn(uuid_sklep_a, state_after_2["pending"],
+                      "UUID ze sklepu A NIE moze byc usuniety z pending gdy sklep byl niedostepny")
+        # Telegram nie powinien dostac duplikatu (nadal jest w pending jako dostarczony)
+        self.assertEqual(len(tg_calls_2), 0,
+                         "Telegram NIE powinien ponawiac UUID ktory juz dostarczyl")
+
 
 if __name__ == "__main__":
     unittest.main()
