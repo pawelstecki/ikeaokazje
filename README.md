@@ -161,12 +161,9 @@ Jeśli zapomnisz o tym wpisie, skrypt pod systemd wykona jedno przejście
 "cron" i wyjdzie ze statusem 0 - systemd może to uznać za normalne
 zakończenie i nie zrestartować usługi (dostaniesz ostrzeżenie w logach).
 
-Instalacja (w pliku usługi podmień `TWOJ_UZYTKOWNIK` w `User=` i
-`WorkingDirectory=`, a w `ExecStart=` ścieżkę do skryptu i pliku blokady
-na te, które faktycznie u siebie używasz - domyślnie w pliku jest to
-`/home/TWOJ_UZYTKOWNIK/ikea_okazje.py`, czyli skrypt bezpośrednio w
-katalogu domowym; jeśli masz repo sklonowane gdzie indziej, popraw tę
-ścieżkę tak samo, jak w przykładach crona/ręcznego uruchomienia wyżej):
+Instalacja (w pliku usługi podmień `TWOJ_UZYTKOWNIK` na swojego
+użytkownika; jeśli repo jest sklonowane gdzie indziej niż
+`/home/TWOJ_UZYTKOWNIK/ikeaokazje`, popraw też ścieżki w `ExecStart=`):
 
 ```
 sudo cp ikea-okazje.service /etc/systemd/system/
@@ -180,7 +177,10 @@ journalctl -u ikea-okazje -f
 blokady co cron. `-E 75` daje dedykowany kod wyjścia dla "blokada zajęta",
 a `RestartPreventExitStatus=75` mówi systemd, żeby w tym przypadku NIE
 restartował usługi (to zamierzony, "cudzy" cykl, nie awaria). Prawdziwe
-błędy skryptu (kody 1-3) są restartowane normalnie.
+błędy skryptu (kody 1-3) są restartowane normalnie. Usługa ma też
+podstawowe utwardzenie (`NoNewPrivileges=true`, `PrivateTmp=true`,
+`ProtectSystem=full`), które nie przeszkadza skryptowi: zapisuje on
+pliki tylko w katalogu domowym, a poza tym potrzebuje dostępu do sieci.
 
 `systemctl stop`/`restart` wysyła `SIGTERM` - daemon kończy bieżący cykl,
 loguje podsumowanie i wychodzi czysto (bez naruszania plików stanu).
