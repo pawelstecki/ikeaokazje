@@ -564,6 +564,9 @@ BASE_SEARCH_ARTICLE_NUMBERS: list = []
 MIN_DISCOUNT_PERCENT = None
 MAX_PRICE = None
 KEYWORDS_EXCLUDE: list = []
+# True: slowa kluczowe tylko jako cale slowa/frazy (KEYWORDS_EXCLUDE nadal
+# jako fragment tekstu).
+MATCH_WHOLE_WORDS = False
 
 ALERT_EXISTING_ON_FIRST_RUN = False
 
@@ -598,6 +601,8 @@ SEARCH_TERMS: list = []
 SEARCH_ARTICLE_NUMBERS: list = []
 STORE_IDS: list = []
 NORMALIZED_TERMS: list = []
+# Skompilowane wzorce NORMALIZED_TERMS dla MATCH_WHOLE_WORDS.
+WHOLE_WORD_TERM_PATTERNS: list = []
 NORMALIZED_EXCLUDE: list = []
 # ----------------------------------------------------------------------------------------
 
@@ -808,10 +813,21 @@ def save_dynamic_state(state: dict) -> None:
     os.replace(tmp_path, DYNAMIC_STATE_FILE)
 
 
+def compile_whole_word_patterns(normalized_terms) -> list:
+    """Wzorce 'calego slowa/frazy': tuz przed i tuz za dopasowaniem nie moze
+    byc litery ani cyfry ([^\\W_] to znak slowa bez '_'). Wnetrze frazy
+    wielowyrazowej porownywane doslownie."""
+    return [
+        re.compile(r"(?<![^\W_])" + re.escape(term) + r"(?![^\W_])")
+        for term in normalized_terms
+    ]
+
+
 def refresh_normalized_terms() -> None:
     """Wywolaj po kazdej zmianie SEARCH_TERMS przez komende Telegrama."""
-    global NORMALIZED_TERMS
+    global NORMALIZED_TERMS, WHOLE_WORD_TERM_PATTERNS
     NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+    WHOLE_WORD_TERM_PATTERNS = compile_whole_word_patterns(NORMALIZED_TERMS)
 
 
 def initialize_runtime() -> None:
@@ -821,7 +837,7 @@ def initialize_runtime() -> None:
     wlasnym HOME. Kazde wywolanie buduje globale od zera (bez doklejania)."""
     global ENV
     global BASE_STORE_IDS, BASE_SEARCH_TERMS, BASE_SEARCH_ARTICLE_NUMBERS
-    global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
+    global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE, MATCH_WHOLE_WORDS
     global ALERT_EXISTING_ON_FIRST_RUN, SMTP_MODE, VERIFY_TLS
     global RUN_MODE, CHECK_INTERVAL_SECONDS, TELEGRAM_POLL_INTERVAL_SECONDS
     global TELEGRAM_LONG_POLL_SECONDS, HEALTH_ALERT_AFTER_CYCLES, CHECK_HOURS
@@ -830,7 +846,7 @@ def initialize_runtime() -> None:
     global EMAIL_ENABLED, EMAIL_TO
     global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED
     global DYNAMIC_STATE, SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS, STORE_IDS
-    global NORMALIZED_TERMS, NORMALIZED_EXCLUDE
+    global NORMALIZED_TERMS, WHOLE_WORD_TERM_PATTERNS, NORMALIZED_EXCLUDE
 
     ENV = load_env_file(CONFIG_FILE)
 
@@ -846,6 +862,7 @@ def initialize_runtime() -> None:
     )
     MAX_PRICE = parse_optional_non_negative_number(ENV.get("MAX_PRICE"), "MAX_PRICE")
     KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
+    MATCH_WHOLE_WORDS = parse_bool(ENV.get("MATCH_WHOLE_WORDS"), False)
 
     ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
 
@@ -932,6 +949,7 @@ def initialize_runtime() -> None:
     SEARCH_ARTICLE_NUMBERS = DYNAMIC_STATE["search_article_numbers"]
     STORE_IDS = DYNAMIC_STATE["store_ids"]
     NORMALIZED_TERMS = [normalize_text(t) for t in SEARCH_TERMS]
+    WHOLE_WORD_TERM_PATTERNS = compile_whole_word_patterns(NORMALIZED_TERMS)
     NORMALIZED_EXCLUDE = [normalize_text(t) for t in KEYWORDS_EXCLUDE]
 
 
@@ -1160,7 +1178,10 @@ def fetch_all_offers() -> tuple:
 
 def product_matches(product: dict) -> bool:
     haystack = normalize_text(f"{product.get('title', '')} {product.get('description', '')}")
-    text_match = any(term in haystack for term in NORMALIZED_TERMS)
+    if MATCH_WHOLE_WORDS:
+        text_match = any(pattern.search(haystack) for pattern in WHOLE_WORD_TERM_PATTERNS)
+    else:
+        text_match = any(term in haystack for term in NORMALIZED_TERMS)
 
     raw_article_numbers = product.get("articleNumbers") or []
     normalized_article_numbers = {normalize_article_number(an) for an in raw_article_numbers}
@@ -2396,6 +2417,10 @@ def format_status_message() -> str:
         lines.append("(brak - monitoring nie pobierze zadnych ofert)")
     lines.append("")
     lines.append(f"Slowa kluczowe: {escape_html(', '.join(SEARCH_TERMS)) or '(brak)'}")
+    lines.append(
+        "Dopasowanie slow: "
+        + ("cale slowa (MATCH_WHOLE_WORDS)" if MATCH_WHOLE_WORDS else "fragment tekstu")
+    )
     lines.append(f"Numery artykulu: {escape_html(', '.join(SEARCH_ARTICLE_NUMBERS)) or '(brak)'}")
     if KEYWORDS_EXCLUDE:
         lines.append(f"Czarna lista: {escape_html(', '.join(KEYWORDS_EXCLUDE))}")

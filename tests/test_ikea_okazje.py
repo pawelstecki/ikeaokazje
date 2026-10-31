@@ -7127,5 +7127,136 @@ class TestCheckHoursStatus(unittest.TestCase):
             )
 
 
+class TestMatchWholeWords(unittest.TestCase):
+    """MATCH_WHOLE_WORDS: slowa kluczowe jako cale slowa/frazy; wykluczenia
+    i numery artykulow bez zmian."""
+
+    def setUp(self):
+        self._orig_terms = list(ik.SEARCH_TERMS)
+        self._orig_numbers = list(ik.SEARCH_ARTICLE_NUMBERS)
+        for patcher in (
+            mock.patch.object(ik, "MATCH_WHOLE_WORDS", True),
+            mock.patch.object(ik, "NORMALIZED_EXCLUDE", []),
+            mock.patch.object(ik, "MIN_DISCOUNT_PERCENT", None),
+            mock.patch.object(ik, "MAX_PRICE", None),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        ik.SEARCH_ARTICLE_NUMBERS = []
+
+    def tearDown(self):
+        ik.SEARCH_TERMS = self._orig_terms
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = self._orig_numbers
+
+    def _terms(self, *terms):
+        ik.SEARCH_TERMS = list(terms)
+        ik.refresh_normalized_terms()
+
+    @staticmethod
+    def _product(title, description="", article_numbers=None):
+        return {"title": title, "description": description,
+                "articleNumbers": article_numbers or []}
+
+    def _matches(self, title, description=""):
+        return ik.product_matches(self._product(title, description))
+
+    def test_hemnes_example(self):
+        self._terms("hem")
+        self.assertFalse(self._matches("HEMNES", "komoda z 3 szufladami"))
+        self.assertTrue(self._matches("HEM", "komoda"))
+        self.assertTrue(self._matches("Komoda", "seria hem, biala"))
+        with mock.patch.object(ik, "MATCH_WHOLE_WORDS", False):
+            self.assertTrue(self._matches("HEMNES", "komoda z 3 szufladami"))
+
+    def test_boundaries_are_letters_and_digits(self):
+        self._terms("hem")
+        for title, expected in (("hem", True), ("(hem)", True), ("hem-2", True),
+                                ("hem_x", True), ("hem.", True), ("hem2", False),
+                                ("2hem", False), ("ahem", False), ("hemy", False),
+                                ("hemś", False), ("ąhem", False)):
+            with self.subTest(title=title):
+                self.assertEqual(self._matches(title), expected)
+
+    def test_diacritics_normalized_like_substring_mode(self):
+        self._terms("Łóżko")
+        self.assertTrue(self._matches("LOZKO MALM", "rama"))
+        self.assertTrue(self._matches("Rama łóżka", "do łóżko"))
+        self.assertFalse(self._matches("ŁÓŻKOWY", ""))
+
+    def test_multi_word_phrase(self):
+        self._terms("szafka nocna")
+        self.assertTrue(self._matches("Szafka nocna, biala"))
+        self.assertTrue(self._matches("MALM", "szafka nocna"))
+        self.assertFalse(self._matches("Szafka nocnas"))
+        self.assertFalse(self._matches("Xszafka nocna"))
+        self.assertFalse(self._matches("Szafka  nocna"))
+        # Tytul i opis sa laczone spacja - jak w trybie bez flagi.
+        self.assertTrue(self._matches("Szafka", "nocna"))
+
+    def test_any_of_several_terms(self):
+        self._terms("stol", "hem")
+        self.assertTrue(self._matches("HEMNES stol"))
+        self.assertFalse(self._matches("HEMNES stolik"))
+
+    def test_regex_special_characters_are_literal(self):
+        self._terms("a+b", "c.d")
+        self.assertTrue(self._matches("zestaw a+b"))
+        self.assertFalse(self._matches("zestaw aab"))
+        self.assertFalse(self._matches("zestaw cxd"))
+        self.assertTrue(self._matches("c.d"))
+
+    def test_article_numbers_unchanged(self):
+        self._terms("hem")
+        ik.SEARCH_ARTICLE_NUMBERS = ["90557419"]
+        self.assertTrue(ik.product_matches(self._product("HEMNES", "", ["905.574.19"])))
+
+    def test_exclusions_stay_substring_based(self):
+        self._terms("stol")
+        product = {
+            "title": "Stol", "description": "frontowy blat", "originalPrice": 200,
+            "articleNumbers": [], "currency": "PLN", "storeId": "294",
+            "offers": [{"offerUuid": "u1", "offerNumber": "1", "price": 100}],
+        }
+        self.assertEqual(len(ik.flatten_matching_offers([product])), 1)
+        with mock.patch.object(ik, "NORMALIZED_EXCLUDE", ["front"]):
+            self.assertTrue(ik.product_excluded(product))
+            self.assertEqual(ik.flatten_matching_offers([product]), [])
+
+    def test_patterns_recompiled_after_telegram_commands(self):
+        self._terms("stol")
+        with mock.patch.object(ik, "save_dynamic_state"):
+            ik.handle_command("/dodaj", "hem")
+            self.assertTrue(self._matches("HEM komoda"))
+            self.assertFalse(self._matches("HEMNES"))
+            ik.handle_command("/usun", "hem")
+        self.assertFalse(self._matches("HEM komoda"))
+        self.assertEqual(len(ik.WHOLE_WORD_TERM_PATTERNS), len(ik.NORMALIZED_TERMS))
+
+    def test_status_shows_mode(self):
+        self.assertIn("Dopasowanie slow: cale slowa (MATCH_WHOLE_WORDS)", ik.format_status_message())
+        with mock.patch.object(ik, "MATCH_WHOLE_WORDS", False):
+            self.assertIn("Dopasowanie slow: fragment tekstu", ik.format_status_message())
+
+    def test_startup_parsing_and_precompiled_patterns(self):
+        base = "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\nSEARCH_TERMS=hem\n"
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n"
+            "assert ik.MATCH_WHOLE_WORDS is False\n"
+            "assert ik.product_matches({'title': 'HEMNES', 'description': ''})\n"
+            "with open(ik.CONFIG_FILE, 'a', encoding='utf-8') as f:\n"
+            "    f.write('MATCH_WHOLE_WORDS=true\\n')\n"
+            "ik.initialize_runtime()\n"
+            "assert ik.MATCH_WHOLE_WORDS is True\n"
+            "assert len(ik.WHOLE_WORD_TERM_PATTERNS) == 1\n"
+            "assert not ik.product_matches({'title': 'HEMNES', 'description': ''})\n"
+            "assert ik.product_matches({'title': 'HEM', 'description': 'komoda'})\n"
+            "print('OK')\n",
+            _make_isolated_home(base),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

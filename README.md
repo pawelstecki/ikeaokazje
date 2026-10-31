@@ -49,6 +49,7 @@ Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
 | `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
 | `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
+| `MATCH_WHOLE_WORDS` | `true` - słowa kluczowe pasują tylko jako całe słowa/frazy (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
 | `CHECK_HOURS` | w jakich godzinach sprawdzać oferty, format `H-H` (np. `8-22`, `22-6`, `0-24`), czas lokalny serwera (patrz "Okno godzinowe") | bez ograniczeń |
@@ -222,6 +223,18 @@ kolidować z cronem/systemd. Użyj tej samej blokady:
 Pierwsze uruchomienie nie wysyła powiadomienia - zapisuje aktualny stan
 jako "już znany". Ustaw `ALERT_EXISTING_ON_FIRST_RUN=true`, jeśli chcesz
 alert od razu.
+
+Słowa kluczowe są szukane w nazwie i opisie produktu bez względu na
+wielkość liter i polskie znaki (`łóżko` = `LOZKO`). Domyślnie wystarczy
+fragment tekstu: `hem` pasuje też do `HEMNES`. Z
+`MATCH_WHOLE_WORDS=true` słowo musi stać osobno - tuż przed nim i tuż za
+nim nie może być litery ani cyfry: `hem` pasuje wtedy do „HEM komoda”
+albo „seria hem, biała”, ale nie do „HEMNES”. Słowa kluczowe z kilku
+wyrazów (np. `szafka nocna`) są szukane jako cała fraza, z granicami
+tylko na jej początku i końcu. Ustawienie dotyczy wyłącznie słów
+kluczowych: `KEYWORDS_EXCLUDE` dalej działa na fragmentach (np. `front`
+wyklucza też „frontowy”), a numery artykułów porównywane są jak dotąd.
+`/status` pokazuje aktywny tryb.
 
 Każde powiadomienie o ofercie zawiera cenę, rabat, stan produktu, numer
 artykułu, numer oferty i link do rezerwacji (jeśli oferta ma numer
