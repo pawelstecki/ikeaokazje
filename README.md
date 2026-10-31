@@ -54,20 +54,24 @@ Pola `.env` (pełny opis i przykłady w `.env.example`):
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
 | `STORE_URL_SLUGS` | nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji, format `ID:slug,ID:slug` (patrz niżej) | brak |
 | `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
-| `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
+| `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 (np. `299.99` albo `299,99`; `MIN_DISCOUNT_PERCENT` może mieć `%`, np. `30%`) | brak |
 | `MATCH_WHOLE_WORDS` | `true` - słowa kluczowe pasują tylko jako całe słowa/frazy (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `ALERT_EXISTING_ON_FIRST_RUN` | `true` - pierwsze uruchomienie wysyła alert o ofertach już widocznych (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
+| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu, `0` oznacza wartość domyślną) | `2700` (45 min) |
 | `CHECK_HOURS` | w jakich godzinach sprawdzać oferty, format `H-H` (np. `8-22`, `22-6`, `0-24`), czas lokalny serwera (patrz "Okno godzinowe") | bez ograniczeń |
 | `TELEGRAM_LONG_POLL_SECONDS` | tylko `daemon` - ile sekund jedno zapytanie do Telegrama czeka na nowe komendy (long polling); liczba całkowita `0`-`50`, `0` wyłącza long polling | `25` |
-| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy przy `TELEGRAM_LONG_POLL_SECONDS=0`; przy long pollingu to przerwa po błędzie Telegrama | `15` |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy przy `TELEGRAM_LONG_POLL_SECONDS=0`; przy long pollingu to przerwa po błędzie Telegrama; `0` oznacza wartość domyślną | `15` |
 | `HEALTH_ALERT_AFTER_CYCLES` | po ilu kolejnych nieudanych cyklach wysłać alert o awarii monitora; `0` wyłącza alert (patrz "Alert o awarii monitora") | `3` |
 
 Nieprawidłowa wartość pola liczbowego, `RUN_MODE` albo `CHECK_HOURS`
-(literówka, tekst zamiast liczby, liczba ujemna, zero dla interwałów)
-kończy start skryptu błędem z nazwą pola i ścieżką pliku, zamiast cicho
-wyłączyć filtr albo wrócić do wartości domyślnej.
+(literówka, tekst zamiast liczby, liczba ujemna) kończy start skryptu
+błędem z nazwą pola i ścieżką pliku (kod wyjścia 78), zamiast cicho
+wyłączyć filtr albo wrócić do wartości domyślnej. Liczby można pisać
+z przecinkiem dziesiętnym (`299,99`), a `MIN_DISCOUNT_PERCENT` także ze
+znakiem `%` (`30%`). `0` w `CHECK_INTERVAL_SECONDS`
+i `TELEGRAM_POLL_INTERVAL_SECONDS` oznacza wartość domyślną (z ostrzeżeniem
+w logu), jak w starszych wersjach.
 
 Format pliku: `KLUCZ=wartość`, opcjonalnie z przedrostkiem `export `.
 Komentarz w linii zaczyna się od `#` poprzedzonego spacją
@@ -75,6 +79,9 @@ Komentarz w linii zaczyna się od `#` poprzedzonego spacją
 Wartość zawierającą ` #` albo spacje na początku/końcu (np. hasło) wpisz
 w cudzysłowie (`SMTP_PASS='ab #cd'`) - treść w cudzysłowie jest brana
 dosłownie, a niezamknięty cudzysłów kończy start błędem z numerem linii.
+Gdy komentarz zostanie ucięty z wartości bez cudzysłowu w `SMTP_PASS`,
+`SMTP_USER` albo `TELEGRAM_BOT_TOKEN`, skrypt ostrzega w logu (nazwa pola
+i numer linii, bez wartości).
 
 Wymagany jest **przynajmniej jeden w pełni skonfigurowany kanał
 powiadomień** - e-mail albo Telegram, może być tylko jeden z nich. Brak
@@ -187,9 +194,12 @@ journalctl -u ikea-okazje -f
 
 `ikea-okazje.service` używa `flock -n -E 75 ...` z tym samym plikiem
 blokady co cron. `-E 75` daje dedykowany kod wyjścia dla "blokada zajęta",
-a `RestartPreventExitStatus=75` mówi systemd, żeby w tym przypadku NIE
-restartował usługi (to zamierzony, "cudzy" cykl, nie awaria). Prawdziwe
-błędy skryptu (kody 1-3) są restartowane normalnie. Usługa ma też
+a `RestartPreventExitStatus=75 78` mówi systemd, żeby w tym przypadku NIE
+restartował usługi (to zamierzony, "cudzy" cykl, nie awaria). Kod 78 to
+błąd konfiguracji (np. literówka w `.env`): usługa kończy się w stanie
+`failed` zamiast restartu co 15 s - popraw `.env` i uruchom
+`sudo systemctl restart ikea-okazje`. Prawdziwe błędy skryptu (kody 1-3)
+są restartowane normalnie. Usługa ma też
 podstawowe utwardzenie (`NoNewPrivileges=true`, `PrivateTmp=true`,
 `ProtectSystem=full`), które nie przeszkadza skryptowi: zapisuje on
 pliki tylko w katalogu domowym, a poza tym potrzebuje dostępu do sieci.
@@ -448,6 +458,12 @@ pierwszym uruchomieniu, chyba że `ALERT_EXISTING_ON_FIRST_RUN=true`).
 
 **`osiagnieto limit MAX_PAGES`.** Sklep ma więcej stron ofert niż limit
 `MAX_PAGES` w kodzie - wyniki z dalszych stron są pomijane.
+
+**`Blad konfiguracji` (kod wyjścia 78).** Skrypt nie wystartował przez
+błąd w `~/.config/ikea-okazje.env` - komunikat podaje pole albo numer
+linii. W cronie widać go w logu albo mailu z crona, pod systemd
+w `journalctl -u ikea-okazje` (usługa jest wtedy w stanie `failed`). Po
+poprawce uruchom `sudo systemctl restart ikea-okazje`.
 
 **Usługa systemd wychodzi natychmiast ze statusem 0.** Sprawdź
 `RUN_MODE=daemon` w `~/.config/ikea-okazje.env` - patrz "systemd

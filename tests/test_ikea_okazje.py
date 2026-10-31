@@ -97,6 +97,21 @@ def _run_module_with_env(env_file_contents: str) -> subprocess.CompletedProcess:
     )
 
 
+def _run_script(home_dir: str) -> subprocess.CompletedProcess:
+    """Odpala ikea_okazje.py jak cron/systemd (sys.exit(main())), z podanym HOME."""
+    env = dict(os.environ)
+    env["HOME"] = home_dir
+    env.pop("INVOCATION_ID", None)
+    return subprocess.run(  # nosec - subprocess used only for isolated startup tests
+        [sys.executable, os.path.join(_REPO_ROOT, "ikea_okazje.py")],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _load_seen() -> set:
     """Zbior UUID z klucza 'seen' w STATE_FILE."""
     return ik.load_seen_state()["seen"]
@@ -216,7 +231,7 @@ class TestExplicitInitialization(unittest.TestCase):
             "import ikea_okazje as ik; ik.initialize_runtime()", home_dir
         )
         self.assertNotEqual(result_with_init.returncode, 0)
-        self.assertIn("RuntimeError", result_with_init.stderr)
+        self.assertIn("ConfigError", result_with_init.stderr)
         self.assertIn("Telegram", result_with_init.stderr)
 
 
@@ -405,6 +420,29 @@ class TestMainLifecycle(unittest.TestCase):
             ik.main()
 
         self.assertEqual(calls, ["init", "telegram"])
+
+    def test_main_returns_78_on_config_error_without_running_anything(self):
+        error = ik.ConfigError("Nieprawidlowe RUN_MODE w ~/.config/ikea-okazje.env: 'systemd'.")
+        with mock.patch.object(ik, "initialize_runtime", side_effect=error), \
+             mock.patch.object(ik, "handle_telegram_updates") as telegram, \
+             mock.patch.object(ik, "run_ikea_check_cycle") as cycle, \
+             mock.patch.object(ik, "run_daemon") as daemon, \
+             mock.patch.object(ik, "log") as mock_log:
+            result = ik.main()
+        self.assertEqual(result, ik.EXIT_CONFIG_ERROR)
+        telegram.assert_not_called()
+        cycle.assert_not_called()
+        daemon.assert_not_called()
+        messages = " ".join(call.args[0] for call in mock_log.call_args_list)
+        self.assertIn("Blad konfiguracji", messages)
+        self.assertIn("RUN_MODE", messages)
+        self.assertTrue(all(call.kwargs.get("to_stderr") for call in mock_log.call_args_list))
+
+    def test_main_does_not_swallow_other_runtime_errors(self):
+        with mock.patch.object(ik, "initialize_runtime", side_effect=RuntimeError("inny blad")):
+            with self.assertRaises(RuntimeError) as ctx:
+                ik.main()
+        self.assertNotIsInstance(ctx.exception, ik.ConfigError)
 
 
 class TestCronRespectsPersistedBackoff(unittest.TestCase):
@@ -908,7 +946,7 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
             "STORE_IDS=294\n"
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("ConfigError", result.stderr)
         self.assertIn("e-mail", result.stderr)
         self.assertIn("Telegram", result.stderr)
 
@@ -920,7 +958,7 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
             "STORE_IDS=294\n"
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("ConfigError", result.stderr)
         self.assertIn("TELEGRAM_CHAT_ID", result.stderr)
 
     def test_gmail_mode_without_smtp_fields_fails_at_startup(self):
@@ -929,7 +967,7 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
             "STORE_IDS=294\n"
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("ConfigError", result.stderr)
         self.assertIn("SMTP_USER", result.stderr)
         self.assertIn("SMTP_PASS", result.stderr)
 
@@ -939,7 +977,7 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
             "STORE_IDS=294\n"
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("ConfigError", result.stderr)
         self.assertIn("EMAIL_TO", result.stderr)
 
     def test_exim_mode_with_email_to_succeeds(self):
@@ -1053,21 +1091,75 @@ class TestEnvFileParser(unittest.TestCase):
         self.assertEqual(values, {"A": "x=y", "B": "k=v"})
 
     def test_permission_check_still_enforced(self):
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(ik.ConfigError) as ctx:
             self._load("A=1\n", mode=0o644)
         self.assertIn("chmod 600", str(ctx.exception))
+
+    def test_parse_errors_are_config_errors(self):
+        for contents in ("A='x\n", "A='x'y\n"):
+            with self.subTest(contents=contents):
+                with self.assertRaises(ik.ConfigError):
+                    self._load(contents)
+
+    def test_inline_comment_stripped_from_secret_warns_without_value(self):
+        with mock.patch.object(ik, "log") as mock_log:
+            values = self._load(
+                "A=1\n"
+                "SMTP_PASS=tajne1 #tajne2\n"
+                "export TELEGRAM_BOT_TOKEN=123:tokenA\t# tokenB\n"
+                "SMTP_USER=login@example.com # konto\n"
+            )
+        self.assertEqual(values["SMTP_PASS"], "tajne1")
+        self.assertEqual(values["TELEGRAM_BOT_TOKEN"], "123:tokenA")
+        self.assertEqual(mock_log.call_count, 3)
+        for call, (key, line) in zip(
+            mock_log.call_args_list,
+            (("SMTP_PASS", 2), ("TELEGRAM_BOT_TOKEN", 3), ("SMTP_USER", 4)),
+        ):
+            message = call.args[0]
+            self.assertIn(f"klucz {key}", message)
+            self.assertIn(f"linia {line}", message)
+            self.assertIn("cudzyslowie", message)
+            self.assertTrue(call.kwargs.get("to_stderr"))
+            for secret in ("tajne1", "tajne2", "tokenA", "tokenB", "login@example.com", "konto"):
+                self.assertNotIn(secret, message)
+
+    def test_no_inline_comment_warning_for_quoted_secrets_or_other_keys(self):
+        with mock.patch.object(ik, "log") as mock_log:
+            self._load(
+                "SMTP_PASS='ab #cd' # komentarz\n"
+                "TELEGRAM_BOT_TOKEN=123:abc#def\n"
+                "MAX_PRICE=300 # zl\n"
+                "SMTP_HOST=localhost # serwer\n"
+            )
+        mock_log.assert_not_called()
 
 
 class TestConfigValueValidation(unittest.TestCase):
     """parse_run_mode() i parsery liczbowe - czyste funkcje, w procesie."""
 
-    def _assert_config_error(self, func, *args, key):
-        with self.assertRaises(RuntimeError) as ctx:
-            func(*args)
+    def _assert_config_error(self, func, *args, key, **kwargs):
+        with self.assertRaises(ik.ConfigError) as ctx:
+            func(*args, **kwargs)
         message = str(ctx.exception)
         self.assertIn(key, message)
         self.assertIn(ik.CONFIG_FILE, message)
         return message
+
+    def test_config_error_is_runtime_error(self):
+        self.assertTrue(issubclass(ik.ConfigError, RuntimeError))
+        self.assertEqual(ik.EXIT_CONFIG_ERROR, 78)
+
+    def test_other_validators_raise_config_error(self):
+        for func, args in (
+            (ik.parse_smtp_mode, ("smtp",)),
+            (ik.parse_check_hours, ("8-8",)),
+            (ik.parse_non_negative_int, ("-1", "HEALTH_ALERT_AFTER_CYCLES", 3)),
+            (ik.validate_notification_config, ("disabled", None, None, False, None, None, None)),
+        ):
+            with self.subTest(func=func.__name__):
+                with self.assertRaises(ik.ConfigError):
+                    func(*args)
 
     def test_run_mode_valid_values(self):
         self.assertEqual(ik.parse_run_mode("cron"), "cron")
@@ -1102,21 +1194,48 @@ class TestConfigValueValidation(unittest.TestCase):
         self.assertTrue(mock_log.call_args.kwargs.get("to_stderr"))
 
     def test_check_interval_invalid_values_raise(self):
-        for raw in ("abc", "0", "-5", "inf", "nan", "15m"):
+        for raw in ("abc", "-5", "-0.5", "inf", "nan", "15m", "300%"):
             with self.subTest(raw=raw):
                 self._assert_config_error(
                     ik.parse_check_interval_seconds, raw, key="CHECK_INTERVAL_SECONDS"
                 )
 
+    def test_check_interval_zero_uses_default_with_warning(self):
+        # Zgodnosc ze starszymi wersjami: tam 0 dawalo wartosc domyslna.
+        for raw in ("0", "0.0", " 0 "):
+            with self.subTest(raw=raw):
+                with mock.patch.object(ik, "log") as mock_log:
+                    value = ik.parse_check_interval_seconds(raw)
+                self.assertEqual(value, ik.DEFAULT_CHECK_INTERVAL_SECONDS)
+                mock_log.assert_called_once()
+                self.assertIn("CHECK_INTERVAL_SECONDS=0", mock_log.call_args.args[0])
+                self.assertTrue(mock_log.call_args.kwargs.get("to_stderr"))
+
+    def test_check_interval_decimal_comma(self):
+        self.assertEqual(ik.parse_check_interval_seconds("450,5"), 450.5)
+
     def test_telegram_poll_interval(self):
         parse = ik.parse_positive_number
         key = "TELEGRAM_POLL_INTERVAL_SECONDS"
-        self.assertEqual(parse(None, key, 15), 15)
-        self.assertEqual(parse("", key, 15), 15)
-        self.assertEqual(parse("5", key, 15), 5)
-        for raw in ("x", "0", "-1"):
+        self.assertEqual(parse(None, key, 15, zero_means_default=True), 15)
+        self.assertEqual(parse("", key, 15, zero_means_default=True), 15)
+        self.assertEqual(parse("5", key, 15, zero_means_default=True), 5)
+        self.assertEqual(parse("2,5", key, 15, zero_means_default=True), 2.5)
+        for raw in ("x", "-1"):
             with self.subTest(raw=raw):
-                self._assert_config_error(parse, raw, key, 15, key=key)
+                self._assert_config_error(parse, raw, key, 15, key=key, zero_means_default=True)
+
+    def test_telegram_poll_interval_zero_uses_default_with_warning(self):
+        key = "TELEGRAM_POLL_INTERVAL_SECONDS"
+        with mock.patch.object(ik, "log") as mock_log:
+            value = ik.parse_positive_number("0", key, 15, zero_means_default=True)
+        self.assertEqual(value, 15)
+        mock_log.assert_called_once()
+        self.assertIn(key, mock_log.call_args.args[0])
+        self.assertTrue(mock_log.call_args.kwargs.get("to_stderr"))
+
+    def test_positive_number_zero_raises_without_compat_flag(self):
+        self._assert_config_error(ik.parse_positive_number, "0", "X_SECONDS", 15, key="X_SECONDS")
 
     def test_optional_filters_missing_means_disabled(self):
         self.assertIsNone(ik.parse_optional_non_negative_number(None, "MAX_PRICE"))
@@ -1128,10 +1247,34 @@ class TestConfigValueValidation(unittest.TestCase):
         self.assertEqual(parse("299.99", "MAX_PRICE"), 299.99)
         self.assertEqual(parse("0", "MAX_PRICE"), 0)
 
+    def test_optional_filters_decimal_comma(self):
+        parse = ik.parse_optional_non_negative_number
+        self.assertEqual(parse("299,99", "MAX_PRICE"), 299.99)
+        self.assertEqual(parse(" 300,00 ", "MAX_PRICE"), 300.0)
+        self.assertEqual(parse("12,5", "MIN_DISCOUNT_PERCENT", allow_percent=True), 12.5)
+
+    def test_min_discount_accepts_trailing_percent(self):
+        parse = ik.parse_optional_non_negative_number
+        key = "MIN_DISCOUNT_PERCENT"
+        self.assertEqual(parse("30%", key, allow_percent=True), 30)
+        self.assertIsInstance(parse("30%", key, allow_percent=True), int)
+        self.assertEqual(parse(" 30 % ", key, allow_percent=True), 30)
+        self.assertEqual(parse("12,5%", key, allow_percent=True), 12.5)
+        for raw in ("%", "30%%", "%30", "-5%"):
+            with self.subTest(raw=raw):
+                self._assert_config_error(parse, raw, key, key=key, allow_percent=True)
+
+    def test_percent_rejected_without_allow_percent(self):
+        self._assert_config_error(
+            ik.parse_optional_non_negative_number, "30%", "MAX_PRICE", key="MAX_PRICE"
+        )
+
     def test_optional_filters_invalid_values_raise(self):
         for key, raw in (
             ("MAX_PRICE", "300zl"),
             ("MAX_PRICE", "-1"),
+            ("MAX_PRICE", "1,299,99"),
+            ("MAX_PRICE", "299,99zl"),
             ("MIN_DISCOUNT_PERCENT", "trzydziesci"),
             ("MIN_DISCOUNT_PERCENT", "-5"),
         ):
@@ -1157,7 +1300,7 @@ class TestConfigValidationAtStartup(unittest.TestCase):
     def test_invalid_run_mode_fails_at_startup(self):
         result = _run_module_with_env(self.BASE_ENV + "RUN_MODE=deamon\n")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("ConfigError", result.stderr)
         self.assertIn("RUN_MODE", result.stderr)
         self.assertIn("ikea-okazje.env", result.stderr)
 
@@ -1180,9 +1323,50 @@ class TestConfigValidationAtStartup(unittest.TestCase):
         self.assertIn("300", result.stderr)
 
     def test_invalid_check_interval_fails_at_startup(self):
-        result = _run_module_with_env(self.BASE_ENV + "CHECK_INTERVAL_SECONDS=0\n")
+        result = _run_module_with_env(self.BASE_ENV + "CHECK_INTERVAL_SECONDS=-5\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("CHECK_INTERVAL_SECONDS", result.stderr)
+
+    def test_upgrade_shaped_env_starts_through_main(self):
+        # Wartosci tolerowane przez starsze wersje: przecinek, '%', zera.
+        home_dir = _make_isolated_home(
+            self.BASE_ENV
+            + "MAX_PRICE=299,99\nMIN_DISCOUNT_PERCENT=30%\n"
+            "CHECK_INTERVAL_SECONDS=0\nTELEGRAM_POLL_INTERVAL_SECONDS=0\n"
+        )
+        result = _run_python_code(
+            "import ikea_okazje as ik\n"
+            "ik.run_check_cycle_now = lambda forced: 0\n"
+            "assert ik.main() == 0\n"
+            "assert ik.MAX_PRICE == 299.99, ik.MAX_PRICE\n"
+            "assert ik.MIN_DISCOUNT_PERCENT == 30, ik.MIN_DISCOUNT_PERCENT\n"
+            "assert ik.CHECK_INTERVAL_SECONDS == ik.DEFAULT_CHECK_INTERVAL_SECONDS\n"
+            "assert ik.TELEGRAM_POLL_INTERVAL_SECONDS == ik.DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS\n"
+            "print('OK')\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+        self.assertIn("CHECK_INTERVAL_SECONDS=0", result.stderr)
+        self.assertIn("TELEGRAM_POLL_INTERVAL_SECONDS=0", result.stderr)
+
+    def test_config_errors_exit_with_code_78_without_traceback(self):
+        cases = {
+            "RUN_MODE": self.BASE_ENV + "RUN_MODE=systemd\n",
+            "CHECK_INTERVAL_SECONDS": self.BASE_ENV + "CHECK_INTERVAL_SECONDS=-60\n",
+            "MAX_PRICE": self.BASE_ENV + "MAX_PRICE=trzysta\n",
+            "linia 3": "SMTP_MODE=gmail\nSMTP_USER=ja@example.com\nSMTP_PASS='tajne-haslo-123\"\n",
+            "SMTP_MODE": "SMTP_MODE=smtp\n",
+        }
+        for expected, env_contents in cases.items():
+            with self.subTest(expected=expected):
+                result = _run_script(_make_isolated_home(env_contents))
+                self.assertEqual(result.returncode, ik.EXIT_CONFIG_ERROR, msg=result.stderr)
+                self.assertIn("Blad konfiguracji", result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertIn("78", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("tajne-haslo-123", result.stderr + result.stdout)
 
     def test_missing_check_interval_after_reinit_uses_default_not_previous_value(self):
         home_dir = _make_isolated_home(self.BASE_ENV + "CHECK_INTERVAL_SECONDS=900\n")
@@ -5039,6 +5223,23 @@ class TestHealthAlert(unittest.TestCase):
             "last_successful_check_at": 1700000000.5,
         }
         self.assertEqual(ik.migrate_health_state(valid), valid)
+
+    def test_overflowing_failed_cycles_is_tolerated(self):
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                migrated = ik.migrate_health_state({"consecutive_failed_cycles": value})
+                self.assertEqual(migrated["consecutive_failed_cycles"], 0)
+
+    def test_dynamic_state_file_with_1e999_loads(self):
+        # json parsuje 1e999 jako inf; int(inf) to OverflowError.
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["health"] = dict(ik.default_health_state(), consecutive_failed_cycles="__X__")
+        with open(ik.DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data).replace('"__X__"', "1e999"))
+
+        reloaded = ik.load_dynamic_state()
+        self.assertEqual(reloaded["health"]["consecutive_failed_cycles"], 0)
 
 
 class TestHealthAlertConfig(unittest.TestCase):

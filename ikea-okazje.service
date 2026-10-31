@@ -12,12 +12,14 @@ WorkingDirectory=/home/TWOJ_UZYTKOWNIK
 Environment=PYTHONUNBUFFERED=1
 # Ten sam plik blokady co w cronie i przy recznym uruchomieniu (README).
 # Gdy blokada jest zajeta, flock -n od razu wychodzi z kodem 75 (-E 75),
-# a RestartPreventExitStatus=75 nie restartuje wtedy uslugi - dziala juz
-# inna kopia. Inne kody bledow sa restartowane (Restart=on-failure).
+# a RestartPreventExitStatus nie restartuje wtedy uslugi - dziala juz
+# inna kopia. Kod 78 to blad konfiguracji (.env): usluga konczy sie jako
+# "failed" zamiast restartu co 15 s - popraw .env i zrob systemctl restart.
+# Inne kody bledow sa restartowane (Restart=on-failure).
 ExecStart=/usr/bin/flock -n -E 75 /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py
 Restart=on-failure
 RestartSec=15
-RestartPreventExitStatus=75
+RestartPreventExitStatus=75 78
 # Zatrzymanie moze potrwac do TELEGRAM_LONG_POLL_SECONDS (przy maksimum
 # 50 s ok. 65 s) - miesci sie w domyslnym TimeoutStopSec=90s.
 

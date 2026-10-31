@@ -263,6 +263,20 @@ def log(message: str, to_stderr: bool = False) -> None:
     print(line, file=sys.stderr if to_stderr else sys.stdout, flush=True)
 
 
+class ConfigError(RuntimeError):
+    """Bledna konfiguracja (.env, jego uprawnienia, zmienne srodowiskowe).
+    main() konczy wtedy proces kodem EXIT_CONFIG_ERROR zamiast tracebacku."""
+
+
+# Kod wyjscia przy bledzie konfiguracji (EX_CONFIG z sysexits.h). Jest w
+# RestartPreventExitStatus uslugi - systemd nie restartuje co 15 s.
+EXIT_CONFIG_ERROR = 78
+
+# Klucze, dla ktorych obciety komentarz w linii daje ostrzezenie: '#' w
+# hasle/tokenie bez cudzyslowu to zwykle pomylka, a nie komentarz.
+INLINE_COMMENT_WARNING_KEYS = ("SMTP_PASS", "SMTP_USER", "TELEGRAM_BOT_TOKEN")
+
+
 def load_env_file(path: str) -> dict:
     values = {}
     if not os.path.isfile(path):
@@ -270,7 +284,7 @@ def load_env_file(path: str) -> dict:
 
     permissions = os.stat(path).st_mode & 0o777
     if permissions & 0o077:
-        raise RuntimeError(
+        raise ConfigError(
             f"Zbyt szerokie uprawnienia pliku {path}: {oct(permissions)}. Ustaw chmod 600."
         )
 
@@ -296,12 +310,12 @@ def _parse_env_value(raw_value: str, path: str, line_number: int, key: str) -> s
         quote = value[0]
         end = value.find(quote, 1)
         if end == -1:
-            raise RuntimeError(
+            raise ConfigError(
                 f"Niezamkniety cudzyslow w {path}, linia {line_number} (klucz {key})."
             )
         rest = value[end + 1:].strip()
         if rest and not rest.startswith("#"):
-            raise RuntimeError(
+            raise ConfigError(
                 f"Nieoczekiwane znaki po cudzyslowie zamykajacym w {path}, "
                 f"linia {line_number} (klucz {key}). Dozwolony jest tylko "
                 "komentarz zaczynajacy sie od '#'."
@@ -309,6 +323,14 @@ def _parse_env_value(raw_value: str, path: str, line_number: int, key: str) -> s
         return value[1:end]
     comment = re.search(r"\s#", raw_value)
     if comment:
+        if key in INLINE_COMMENT_WARNING_KEYS:
+            log(
+                f"UWAGA: {path}, linia {line_number} (klucz {key}): wartosc bez "
+                "cudzyslowu zawiera ' #' - reszta linii od '#' zostala pominieta "
+                "jako komentarz. Jesli '#' jest czescia wartosci, wpisz ja "
+                f"w cudzyslowie, np. {key}='...'.",
+                to_stderr=True,
+            )
         return raw_value[:comment.start()].strip()
     return value
 
@@ -319,48 +341,62 @@ def parse_list(raw, default):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _parse_config_number(raw, key: str):
+def _parse_config_number(raw, key: str, allow_percent: bool = False):
     """Liczba z .env (int, a gdy sie nie da - float) albo None dla pustej
-    wartosci. Tekst, ktory nie jest skonczona liczba, konczy start
-    RuntimeError, zamiast cicho wylaczyc filtr albo wlaczyc default."""
+    wartosci. Przecinek dziesietny (299,99) jest akceptowany, z
+    allow_percent takze koncowe '%'. Tekst, ktory nie jest skonczona
+    liczba, konczy start ConfigError, zamiast cicho wylaczyc filtr."""
     if raw is None or raw.strip() == "":
         return None
     text = raw.strip()
+    number_text = text
+    if allow_percent and number_text.endswith("%"):
+        number_text = number_text[:-1].rstrip()
+    # Po polsku liczby pisze sie z przecinkiem dziesietnym (299,99).
+    number_text = number_text.replace(",", ".")
     try:
-        return int(text)
+        return int(number_text)
     except ValueError:
         pass
     try:
-        value = float(text)
+        value = float(number_text)
     except ValueError:
         value = None
     if value is None or not math.isfinite(value):
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' nie jest liczba."
         )
     return value
 
 
-def parse_optional_non_negative_number(raw, key: str):
+def parse_optional_non_negative_number(raw, key: str, allow_percent: bool = False):
     """Filtr liczbowy (MIN_DISCOUNT_PERCENT, MAX_PRICE): pusty -> None
-    (wylaczony), ujemny lub nie-liczba -> RuntimeError."""
-    value = _parse_config_number(raw, key)
+    (wylaczony), ujemny lub nie-liczba -> ConfigError."""
+    value = _parse_config_number(raw, key, allow_percent=allow_percent)
     if value is not None and value < 0:
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe {key} w {CONFIG_FILE}: '{raw.strip()}' - wartosc "
             "nie moze byc ujemna."
         )
     return value
 
 
-def parse_positive_number(raw, key: str, default):
-    """Dodatnia liczba z .env; pusty -> default, <= 0 lub nie-liczba ->
-    RuntimeError."""
+def parse_positive_number(raw, key: str, default, zero_means_default: bool = False):
+    """Dodatnia liczba z .env; pusty -> default, < 0 lub nie-liczba ->
+    ConfigError. 0 -> ConfigError, a z zero_means_default -> default z
+    ostrzezeniem (tak dzialaly interwaly w starszych wersjach)."""
     value = _parse_config_number(raw, key)
     if value is None:
         return default
+    if value == 0 and zero_means_default:
+        log(
+            f"UWAGA: {key}=0 w {CONFIG_FILE} - uzywam wartosci domyslnej "
+            f"{default}s. Usun wpis albo ustaw liczbe wieksza od zera.",
+            to_stderr=True,
+        )
+        return default
     if value <= 0:
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe {key} w {CONFIG_FILE}: '{raw.strip()}' - wartosc "
             "musi byc wieksza od zera."
         )
@@ -368,10 +404,12 @@ def parse_positive_number(raw, key: str, default):
 
 
 def parse_check_interval_seconds(raw):
-    """CHECK_INTERVAL_SECONDS: pusty -> DEFAULT_CHECK_INTERVAL_SECONDS.
+    """CHECK_INTERVAL_SECONDS: pusty albo 0 -> DEFAULT_CHECK_INTERVAL_SECONDS.
     Wartosc ponizej MIN_CHECK_INTERVAL_SECONDS jest podnoszona z
     ostrzezeniem zamiast bledu, zeby istniejace instalacje dalej startowaly."""
-    value = parse_positive_number(raw, "CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS)
+    value = parse_positive_number(
+        raw, "CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS, zero_means_default=True
+    )
     if value < MIN_CHECK_INTERVAL_SECONDS:
         log(
             f"UWAGA: CHECK_INTERVAL_SECONDS={value} w {CONFIG_FILE} jest ponizej "
@@ -384,7 +422,7 @@ def parse_check_interval_seconds(raw):
 
 def parse_non_negative_int(raw, key: str, default: int, max_value: "int | None" = None) -> int:
     """Liczba calkowita >= 0 (i <= max_value, jesli podane) z .env; pusty ->
-    default, inna wartosc -> RuntimeError."""
+    default, inna wartosc -> ConfigError."""
     if raw is None or raw.strip() == "":
         return default
     text = raw.strip()
@@ -397,7 +435,7 @@ def parse_non_negative_int(raw, key: str, default: int, max_value: "int | None" 
             "liczba calkowita >= 0" if max_value is None
             else f"liczba calkowita od 0 do {max_value}"
         )
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' - oczekiwana {expected}."
         )
     return value
@@ -405,11 +443,11 @@ def parse_non_negative_int(raw, key: str, default: int, max_value: "int | None" 
 
 def parse_run_mode(raw) -> str:
     """Waliduje RUN_MODE (jak parse_smtp_mode()): pusty -> 'cron', literowka
-    konczy start RuntimeError zamiast cicho wlaczyc tryb cron."""
+    konczy start ConfigError zamiast cicho wlaczyc tryb cron."""
     value = ("" if raw is None else raw).strip()
     mode = value.lower() or "cron"
     if mode not in ("cron", "daemon"):
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe RUN_MODE w {CONFIG_FILE}: '{value}'. "
             "Dozwolone wartosci: cron, daemon."
         )
@@ -420,7 +458,7 @@ def parse_check_hours(raw) -> "tuple | None":
     """CHECK_HOURS 'H-H' (godziny 0..24, od pelnej godziny poczatku do
     pelnej godziny konca, bez niej; poczatek > koniec - okno przez polnoc).
     Pusty -> None (bez ograniczen); zly format, zakres albo puste okno ->
-    RuntimeError."""
+    ConfigError."""
     if raw is None or raw.strip() == "":
         return None
     text = raw.strip()
@@ -432,7 +470,7 @@ def parse_check_hours(raw) -> "tuple | None":
         or window[0] == window[1]
         or window == (24, 0)  # od polnocy do polnocy wstecz - okno puste
     ):
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe CHECK_HOURS w {CONFIG_FILE}: '{text}' - oczekiwany "
             "format H-H z pelnymi godzinami od 0 do 24 i roznym poczatkiem i "
             "koncem, np. 8-22 albo 22-6."
@@ -485,12 +523,12 @@ def normalize_article_numbers(values) -> list:
 
 def parse_smtp_mode(raw) -> str:
     """Waliduje SMTP_MODE. Nieznana wartosc (np. literowka) konczy start
-    RuntimeError, zamiast cicho wpasc w ktorys tryb. 'disabled' wylacza
+    ConfigError, zamiast cicho wpasc w ktorys tryb. 'disabled' wylacza
     e-mail."""
     value = ("" if raw is None else raw).strip()
     mode = value.lower()
     if mode not in ("gmail", "local587", "exim", "disabled"):
-        raise RuntimeError(
+        raise ConfigError(
             f"Nieprawidlowe SMTP_MODE: '{value}'. "
             "Dozwolone wartosci: gmail, local587, exim, disabled."
         )
@@ -514,7 +552,7 @@ def validate_notification_config(
     has_chat_id = bool(telegram_chat_id)
 
     if has_token != has_chat_id:
-        raise RuntimeError(
+        raise ConfigError(
             "Niepelna konfiguracja Telegrama: potrzebujesz jednoczesnie "
             "TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID (albo obu, albo zadnego z "
             f"nich). Aktualnie ustawiony jest tylko "
@@ -525,7 +563,7 @@ def validate_notification_config(
 
     if smtp_mode == "disabled":
         if not telegram_enabled:
-            raise RuntimeError(
+            raise ConfigError(
                 "Brak skonfigurowanego kanalu powiadomien: SMTP_MODE='disabled' "
                 "wylacza wysylke e-mail, a Telegram nie jest skonfigurowany "
                 "(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Skonfiguruj albo e-mail "
@@ -544,7 +582,7 @@ def validate_notification_config(
         missing.append("EMAIL_TO")
 
     if missing:
-        raise RuntimeError(
+        raise ConfigError(
             f"SMTP_MODE='{smtp_mode}' wymaga uzupelnienia w {CONFIG_FILE} "
             f"nastepujacych pol: {', '.join(missing)}. Jesli nie chcesz "
             "uzywac e-maila, ustaw SMTP_MODE=disabled i skonfiguruj "
@@ -670,7 +708,8 @@ def migrate_health_state(raw) -> dict:
         return default_health_state()
     try:
         failed_cycles = int(raw.get("consecutive_failed_cycles") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: np. 1e999 z JSON to inf.
         failed_cycles = 0
     last_error = raw.get("last_error")
     if not isinstance(last_error, str):
@@ -858,7 +897,7 @@ def initialize_runtime() -> None:
     )
 
     MIN_DISCOUNT_PERCENT = parse_optional_non_negative_number(
-        ENV.get("MIN_DISCOUNT_PERCENT"), "MIN_DISCOUNT_PERCENT"
+        ENV.get("MIN_DISCOUNT_PERCENT"), "MIN_DISCOUNT_PERCENT", allow_percent=True
     )
     MAX_PRICE = parse_optional_non_negative_number(ENV.get("MAX_PRICE"), "MAX_PRICE")
     KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
@@ -875,6 +914,7 @@ def initialize_runtime() -> None:
         ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS"),
         "TELEGRAM_POLL_INTERVAL_SECONDS",
         DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS,
+        zero_means_default=True,
     )
     TELEGRAM_LONG_POLL_SECONDS = parse_non_negative_int(
         ENV.get("TELEGRAM_LONG_POLL_SECONDS"),
@@ -3358,7 +3398,17 @@ def warn_if_systemd_without_daemon_mode() -> None:
 
 
 def main() -> int:
-    initialize_runtime()
+    try:
+        initialize_runtime()
+    except ConfigError as exc:
+        # Komunikaty ConfigError nie zawieraja hasel ani tokenu.
+        log(f"Blad konfiguracji: {exc}", to_stderr=True)
+        log(
+            f"Popraw konfiguracje ({CONFIG_FILE}) i uruchom skrypt ponownie. "
+            f"Kod wyjscia {EXIT_CONFIG_ERROR} - systemd nie restartuje wtedy uslugi.",
+            to_stderr=True,
+        )
+        return EXIT_CONFIG_ERROR
 
     warn_if_systemd_without_daemon_mode()
 
