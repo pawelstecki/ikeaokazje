@@ -20,8 +20,12 @@ ExecStart=/usr/bin/flock -n -E 75 /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/b
 Restart=on-failure
 RestartSec=15
 RestartPreventExitStatus=75 78
-# Zatrzymanie moze potrwac do TELEGRAM_LONG_POLL_SECONDS (przy maksimum
-# 50 s ok. 65 s) - miesci sie w domyslnym TimeoutStopSec=90s.
+# Po SIGTERM daemon czeka na koniec biezacego zapytania long pollingu (do
+# TELEGRAM_LONG_POLL_SECONDS, przy maksimum ok. 65 s) albo trwajacego
+# sprawdzania IKEA - przy ponowieniach i timeoutach nawet kilka minut.
+# Po TimeoutStopSec systemd zabija proces (SIGKILL); pliki stanu sa
+# zapisywane atomowo, wiec zostaja poprawne.
+TimeoutStopSec=180
 
 # Utwardzenie: skrypt pisze tylko w katalogu domowym uzytkownika i laczy
 # sie z siecia (IKEA, Telegram, SMTP), wiec bez ProtectHome/PrivateNetwork.

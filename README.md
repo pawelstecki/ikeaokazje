@@ -58,7 +58,7 @@ Pola `.env` (pełny opis i przykłady w `.env.example`):
 | `MATCH_WHOLE_WORDS` | `true` - słowa kluczowe pasują tylko jako całe słowa/frazy (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `ALERT_EXISTING_ON_FIRST_RUN` | `true` - pierwsze uruchomienie wysyła alert o ofertach już widocznych (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu, `0` oznacza wartość domyślną) | `2700` (45 min) |
+| `CHECK_INTERVAL_SECONDS` | w `daemon` jak często sprawdzać oferty; w obu trybach także długość backoffu po 403/429 (w `cron` tyle co najmniej trwa przerwa w zapytaniach do IKEA po blokadzie, patrz "Zachowanie przy HTTP 403/429"); minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu, `0` oznacza wartość domyślną) | `2700` (45 min) |
 | `CHECK_HOURS` | w jakich godzinach sprawdzać oferty, format `H-H` (np. `8-22`, `22-6`, `0-24`), czas lokalny serwera (patrz "Okno godzinowe") | bez ograniczeń |
 | `TELEGRAM_LONG_POLL_SECONDS` | tylko `daemon` - ile sekund jedno zapytanie do Telegrama czeka na nowe komendy (long polling); liczba całkowita `0`-`50`, `0` wyłącza long polling | `25` |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy przy `TELEGRAM_LONG_POLL_SECONDS=0`; przy long pollingu to przerwa po błędzie Telegrama; `0` oznacza wartość domyślną | `15` |
@@ -114,6 +114,47 @@ zmiana routingu przez IKEA).
 4. Wejdź na `https://api.telegram.org/bot<TOKEN>/getUpdates` i znajdź
    `"chat":{"id": ...}` - to `TELEGRAM_CHAT_ID`. Puste `result: []`
    znaczy, że jeszcze nie napisałeś do bota.
+
+## Aktualizacja z wcześniejszej wersji
+
+Po `git pull` uruchom skrypt raz ręcznie (patrz "Ręczne uruchomienie")
+i sprawdź, czy startuje bez błędu. Co się zmieniło:
+
+- **Ostrzejsza walidacja `.env`.** Wartości, które starsza wersja cicho
+  ignorowała albo zamieniała na domyślne, kończą start błędem z nazwą pola
+  albo numerem linii i kodem wyjścia 78, np. literówka w `RUN_MODE`
+  (`RUN_MODE=systemd`), niezamknięty albo niepasujący cudzysłów
+  (`SMTP_PASS='abc"`), tekst za cudzysłowem zamykającym
+  (`SMTP_PASS="abc"def`), liczba ujemna (`CHECK_INTERVAL_SECONDS=-60`),
+  tekst zamiast liczby (`MAX_PRICE=300zl`), token Telegrama w złym
+  formacie (np. ze spacją). W cronie błąd widać w logu albo mailu
+  z crona, pod systemd usługa zostaje w stanie `failed`.
+- **Przecinek dziesiętny działa** (`MAX_PRICE=299,99`), podobnie `%`
+  w `MIN_DISCOUNT_PERCENT` (`30%`). `0` w `CHECK_INTERVAL_SECONDS`
+  i `TELEGRAM_POLL_INTERVAL_SECONDS` dalej oznacza wartość domyślną.
+- **Komentarze w linii:** ` #` w wartości bez cudzysłowu zaczyna komentarz
+  (`SMTP_PASS=abc #def` daje `abc`). Wartość z ` #` wpisz w cudzysłowie:
+  `SMTP_PASS='abc #def'`. Wpisy w rodzaju `MAX_PRICE=300 # zł` albo
+  `RUN_MODE=daemon # systemd` zaczynają działać zgodnie z wartością przed
+  `#` (wcześniej filtr był wyłączony, a tryb był `cron`).
+- **`CHECK_INTERVAL_SECONDS` ma minimum 300 s** - mniejsza wartość jest
+  podnoszona do 300 z ostrzeżeniem w logu.
+- **Cron respektuje backoff po 403/429:** po blokadzie odpalenia z crona
+  kończą się bez zapytania do IKEA do zapisanego terminu (co najmniej
+  `CHECK_INTERVAL_SECONDS`).
+- **Nowe ustawienia domyślne:** alert o awarii monitora po 3 nieudanych
+  cyklach (`HEALTH_ALERT_AFTER_CYCLES=3`, `0` wyłącza), long polling
+  Telegrama w trybie `daemon` (`TELEGRAM_LONG_POLL_SECONDS=25`, `0`
+  wyłącza).
+- **Nowy plik stanu** `~/.ikea_okazje_last_matches.json` (dla `/oferty`);
+  istniejące pliki stanu są uzupełniane automatycznie.
+- **Plik usługi systemd:** `ExecStart=` wskazuje teraz
+  `/home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py` (katalog repo),
+  doszły m.in. `RestartPreventExitStatus=75 78` i `TimeoutStopSec=180`.
+  Skopiuj plik ponownie (patrz "systemd"), popraw użytkownika i ścieżki,
+  potem `sudo systemctl daemon-reload` i `sudo systemctl restart ikea-okazje`.
+- **Cron:** przykład używa teraz `*/30` (co 30 minut) zamiast `*/15` -
+  rozważ zmianę swojego wpisu.
 
 ## Uruchamianie: cron albo systemd (nigdy oba naraz)
 
@@ -204,13 +245,21 @@ podstawowe utwardzenie (`NoNewPrivileges=true`, `PrivateTmp=true`,
 `ProtectSystem=full`), które nie przeszkadza skryptowi: zapisuje on
 pliki tylko w katalogu domowym, a poza tym potrzebuje dostępu do sieci.
 
-`systemctl stop`/`restart` wysyła `SIGTERM` - daemon kończy bieżący cykl,
-loguje podsumowanie i wychodzi czysto (bez naruszania plików stanu).
-Jeśli `SIGTERM` trafi w trwające zapytanie long pollingu, daemon czeka na
-jego koniec: zatrzymanie może trwać do `TELEGRAM_LONG_POLL_SECONDS`
-(domyślnie 25 s; przy maksimum 50 s i wolnej sieci do ok. 65 s). To mieści
-się w domyślnym `TimeoutStopSec=90s` systemd - jeśli ustawiasz w usłudze
-krótszy `TimeoutStopSec`, zmniejsz też `TELEGRAM_LONG_POLL_SECONDS`.
+`systemctl stop`/`restart` wysyła `SIGTERM` - daemon nie zaczyna nowego
+cyklu, czeka na koniec tego, co właśnie robi, i wychodzi czysto (bez
+naruszania plików stanu):
+
+- trwające zapytanie long pollingu: do `TELEGRAM_LONG_POLL_SECONDS`
+  (domyślnie 25 s; przy maksimum 50 s i wolnej sieci do ok. 65 s);
+- trwające sprawdzanie ofert IKEA (razem z wysyłką powiadomień): zwykle
+  kilka sekund, ale przy problemach po stronie IKEA (ponowienia po 5xx,
+  timeouty) nawet kilka minut - do ok. 80 s na każdy taki sklep.
+
+Usługa ma `TimeoutStopSec=180`; gdy i to nie wystarczy, systemd zabija
+proces (`SIGKILL`). Pliki stanu są zapisywane atomowo, więc zostają
+poprawne, ale powiadomienia wysłane tuż przed zabiciem mogą po restarcie
+przyjść drugi raz. Jeśli skracasz `TimeoutStopSec`, zmniejsz też
+`TELEGRAM_LONG_POLL_SECONDS`.
 
 ### Okno godzinowe (CHECK_HOURS)
 

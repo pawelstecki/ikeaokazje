@@ -89,7 +89,8 @@ MIN_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS = 15
 # Long polling getUpdates w trybie daemon (TELEGRAM_LONG_POLL_SECONDS z
 # .env; 0 = krotkie odpytywanie co TELEGRAM_POLL_INTERVAL_SECONDS). Max 50:
-# z REQUEST_TIMEOUT daje 65 s na zapytanie, ponizej TimeoutStopSec=90s.
+# z REQUEST_TIMEOUT daje 65 s na zapytanie, ponizej domyslnego
+# TimeoutStopSec=90s systemd.
 DEFAULT_TELEGRAM_LONG_POLL_SECONDS = 25
 MAX_TELEGRAM_LONG_POLL_SECONDS = 50
 # Minimalny odstep miedzy zapytaniami long pollingu - bez petli bez
@@ -3075,7 +3076,6 @@ def _run_check_cycle() -> tuple:
     active_channels = _enabled_channels()
     active_channels_set = set(active_channels)
 
-
     # Oferty, ktorych co najmniej jeden aktywny kanal jeszcze nie dostarczyl.
     new_offers = []
     for o in matching_offers:
@@ -3357,7 +3357,8 @@ def run_daemon() -> int:
     komendy w samym getUpdates zamiast w SHUTDOWN_EVENT.wait(). Termin
     przypadajacy poza CHECK_HOURS czeka na otwarcie okna; /sprawdz
     uruchamia cykl od razu. Po SIGTERM/SIGINT konczy sie bez nowego cyklu
-    (najpozniej po biezacym zapytaniu long pollingu) i zwraca 0."""
+    (po biezacym zapytaniu long pollingu albo trwajacym cyklu IKEA) i
+    zwraca 0."""
     install_shutdown_signal_handlers()
     long_polling = TELEGRAM_ENABLED and TELEGRAM_LONG_POLL_SECONDS > 0
     if not TELEGRAM_ENABLED:

@@ -274,7 +274,9 @@ assert ik.SEARCH_TERMS == ['stall'], ik.SEARCH_TERMS
 # EMAIL_TO/MIN_DISCOUNT_PERCENT/TELEGRAM_* sa odczytywane z .env przy
 # KAZDYM initialize_runtime(), w przeciwienstwie do STORE_IDS/SEARCH_TERMS,
 # ktore po pierwszym zasianiu zyja tylko w dynamicznym stanie na dysku -
-# patrz README, sekcja "SEARCH_TERMS/... dzialaja tylko RAZ").
+# patrz README, pogrubiony akapit "SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/
+# STORE_IDS dzialaja tylko przy pierwszym uruchomieniu" w sekcji
+# "Konfiguracja").
 with open(config_path, "w", encoding="utf-8") as f:
     f.write(
         "SMTP_MODE=exim\\nEMAIL_TO=second@example.com\\n"
