@@ -50,7 +50,7 @@ Pola `.env` (pełny opis i przykłady w `.env.example`):
 | `SMTP_HOST` | tylko `local587`/`exim` - adres serwera SMTP (w `gmail` zawsze `smtp.gmail.com`) | `localhost` |
 | `EMAIL_FROM` | tylko `exim` - adres nadawcy (w `gmail`/`local587` nadawcą jest `SMTP_USER`) | `ikea-watch@localhost` |
 | `VERIFY_TLS` | tylko `gmail`/`local587` - `false` wyłącza weryfikację certyfikatu serwera SMTP (np. lokalny MTA z przeterminowanym certyfikatem) | `true` |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał powiadomień + komendy - oba naraz albo żaden | wyłączone |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał powiadomień + komendy - oba naraz albo żaden; token w formacie od `@BotFather` (`123456789:ABC-def_ghi`), inny (np. ze spacją) kończy start błędem | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
 | `STORE_URL_SLUGS` | nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji, format `ID:slug,ID:slug` (patrz niżej) | brak |
 | `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
@@ -274,9 +274,11 @@ nazwa, sklep, cena, stan), powiadomienie zawiera jeden wspólny opis
 i listę osobnych linków do rezerwacji każdego egzemplarza. Jeśli łączna
 treść powiadomienia Telegrama przekracza limit API, alert jest
 automatycznie dzielony na wiele wiadomości — żaden egzemplarz nie zostaje
-pominięty. Kolejne wiadomości takiej serii idą co 1 s (limit Telegrama).
-Gdy Telegram mimo to odpowie HTTP 429 (za dużo wiadomości), skrypt czeka
-wskazany przez niego czas (najwyżej 60 s) i ponawia wiadomość raz.
+pominięty. Kolejne wiadomości takiej serii idą co 1 s (limit Telegrama),
+także w trakcie zatrzymywania usługi. Gdy Telegram mimo to odpowie
+HTTP 429 (za dużo wiadomości), skrypt czeka wskazany przez niego czas
+i ponawia wiadomość raz. Jeśli Telegram każe czekać dłużej niż 60 s,
+wysyłka od razu kończy się błędem, a oferty pójdą w następnym cyklu.
 Wiadomości e-mail używają analogicznego grupowania.
 
 ### Komendy Telegrama
@@ -333,11 +335,16 @@ zwykłe sprawdzenie jest planowane od tej chwili (co
 najbliższym uruchomieniu skryptu - sprawdzenie i tak by się wtedy
 odbyło, `/sprawdz` dodaje tylko wiadomość z wynikiem.
 
-Bot reaguje tylko na wiadomości z `TELEGRAM_CHAT_ID` z `.env` - inni
-nadawcy są ignorowani. Komenda z nazwą bota (np. `/status@MojBot`, tak
-wysyła ją Telegram w grupach) działa tak samo jak `/status`. Edycja
-wysłanej wcześniej komendy nie wykonuje jej ponownie - wyślij ją jako
-nową wiadomość.
+Bot reaguje tylko na wiadomości z czatu `TELEGRAM_CHAT_ID` z `.env` -
+inne czaty są ignorowane. Jeśli `TELEGRAM_CHAT_ID` to czat grupowy,
+komend (także `/sprawdz` i zmian list) może używać każdy członek grupy.
+Komenda z nazwą bota (np. `/status@MojBot`, tak wysyła ją Telegram
+w grupach) działa tylko wtedy, gdy to nazwa tego bota (wielkość liter bez
+znaczenia) - komendy do innych botów są ignorowane. Nazwę bota skrypt
+pobiera z Telegrama (`getMe`) przy pierwszej takiej komendzie; jeśli to
+się nie uda, komenda jest pomijana z wpisem w logu - wyślij ją ponownie.
+Edycja wysłanej wcześniej komendy nie wykonuje jej ponownie - wyślij ją
+jako nową wiadomość.
 
 ## Stan na dysku
 
@@ -494,7 +501,9 @@ serwer) albo bot ma ustawiony webhook - usuń go, otwierając
 
 **Komendy Telegrama nie działają.** Sprawdź, czy piszesz z konta o
 `chat_id` z `.env`. W trybie `cron` komenda zadziała przy następnym
-przebiegu skryptu.
+przebiegu skryptu. Komenda z `@nazwą` działa tylko z nazwą tego bota;
+gdy w logu jest `nie udalo sie ustalic nazwy bota (getMe)`, wyślij ją
+ponownie albo bez `@nazwy`.
 
 **Brak linku do rezerwacji.** Sklep nie jest w `KNOWN_STORES` - dodaj go
 w `STORE_URL_SLUGS` albo sprawdź `/sklepy` w Telegramie.

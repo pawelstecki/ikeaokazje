@@ -3,6 +3,7 @@
 Uruchomienie: python3 -m unittest tests/test_ikea_okazje.py
 """
 
+import http.client
 import io
 import json
 import os
@@ -1146,6 +1147,23 @@ class TestConfigValueValidation(unittest.TestCase):
         self.assertIn(ik.CONFIG_FILE, message)
         return message
 
+    def test_telegram_bot_token_valid_formats(self):
+        for token in (None, "", "123:fake-token", "123456789:AAH-abc_DEF09"):
+            with self.subTest(token=token):
+                ik.validate_telegram_bot_token(token)
+
+    def test_telegram_bot_token_invalid_formats_raise_without_token(self):
+        for token in (
+            "123456:SEKRET x", "123456:SEKRET\n", " 123456:SEKRET", "abc:SEKRET",
+            "123456", "123456:", ":SEKRET", "123456:SEKRET.x", "123456:SEKRET#x",
+        ):
+            with self.subTest(token=token):
+                with self.assertRaises(ik.ConfigError) as ctx:
+                    ik.validate_telegram_bot_token(token)
+                message = str(ctx.exception)
+                self.assertIn("TELEGRAM_BOT_TOKEN", message)
+                self.assertNotIn("SEKRET", message)
+
     def test_config_error_is_runtime_error(self):
         self.assertTrue(issubclass(ik.ConfigError, RuntimeError))
         self.assertEqual(ik.EXIT_CONFIG_ERROR, 78)
@@ -1349,6 +1367,25 @@ class TestConfigValidationAtStartup(unittest.TestCase):
         self.assertIn("OK", result.stdout)
         self.assertIn("CHECK_INTERVAL_SECONDS=0", result.stderr)
         self.assertIn("TELEGRAM_POLL_INTERVAL_SECONDS=0", result.stderr)
+
+    def test_invalid_telegram_token_fails_at_startup_without_printing_it(self):
+        result = _run_script(_make_isolated_home(
+            "SMTP_MODE=disabled\nTELEGRAM_BOT_TOKEN='123456:SEKRET x'\nTELEGRAM_CHAT_ID=999\n"
+        ))
+        self.assertEqual(result.returncode, ik.EXIT_CONFIG_ERROR, msg=result.stderr)
+        self.assertIn("TELEGRAM_BOT_TOKEN", result.stderr)
+        self.assertNotIn("SEKRET", result.stderr + result.stdout)
+
+    def test_invalid_telegram_token_from_environment_is_rejected(self):
+        home_dir = _make_isolated_home("SMTP_MODE=disabled\nTELEGRAM_CHAT_ID=999\n")
+        result = _run_python_code(
+            "import ikea_okazje as ik\nraise SystemExit(ik.main())\n",
+            home_dir,
+            extra_env={"TELEGRAM_BOT_TOKEN": "123456:SEKRET "},
+        )
+        self.assertEqual(result.returncode, ik.EXIT_CONFIG_ERROR, msg=result.stderr)
+        self.assertIn("TELEGRAM_BOT_TOKEN", result.stderr)
+        self.assertNotIn("SEKRET", result.stderr + result.stdout)
 
     def test_config_errors_exit_with_code_78_without_traceback(self):
         cases = {
@@ -5415,13 +5452,21 @@ class TestTelegramCommandParsing(unittest.TestCase):
         chat = int(chat_id or self.CHAT_ID)
         return {"update_id": update_id, key: {"chat": {"id": chat}, "text": text}}
 
-    def _handle(self, updates, offset=100):
+    def _handle(self, updates, offset=100, get_me=None):
+        """get_me - atrapa telegram_api_call() dla getMe (domyslnie bot MojBot);
+        nazwa bota startuje niezapamietana."""
+        self.get_me = get_me or mock.Mock(
+            return_value={"id": 1, "is_bot": True, "username": "MojBot"}
+        )
         with mock.patch.object(ik, "TELEGRAM_CHAT_ID", self.CHAT_ID), \
+             mock.patch.object(ik, "TELEGRAM_BOT_USERNAME", None), \
+             mock.patch.object(ik, "telegram_api_call", self.get_me), \
              mock.patch.object(ik, "load_telegram_offset", return_value=offset), \
              mock.patch.object(ik, "telegram_get_updates", return_value=updates), \
              mock.patch.object(ik, "save_telegram_offset") as save_offset, \
              mock.patch.object(ik, "handle_command", return_value="ok") as handle_command, \
-             mock.patch.object(ik, "telegram_send_message") as send:
+             mock.patch.object(ik, "telegram_send_message") as send, \
+             mock.patch.object(ik, "log") as self.log:
             ik.handle_telegram_updates()
         return handle_command, send, save_offset
 
@@ -5429,14 +5474,75 @@ class TestTelegramCommandParsing(unittest.TestCase):
         handle_command, send, _ = self._handle([self._message(100, "/status@MojBot")])
         handle_command.assert_called_once_with("/status", "")
         send.assert_called_once()
+        self.get_me.assert_called_once_with("getMe", {}, ik.REQUEST_TIMEOUT)
 
     def test_bot_name_suffix_with_argument_and_upper_case_command(self):
-        handle_command, _, _ = self._handle([self._message(100, "/DODAJ@Moj_Bot  stall nowy")])
+        handle_command, _, _ = self._handle([self._message(100, "/DODAJ@mojBOT  stall nowy")])
         handle_command.assert_called_once_with("/dodaj", "stall nowy")
 
     def test_plain_command_unchanged(self):
         handle_command, _, _ = self._handle([self._message(100, "/usun stall")])
         handle_command.assert_called_once_with("/usun", "stall")
+
+    def test_plain_command_does_not_ask_for_bot_name(self):
+        self._handle([self._message(100, "/status"), self._message(101, "/sprawdz")])
+        self.get_me.assert_not_called()
+
+    def test_command_for_other_bot_is_ignored_but_offset_advances(self):
+        handle_command, send, save_offset = self._handle([
+            self._message(100, "/sprawdz@InnyBot"),
+            self._message(101, "/usunsklep@MojBot_2 294"),
+        ])
+        handle_command.assert_not_called()
+        send.assert_not_called()
+        save_offset.assert_called_once_with(102)
+
+    def test_bot_name_fetched_once_per_process(self):
+        handle_command, _, _ = self._handle([
+            self._message(100, "/status@MojBot"),
+            self._message(101, "/sprawdz@InnyBot"),
+            self._message(102, "/pomoc@mojbot"),
+        ])
+        self.assertEqual(
+            [call.args for call in handle_command.call_args_list],
+            [("/status", ""), ("/pomoc", "")],
+        )
+        self.get_me.assert_called_once()
+
+    def test_get_me_failure_skips_suffixed_command_with_warning(self):
+        get_me = mock.Mock(side_effect=ik.TelegramApiError(
+            "Blad polaczenia z Telegram API (getMe): timed out"
+        ))
+        handle_command, send, save_offset = self._handle(
+            [self._message(100, "/sprawdz@MojBot"), self._message(101, "/status")],
+            get_me=get_me,
+        )
+        handle_command.assert_called_once_with("/status", "")
+        send.assert_called_once()
+        save_offset.assert_called_once_with(102)
+        warning = self.log.call_args.args[0]
+        self.assertIn("getMe", warning)
+        self.assertIn("pomijam", warning)
+        self.assertTrue(self.log.call_args.kwargs.get("to_stderr"))
+
+    def test_get_me_without_username_skips_suffixed_command(self):
+        handle_command, _, _ = self._handle(
+            [self._message(100, "/sprawdz@MojBot")],
+            get_me=mock.Mock(return_value={"id": 1, "is_bot": True}),
+        )
+        handle_command.assert_not_called()
+
+    def test_failed_get_me_is_not_cached(self):
+        get_me = mock.Mock(side_effect=[
+            ik.TelegramApiError("Telegram API (getMe) zwrocilo HTTP 502"),
+            {"username": "MojBot"},
+        ])
+        handle_command, _, _ = self._handle(
+            [self._message(100, "/status@MojBot"), self._message(101, "/pomoc@MojBot")],
+            get_me=get_me,
+        )
+        handle_command.assert_called_once_with("/pomoc", "")
+        self.assertEqual(get_me.call_count, 2)
 
     def test_edited_message_is_ignored_but_offset_advances(self):
         handle_command, send, save_offset = self._handle(
@@ -5466,6 +5572,20 @@ class TestTelegramCommandParsing(unittest.TestCase):
         handle_command.assert_not_called()
         send.assert_not_called()
         save_offset.assert_called_once_with(101)
+        self.get_me.assert_not_called()
+
+    def test_initialize_runtime_forgets_bot_name(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=disabled\nTELEGRAM_BOT_TOKEN=123:fake-token\nTELEGRAM_CHAT_ID=999\n"
+        )
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n"
+            "ik.TELEGRAM_BOT_USERNAME = 'StaryBot'\nik.initialize_runtime()\n"
+            "assert ik.TELEGRAM_BOT_USERNAME is None, ik.TELEGRAM_BOT_USERNAME\nprint('OK')\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
 
 
 _TEST_BOT_TOKEN = "123456:SEKRETNY-TOKEN"
@@ -5606,10 +5726,65 @@ class TestTelegramApiErrors(unittest.TestCase):
         ik.telegram_send_message("x")
         self.wait.assert_called_once_with(ik.TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS)
 
-    def test_429_wait_is_capped(self):
-        self._urlopen(_telegram_http_error(429, "Too Many Requests", retry_after=600), _telegram_ok())
+    def test_429_retry_after_over_cap_raises_without_retry(self):
+        # Ponowienie przed uplywem retry_after i tak by sie nie udalo.
+        urlopen = self._urlopen(
+            _telegram_http_error(429, "Too Many Requests: retry after 600", retry_after=600),
+            _telegram_ok(),
+        )
+        with self.assertRaises(ik.TelegramApiError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertEqual(urlopen.call_count, 1)
+        self.wait.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("HTTP 429", message)
+        self.assertIn("czekac 600s", message)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.retry_after, 600.0)
+        self._assert_no_secret(message)
+
+    def test_429_retry_after_at_cap_is_retried(self):
+        urlopen = self._urlopen(
+            _telegram_http_error(429, "Too Many Requests", retry_after=ik.TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS),
+            _telegram_ok(),
+        )
         ik.telegram_send_message("x")
-        self.wait.assert_called_once_with(ik.TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS)
+        self.assertEqual(urlopen.call_count, 2)
+        self.wait.assert_called_once_with(float(ik.TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS))
+
+    def test_invalid_url_error_does_not_leak_token(self):
+        # Token ze spacja: http.client.InvalidURL pokazuje sciezke z tokenem (repr).
+        token = "123456:SEKRETNY TOKEN"
+        path = f"/bot{token}/getUpdates"
+        self._urlopen(http.client.InvalidURL(
+            f"URL can't contain control characters. {path!r} (found at least ' ')"
+        ))
+        with mock.patch.object(ik, "TELEGRAM_BOT_TOKEN", token):
+            with self.assertRaises(ik.TelegramApiError) as ctx:
+                ik.telegram_get_updates(0)
+        message = str(ctx.exception)
+        self.assertIn("getUpdates", message)
+        self.assertIn("control characters", message)
+        self.assertNotIn("SEKRETNY", message)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
+    def test_token_masked_in_repr_form(self):
+        token = "123456:SEKRETNY\tTOKEN"
+        with mock.patch.object(ik, "TELEGRAM_BOT_TOKEN", token):
+            masked = ik._hide_telegram_token(f"a {token} b {f'/bot{token}/x'!r}")
+        self.assertNotIn("SEKRETNY", masked)
+        self.assertEqual(masked.count("[ukryte]"), 2)
+
+    def test_unexpected_exception_is_wrapped_and_masked(self):
+        self._urlopen(ValueError(f"unknown url type: bot{_TEST_BOT_TOKEN}"))
+        with self.assertRaises(ik.TelegramApiError) as ctx:
+            ik.telegram_send_message("x")
+        message = str(ctx.exception)
+        self.assertIn("Blad wywolania Telegram API (sendMessage)", message)
+        self.assertIn("[ukryte]", message)
+        self._assert_no_secret(message)
+        self.assertIsNone(ctx.exception.__cause__)
 
     def test_second_429_raises_after_single_retry(self):
         urlopen = self._urlopen(
@@ -5676,7 +5851,7 @@ class TestTelegramApiErrors(unittest.TestCase):
 
 class TestTelegramSeriesPacing(unittest.TestCase):
     """send_telegram(): przerwa TELEGRAM_SERIES_DELAY_SECONDS miedzy
-    wiadomosciami serii (przez SHUTDOWN_EVENT.wait), bez przerwy przed
+    wiadomosciami serii (time.sleep, takze po SIGTERM), bez przerwy przed
     pierwsza i po ostatniej."""
 
     def _series_offers(self):
@@ -5697,23 +5872,35 @@ class TestTelegramSeriesPacing(unittest.TestCase):
             if send_side_effect:
                 send_side_effect(len([e for e in events if e == "send"]))
 
-        def fake_wait(timeout):
-            events.append(("wait", timeout))
-            return False
+        def fake_sleep(seconds):
+            events.append(("sleep", seconds))
 
         with mock.patch.object(ik, "telegram_send_message", side_effect=fake_send), \
-             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=fake_wait):
+             mock.patch.object(ik.time, "sleep", side_effect=fake_sleep), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait") as self.wait:
             ik.send_telegram(offers)
         return events
+
+    def _expected(self, count):
+        expected = ["send"]
+        for _ in range(count - 1):
+            expected += [("sleep", ik.TELEGRAM_SERIES_DELAY_SECONDS), "send"]
+        return expected
 
     def test_delay_between_messages_only(self):
         offers, count = self._series_offers()
         events = self._run(offers)
-        expected = ["send"]
-        for _ in range(count - 1):
-            expected += [("wait", ik.TELEGRAM_SERIES_DELAY_SECONDS), "send"]
-        self.assertEqual(events, expected)
+        self.assertEqual(events, self._expected(count))
         self.assertEqual(ik.TELEGRAM_SERIES_DELAY_SECONDS, 1.0)
+        self.wait.assert_not_called()
+
+    def test_pacing_kept_after_shutdown_request(self):
+        # Po SIGTERM seria bez przerw dostalaby 429 i poszla ponownie w calosci.
+        offers, count = self._series_offers()
+        ik.SHUTDOWN_EVENT.set()
+        self.addCleanup(ik.SHUTDOWN_EVENT.clear)
+        events = self._run(offers)
+        self.assertEqual(events, self._expected(count))
 
     def test_single_message_has_no_delay(self):
         self.assertEqual(self._run([_make_offer()]), ["send"])

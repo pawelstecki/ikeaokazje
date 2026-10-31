@@ -535,6 +535,23 @@ def parse_smtp_mode(raw) -> str:
     return mode
 
 
+# Format tokenu od @BotFather: <id bota>:<sekret>. Token trafia do URL, wiec
+# spacja albo inny znak dalby blad z tokenem w tresci (http.client).
+TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
+
+
+def validate_telegram_bot_token(token) -> None:
+    """Pusty token -> Telegram wylaczony; inny niz <liczba>:<znaki> ->
+    ConfigError. Komunikat nigdy nie zawiera tokenu."""
+    if token and not TELEGRAM_BOT_TOKEN_PATTERN.fullmatch(token):
+        raise ConfigError(
+            f"Nieprawidlowy format TELEGRAM_BOT_TOKEN (w {CONFIG_FILE} albo w "
+            "zmiennej srodowiskowej): oczekiwany <liczba>:<litery, cyfry, _ i ->, "
+            "np. 123456789:AAH-abc_def. Sprawdz spacje, cudzyslowy i komentarz "
+            "w tej linii."
+        )
+
+
 def validate_notification_config(
     smtp_mode: str,
     smtp_user,
@@ -633,6 +650,9 @@ EMAIL_TO = None
 TELEGRAM_BOT_TOKEN = None
 TELEGRAM_CHAT_ID = None
 TELEGRAM_ENABLED = False
+# Nazwa tego bota z getMe (bez '@'); pobierana dopiero przy pierwszej
+# komendzie z @nazwa i trzymana w pamieci procesu.
+TELEGRAM_BOT_USERNAME = None
 
 DYNAMIC_STATE: dict = {}
 SEARCH_TERMS: list = []
@@ -883,7 +903,7 @@ def initialize_runtime() -> None:
     global STORE_URL_SLUGS
     global SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, USE_AUTH
     global EMAIL_ENABLED, EMAIL_TO
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED, TELEGRAM_BOT_USERNAME
     global DYNAMIC_STATE, SEARCH_TERMS, SEARCH_ARTICLE_NUMBERS, STORE_IDS
     global NORMALIZED_TERMS, WHOLE_WORD_TERM_PATTERNS, NORMALIZED_EXCLUDE
 
@@ -973,6 +993,8 @@ def initialize_runtime() -> None:
     TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = ENV.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
     TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    # Nazwa bota (getMe) moze sie zmienic razem z tokenem.
+    TELEGRAM_BOT_USERNAME = None
 
     validate_notification_config(
         SMTP_MODE,
@@ -983,6 +1005,7 @@ def initialize_runtime() -> None:
         TELEGRAM_BOT_TOKEN,
         TELEGRAM_CHAT_ID,
     )
+    validate_telegram_bot_token(TELEGRAM_BOT_TOKEN)
 
     DYNAMIC_STATE = load_dynamic_state()
     SEARCH_TERMS = DYNAMIC_STATE["search_terms"]
@@ -1853,8 +1876,9 @@ def split_telegram_messages_with_previews(groups: list) -> list:
     return messages
 
 
-# HTTP 429 z Bot API: jedno ponowienie po retry_after (brak -> 5 s), ale
-# nie dluzej niz 60 s, zeby nie wstrzymywac cyklu.
+# HTTP 429 z Bot API: jedno ponowienie po retry_after (brak -> 5 s). Gdy
+# retry_after przekracza 60 s - blad bez ponowienia, zeby nie wstrzymywac
+# cyklu (oferty pojda w nastepnym).
 TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
 TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS = 60
 # Przerwa miedzy wiadomosciami jednej serii (Telegram limituje ok. 1
@@ -1873,10 +1897,12 @@ class TelegramApiError(RuntimeError):
 
 
 def _hide_telegram_token(text) -> str:
-    """Maskuje token bota, gdyby wrocil w tresci bledu."""
+    """Maskuje token bota, gdyby wrocil w tresci bledu - takze w postaci
+    repr() (np. http.client.InvalidURL pokazuje URL przez repr)."""
     text = str(text)
     if TELEGRAM_BOT_TOKEN:
-        text = text.replace(TELEGRAM_BOT_TOKEN, "[ukryte]")
+        for form in (TELEGRAM_BOT_TOKEN, repr(TELEGRAM_BOT_TOKEN)[1:-1]):
+            text = text.replace(form, "[ukryte]")
     return text
 
 
@@ -1936,6 +1962,12 @@ def telegram_api_call(method: str, payload: dict, timeout: float):
         raise TelegramApiError(
             f"Blad polaczenia z Telegram API ({method}): {_hide_telegram_token(reason_text)}"
         ) from None
+    except Exception as exc:
+        # Np. http.client.InvalidURL - jego tresc zawiera sciezke URL z tokenem.
+        raise TelegramApiError(
+            f"Blad wywolania Telegram API ({method}): "
+            f"{_hide_telegram_token(exception_text(exc))}"
+        ) from None
 
     try:
         data = json.loads(body.decode("utf-8"))
@@ -1955,8 +1987,9 @@ def telegram_api_call(method: str, payload: dict, timeout: float):
 def telegram_send_message(text: str, chat_id=None, preview_url=None, disable_preview=False) -> None:
     """Wysyla wiadomosc HTML. preview_url - obraz w podgladzie linku (bez
     niego Telegram bierze pierwszy link z tresci), disable_preview - bez
-    podgladu. Po HTTP 429 czeka retry_after i ponawia raz; gdy w trakcie
-    czekania przyjdzie SIGTERM, konczy bledem bez ponowienia."""
+    podgladu. Po HTTP 429 czeka retry_after i ponawia raz; retry_after
+    ponad TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS albo SIGTERM w trakcie
+    czekania - blad bez ponowienia."""
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
@@ -1975,10 +2008,16 @@ def telegram_send_message(text: str, chat_id=None, preview_url=None, disable_pre
             raise
         rate_limit_error = exc
 
-    delay = min(
-        rate_limit_error.retry_after or TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS,
-        TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS,
-    )
+    retry_after = rate_limit_error.retry_after
+    if retry_after is not None and retry_after > TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS:
+        # Ponowienie przed uplywem retry_after i tak by sie nie udalo.
+        raise TelegramApiError(
+            f"{rate_limit_error} (Telegram kazal czekac {retry_after:.0f}s - dluzej niz "
+            f"{TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS}s, bez ponowienia)",
+            429,
+            retry_after,
+        )
+    delay = retry_after or TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS
     log(f"Telegram: limit wysylania (HTTP 429) - ponawiam za {delay:.0f}s.", to_stderr=True)
     if SHUTDOWN_EVENT.wait(delay):
         raise TelegramApiError(
@@ -1999,9 +2038,9 @@ def send_telegram(new_offers) -> None:
     sent_count = 0
     for index, (msg, preview_url) in enumerate(messages):
         if index > 0:
-            # Po SIGTERM wait() wraca od razu - reszta serii idzie bez
-            # przerwy, zeby cykl skonczyl sie szybko.
-            SHUTDOWN_EVENT.wait(TELEGRAM_SERIES_DELAY_SECONDS)
+            # Zwykly sleep, nie SHUTDOWN_EVENT.wait(): po SIGTERM seria bez
+            # przerw dostalaby 429 i poszla po restarcie jeszcze raz w calosci.
+            time.sleep(TELEGRAM_SERIES_DELAY_SECONDS)
         try:
             telegram_send_message(msg, preview_url=preview_url)
             sent_count += 1
@@ -2314,6 +2353,35 @@ def telegram_get_updates(offset: int, timeout: int = 0) -> list:
             ) from None
         raise
     return result if isinstance(result, list) else []
+
+
+def get_telegram_bot_username() -> str:
+    """Nazwa tego bota z getMe, zapamietana na czas procesu. Blad
+    zapytania albo brak nazwy -> TelegramApiError (bez zapamietania)."""
+    global TELEGRAM_BOT_USERNAME
+    if TELEGRAM_BOT_USERNAME is None:
+        result = telegram_api_call("getMe", {}, REQUEST_TIMEOUT)
+        username = result.get("username") if isinstance(result, dict) else None
+        if not isinstance(username, str) or not username:
+            raise TelegramApiError("Telegram API (getMe) nie zwrocilo nazwy bota.")
+        TELEGRAM_BOT_USERNAME = username
+    return TELEGRAM_BOT_USERNAME
+
+
+def command_addressed_to_this_bot(suffix: str) -> bool:
+    """Komenda /cmd@nazwa jest dla nas tylko, gdy nazwa to ten bot (bez
+    wielkosci liter). Gdy getMe zawiedzie, komenda jest pomijana - lepiej
+    pominac wlasna komende niz wykonac komende innego bota w grupie."""
+    try:
+        username = get_telegram_bot_username()
+    except Exception as exc:
+        log(
+            "Telegram: nie udalo sie ustalic nazwy bota (getMe) - pomijam komende "
+            f"z @nazwa_bota: {exception_text(exc)}",
+            to_stderr=True,
+        )
+        return False
+    return suffix.lower() == username.lower()
 
 
 # /oferty: limity jednej grupy, zeby kazda zmiescila sie w wiadomosci.
@@ -2630,7 +2698,8 @@ def handle_command(cmd: str, arg: str) -> str:
 
 def handle_telegram_updates(long_poll_seconds: int = 0) -> None:
     """Sprawdza nowe wiadomosci od ostatniego razu i wykonuje komendy.
-    Ignoruje wiadomosci od kogokolwiek innego niz TELEGRAM_CHAT_ID.
+    Ignoruje wiadomosci spoza czatu TELEGRAM_CHAT_ID i komendy z @nazwa
+    innego bota.
     long_poll_seconds > 0: czeka na wiadomosci do tylu sekund (daemon)."""
     offset = load_telegram_offset()
     updates = telegram_get_updates(offset, timeout=long_poll_seconds)
@@ -2654,7 +2723,11 @@ def handle_telegram_updates(long_poll_seconds: int = 0) -> None:
 
         parts = text.split(maxsplit=1)
         # W grupach Telegram dokleja nazwe bota: /status@MojBot -> /status.
-        cmd = parts[0].split("@", 1)[0].lower()
+        # Komenda z nazwa innego bota nie jest dla nas.
+        cmd, _, suffix = parts[0].partition("@")
+        if suffix and not command_addressed_to_this_bot(suffix):
+            continue
+        cmd = cmd.lower()
         arg = parts[1] if len(parts) > 1 else ""
 
         try:
