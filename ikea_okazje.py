@@ -28,6 +28,8 @@ Tryby pracy (RUN_MODE):
                (TELEGRAM_LONG_POLL_SECONDS; 0 = co
                TELEGRAM_POLL_INTERVAL_SECONDS), oferty co
                CHECK_INTERVAL_SECONDS; lagodne zakonczenie po SIGTERM/SIGINT.
+    W obu trybach CHECK_HOURS (np. 8-22, czas lokalny) ogranicza zwykle
+    sprawdzanie ofert do tych godzin; /sprawdz dziala tez poza oknem.
 
 Konfiguracja uzytkownika jest w ~/.config/ikea-okazje.env (patrz
 .env.example), nie w kodzie - aktualizacja skryptu jej nie nadpisze.
@@ -48,7 +50,7 @@ import re
 import signal
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import smtplib
 import ssl
 import sys
@@ -414,6 +416,30 @@ def parse_run_mode(raw) -> str:
     return mode
 
 
+def parse_check_hours(raw) -> "tuple | None":
+    """CHECK_HOURS 'H-H' (godziny 0..24, od pelnej godziny poczatku do
+    pelnej godziny konca, bez niej; poczatek > koniec - okno przez polnoc).
+    Pusty -> None (bez ograniczen); zly format, zakres albo puste okno ->
+    RuntimeError."""
+    if raw is None or raw.strip() == "":
+        return None
+    text = raw.strip()
+    match = re.fullmatch(r"([0-9]{1,2})\s*-\s*([0-9]{1,2})", text)
+    window = (int(match.group(1)), int(match.group(2))) if match else None
+    if (
+        window is None
+        or not all(0 <= hour <= 24 for hour in window)
+        or window[0] == window[1]
+        or window == (24, 0)  # od polnocy do polnocy wstecz - okno puste
+    ):
+        raise RuntimeError(
+            f"Nieprawidlowe CHECK_HOURS w {CONFIG_FILE}: '{text}' - oczekiwany "
+            "format H-H z pelnymi godzinami od 0 do 24 i roznym poczatkiem i "
+            "koncem, np. 8-22 albo 22-6."
+        )
+    return window
+
+
 def parse_bool(raw, default):
     if raw is None or raw.strip() == "":
         return default
@@ -549,6 +575,8 @@ CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL_SECONDS
 TELEGRAM_POLL_INTERVAL_SECONDS = DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS
 TELEGRAM_LONG_POLL_SECONDS = DEFAULT_TELEGRAM_LONG_POLL_SECONDS
 HEALTH_ALERT_AFTER_CYCLES = DEFAULT_HEALTH_ALERT_AFTER_CYCLES
+# Okno godzinowe sprawdzania ofert (start, koniec) albo None - bez ograniczen.
+CHECK_HOURS = None
 
 STORE_URL_SLUGS: dict = {}
 
@@ -796,7 +824,7 @@ def initialize_runtime() -> None:
     global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
     global ALERT_EXISTING_ON_FIRST_RUN, SMTP_MODE, VERIFY_TLS
     global RUN_MODE, CHECK_INTERVAL_SECONDS, TELEGRAM_POLL_INTERVAL_SECONDS
-    global TELEGRAM_LONG_POLL_SECONDS, HEALTH_ALERT_AFTER_CYCLES
+    global TELEGRAM_LONG_POLL_SECONDS, HEALTH_ALERT_AFTER_CYCLES, CHECK_HOURS
     global STORE_URL_SLUGS
     global SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, USE_AUTH
     global EMAIL_ENABLED, EMAIL_TO
@@ -842,6 +870,7 @@ def initialize_runtime() -> None:
         "HEALTH_ALERT_AFTER_CYCLES",
         DEFAULT_HEALTH_ALERT_AFTER_CYCLES,
     )
+    CHECK_HOURS = parse_check_hours(ENV.get("CHECK_HOURS"))
 
     # Ma pierwszenstwo nad KNOWN_STORES (nowe sklepy bez zmiany kodu).
     STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
@@ -2375,6 +2404,14 @@ def format_status_message() -> str:
     if MAX_PRICE is not None:
         lines.append(f"Maks. cena: {MAX_PRICE}")
     lines.append(f"Tryb pracy: {escape_html(RUN_MODE)}")
+    if CHECK_HOURS is None:
+        lines.append("Okno sprawdzania (CHECK_HOURS): bez ograniczen")
+    else:
+        state_txt = (
+            "teraz otwarte" if within_check_hours()
+            else f"teraz zamkniete, otwarcie {check_hours_opening_text()}"
+        )
+        lines.append(f"Okno sprawdzania (CHECK_HOURS): {format_check_hours()} - {state_txt}")
     lines.append("")
     lines.extend(_format_status_check_lines())
     return "\n".join(lines)
@@ -3013,6 +3050,45 @@ def log_cron_backoff_skip(remaining_seconds: float) -> None:
     )
 
 
+# ---------------- OKNO GODZINOWE SPRAWDZANIA (CHECK_HOURS) ----------------
+# Czas lokalny serwera. now (datetime) mozna wstrzyknac w testach.
+
+def format_check_hours() -> str:
+    """'8:00-22:00' albo 'bez ograniczen'."""
+    if CHECK_HOURS is None:
+        return "bez ograniczen"
+    start, end = CHECK_HOURS
+    return f"{start}:00-{end}:00"
+
+
+def within_check_hours(now=None) -> bool:
+    """Czy wolno teraz sprawdzac oferty (zawsze, gdy CHECK_HOURS puste)."""
+    if CHECK_HOURS is None:
+        return True
+    hour = (datetime.now() if now is None else now).hour
+    start, end = CHECK_HOURS
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def seconds_until_check_hours_open(now=None) -> float:
+    """Sekundy do otwarcia okna CHECK_HOURS (0, gdy otwarte). Roznica
+    znacznikow czasu, a nie dat, wiec zmiana czasu letniego jej nie psuje."""
+    now = datetime.now() if now is None else now
+    if within_check_hours(now):
+        return 0.0
+    opening = now.replace(hour=CHECK_HOURS[0] % 24, minute=0, second=0, microsecond=0)
+    if opening <= now:
+        opening += timedelta(days=1)
+    return max(0.0, opening.timestamp() - now.timestamp())
+
+
+def check_hours_opening_text() -> str:
+    """Czas najblizszego otwarcia okna do logow i odpowiedzi."""
+    return format_local_timestamp(time.time() + seconds_until_check_hours_open())
+
+
 # ---------------- /sprawdz - SPRAWDZENIE NA ZADANIE ----------------
 
 def seconds_until_forced_check_allowed(now_wall_clock=None) -> float:
@@ -3129,9 +3205,10 @@ def run_daemon() -> int:
     sa odliczane time.monotonic(), zeby skoki zegara (NTP) ich nie
     zmienialy; trwaly termin backoffu (czas scienny) jest przeliczany na
     sekundy przy starcie i po kazdym cyklu. Z long pollingiem czeka na
-    komendy w samym getUpdates zamiast w SHUTDOWN_EVENT.wait(). Po
-    SIGTERM/SIGINT konczy sie bez nowego cyklu (najpozniej po biezacym
-    zapytaniu long pollingu) i zwraca 0."""
+    komendy w samym getUpdates zamiast w SHUTDOWN_EVENT.wait(). Termin
+    przypadajacy poza CHECK_HOURS czeka na otwarcie okna; /sprawdz
+    uruchamia cykl od razu. Po SIGTERM/SIGINT konczy sie bez nowego cyklu
+    (najpozniej po biezacym zapytaniu long pollingu) i zwraca 0."""
     install_shutdown_signal_handlers()
     long_polling = TELEGRAM_ENABLED and TELEGRAM_LONG_POLL_SECONDS > 0
     if not TELEGRAM_ENABLED:
@@ -3142,7 +3219,8 @@ def run_daemon() -> int:
         telegram_txt = f"Telegram co {TELEGRAM_POLL_INTERVAL_SECONDS}s"
     log(
         f"Start w trybie daemon (IKEA co ~{CHECK_INTERVAL_SECONDS}s "
-        f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, {telegram_txt})."
+        f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, okno CHECK_HOURS: "
+        f"{format_check_hours()}, {telegram_txt})."
     )
 
     # Restart nie resetuje aktywnego backoffu - respektujemy zapisany termin.
@@ -3161,6 +3239,8 @@ def run_daemon() -> int:
 
     # Pierwsze sprawdzenie ofert dopiero po next_check_interval, nie od razu.
     last_ikea_check_monotonic = time.monotonic()
+    # Log o zamknietym oknie CHECK_HOURS raz na kazde zamkniecie.
+    closed_window_logged = False
 
     while not SHUTDOWN_EVENT.is_set():
         # Bez long pollingu i po bledzie Telegrama (backoff) czekamy pelny
@@ -3169,9 +3249,12 @@ def run_daemon() -> int:
         if TELEGRAM_ENABLED:
             long_poll_seconds = 0
             if long_polling:
-                long_poll_seconds = telegram_long_poll_timeout(
-                    next_check_interval - (time.monotonic() - last_ikea_check_monotonic)
-                )
+                # Przy zamknietym oknie CHECK_HOURS liczy sie czas do jego
+                # otwarcia - minionego terminu nie, inaczej poll co ~1 s.
+                long_poll_seconds = telegram_long_poll_timeout(max(
+                    next_check_interval - (time.monotonic() - last_ikea_check_monotonic),
+                    seconds_until_check_hours_open(),
+                ))
             poll_started_monotonic = time.monotonic()
             try:
                 handle_telegram_updates(long_poll_seconds=long_poll_seconds)
@@ -3182,10 +3265,23 @@ def run_daemon() -> int:
         if SHUTDOWN_EVENT.is_set():
             break
 
-        # /sprawdz uruchamia cykl od razu; harmonogram liczy sie potem od nowa.
+        # /sprawdz uruchamia cykl od razu (takze poza CHECK_HOURS);
+        # harmonogram liczy sie potem od nowa.
         forced = FORCE_CHECK_REQUESTED.is_set()
-        if forced or time.monotonic() - last_ikea_check_monotonic >= next_check_interval:
+        check_due = time.monotonic() - last_ikea_check_monotonic >= next_check_interval
+        if check_due and not forced and not within_check_hours():
+            # Termin minal, ale okno zamkniete: cykl ruszy po otwarciu.
+            if not closed_window_logged:
+                log(
+                    f"Poza oknem sprawdzania CHECK_HOURS ({format_check_hours()}) - "
+                    "sprawdzanie ofert wstrzymane do otwarcia okna "
+                    f"({check_hours_opening_text()})."
+                )
+                closed_window_logged = True
+            check_due = False
+        if forced or check_due:
             FORCE_CHECK_REQUESTED.clear()
+            closed_window_logged = False
             run_check_cycle_now(forced)
             # Znacznik po cyklu, zeby czas pobierania nie skracal interwalu.
             last_ikea_check_monotonic = time.monotonic()
@@ -3258,9 +3354,17 @@ def main() -> int:
         log_cron_backoff_skip(remaining)
         return 0
 
-    # /sprawdz z komend wyzej: ten sam cykl, plus podsumowanie na Telegramie.
+    # /sprawdz z komend wyzej: ten sam cykl (takze poza CHECK_HOURS), plus
+    # podsumowanie na Telegramie.
     forced = FORCE_CHECK_REQUESTED.is_set()
     FORCE_CHECK_REQUESTED.clear()
+    if not forced and not within_check_hours():
+        log(
+            f"Poza oknem sprawdzania CHECK_HOURS ({format_check_hours()}) - pomijam "
+            "sprawdzanie ofert, bez zapytania do IKEA. Okno otworzy sie "
+            f"{check_hours_opening_text()}."
+        )
+        return 0
     return run_check_cycle_now(forced)
 
 

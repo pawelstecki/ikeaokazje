@@ -51,14 +51,15 @@ Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 | `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
+| `CHECK_HOURS` | w jakich godzinach sprawdzać oferty, format `H-H` (np. `8-22`, `22-6`, `0-24`), czas lokalny serwera (patrz "Okno godzinowe") | bez ograniczeń |
 | `TELEGRAM_LONG_POLL_SECONDS` | tylko `daemon` - ile sekund jedno zapytanie do Telegrama czeka na nowe komendy (long polling); liczba całkowita `0`-`50`, `0` wyłącza long polling | `25` |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy przy `TELEGRAM_LONG_POLL_SECONDS=0`; przy long pollingu to przerwa po błędzie Telegrama | `15` |
 | `HEALTH_ALERT_AFTER_CYCLES` | po ilu kolejnych nieudanych cyklach wysłać alert o awarii monitora; `0` wyłącza alert (patrz "Alert o awarii monitora") | `3` |
 
-Nieprawidłowa wartość pola liczbowego albo `RUN_MODE` (literówka, tekst
-zamiast liczby, liczba ujemna, zero dla interwałów) kończy start skryptu
-błędem z nazwą pola i ścieżką pliku, zamiast cicho wyłączyć filtr albo
-wrócić do wartości domyślnej.
+Nieprawidłowa wartość pola liczbowego, `RUN_MODE` albo `CHECK_HOURS`
+(literówka, tekst zamiast liczby, liczba ujemna, zero dla interwałów)
+kończy start skryptu błędem z nazwą pola i ścieżką pliku, zamiast cicho
+wyłączyć filtr albo wrócić do wartości domyślnej.
 
 Format pliku: `KLUCZ=wartość`, opcjonalnie z przedrostkiem `export `.
 Komentarz w linii zaczyna się od `#` poprzedzonego spacją
@@ -187,6 +188,24 @@ jego koniec: zatrzymanie może trwać do `TELEGRAM_LONG_POLL_SECONDS`
 (domyślnie 25 s; przy maksimum 50 s i wolnej sieci do ok. 65 s). To mieści
 się w domyślnym `TimeoutStopSec=90s` systemd - jeśli ustawiasz w usłudze
 krótszy `TimeoutStopSec`, zmniejsz też `TELEGRAM_LONG_POLL_SECONDS`.
+
+### Okno godzinowe (CHECK_HOURS)
+
+`CHECK_HOURS=8-22` w `.env` ogranicza sprawdzanie ofert do godzin od
+8:00 (włącznie) do 22:00 (bez 22:00) czasu lokalnego serwera. Okno może
+przechodzić przez północ (`22-6` = od 22:00 do 6:00), `0-24` oznacza
+całą dobę, a puste pole - brak ograniczeń. Godziny to liczby całkowite
+od 0 do 24; inny format, liczba spoza zakresu albo ten sam początek
+i koniec (np. `8-8`) kończą start błędem.
+
+- `cron`: uruchomienie poza oknem obsługuje komendy Telegrama, zapisuje
+  w logu, kiedy okno się otworzy, i kończy się kodem 0 bez zapytania do
+  IKEA. Taki przebieg nie liczy się do alertu o awarii monitora.
+- `daemon`: sprawdzenie, którego termin wypada poza oknem, czeka na jego
+  otwarcie i rusza zaraz po nim; w logu jest jeden wpis na każde
+  zamknięcie okna. Komendy Telegrama działają przez całą dobę.
+- `/sprawdz` działa także poza oknem (z tymi samymi limitami co zawsze).
+  `/status` pokazuje okno i to, czy jest teraz otwarte.
 
 ### Ręczne uruchomienie
 

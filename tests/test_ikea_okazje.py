@@ -6801,5 +6801,331 @@ class TestForcedCheckCron(_ForcedCheckStateTestCase):
         self.assertEqual(calls[1:], ["cycle"])
 
 
+class TestCheckHoursParsing(unittest.TestCase):
+    """CHECK_HOURS: 'H-H' z godzinami 0..24, pusty = bez ograniczen."""
+
+    def test_empty_means_no_limit(self):
+        for raw in (None, "", "   "):
+            with self.subTest(raw=raw):
+                self.assertIsNone(ik.parse_check_hours(raw))
+
+    def test_valid_values(self):
+        for raw, expected in (("8-22", (8, 22)), (" 22 - 6 ", (22, 6)), ("0-24", (0, 24)),
+                              ("08-22", (8, 22)), ("24-6", (24, 6)), ("22-0", (22, 0)),
+                              ("0-1", (0, 1))):
+            with self.subTest(raw=raw):
+                self.assertEqual(ik.parse_check_hours(raw), expected)
+
+    def test_invalid_values_raise_with_key_and_path(self):
+        for raw in ("8", "8-", "-8", "a-b", "8-25", "25-8", "8-8", "0-0", "24-24", "24-0",
+                    "8:00-22:00", "8-22-23", "\uff18-\uff12\uff12", "8 22", "-1-5", "8.5-22",
+                    "100-2"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ik.parse_check_hours(raw)
+                message = str(ctx.exception)
+                self.assertIn("CHECK_HOURS", message)
+                self.assertIn(ik.CONFIG_FILE, message)
+
+    def test_startup_default_override_and_invalid(self):
+        base = "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n"
+            "assert ik.CHECK_HOURS is None, ik.CHECK_HOURS\n"
+            "with open(ik.CONFIG_FILE, 'a', encoding='utf-8') as f:\n"
+            "    f.write('CHECK_HOURS=22-6\\n')\n"
+            "ik.initialize_runtime()\n"
+            "assert ik.CHECK_HOURS == (22, 6), ik.CHECK_HOURS\n"
+            "print('OK')\n",
+            _make_isolated_home(base),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+        result = _run_module_with_env(base + "CHECK_HOURS=8-8\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CHECK_HOURS", result.stderr)
+
+
+class TestCheckHoursWindow(unittest.TestCase):
+    """within_check_hours()/seconds_until_check_hours_open() z wstrzyknietym czasem."""
+
+    def _at(self, hour, minute=0, second=0, day=10):
+        return ik.datetime(2024, 1, day, hour, minute, second)
+
+    def _window(self, window):
+        patcher = mock.patch.object(ik, "CHECK_HOURS", window)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_no_limit(self):
+        self._window(None)
+        self.assertTrue(ik.within_check_hours(self._at(3)))
+        self.assertEqual(ik.seconds_until_check_hours_open(self._at(3)), 0.0)
+        self.assertEqual(ik.format_check_hours(), "bez ograniczen")
+
+    def test_day_window(self):
+        self._window((8, 22))
+        self.assertEqual(ik.format_check_hours(), "8:00-22:00")
+        for (hour, minute), expected in ((( 7, 59), False), ((8, 0), True), ((21, 59), True),
+                                         ((22, 0), False), ((23, 30), False), ((0, 0), False)):
+            with self.subTest(hour=hour, minute=minute):
+                self.assertEqual(ik.within_check_hours(self._at(hour, minute)), expected)
+
+    def test_window_past_midnight(self):
+        self._window((22, 6))
+        for (hour, minute), expected in (((21, 59), False), ((22, 0), True), ((23, 59), True),
+                                         ((0, 0), True), ((5, 59), True), ((6, 0), False),
+                                         ((12, 0), False)):
+            with self.subTest(hour=hour, minute=minute):
+                self.assertEqual(ik.within_check_hours(self._at(hour, minute)), expected)
+
+    def test_always_and_edge_hours(self):
+        self._window((0, 24))
+        self.assertTrue(all(ik.within_check_hours(self._at(h, 30)) for h in range(24)))
+        self._window((24, 6))
+        self.assertTrue(ik.within_check_hours(self._at(0)))
+        self.assertTrue(ik.within_check_hours(self._at(5, 59)))
+        self.assertFalse(ik.within_check_hours(self._at(6)))
+        self.assertFalse(ik.within_check_hours(self._at(23, 59)))
+        self._window((22, 0))
+        self.assertTrue(ik.within_check_hours(self._at(23, 59)))
+        self.assertFalse(ik.within_check_hours(self._at(0)))
+        self.assertFalse(ik.within_check_hours(self._at(21)))
+
+    def test_seconds_until_open(self):
+        cases = (
+            ((8, 22), self._at(23), 9 * 3600),
+            ((8, 22), self._at(7, 30), 1800),
+            ((8, 22), self._at(22), 10 * 3600),
+            ((8, 22), self._at(7, 59, 59), 1),
+            ((8, 22), self._at(12), 0),
+            ((22, 6), self._at(12), 10 * 3600),
+            ((22, 6), self._at(6), 16 * 3600),
+            ((24, 6), self._at(7), 17 * 3600),
+            ((0, 24), self._at(3), 0),
+        )
+        for window, now, expected in cases:
+            with self.subTest(window=window, now=now):
+                self._window(window)
+                self.assertEqual(ik.seconds_until_check_hours_open(now), expected)
+
+    def test_seconds_until_open_respects_dst_change(self):
+        # Polski czas z regula zmiany (bez tzdata): 31.03.2024 o 2:00 -> 3:00,
+        # wiec od 1:00 do 8:00 mija 6 h, a nie 7 h.
+        result = _run_python_code(
+            "import time\ntime.tzset()\n"
+            "import ikea_okazje as ik\n"
+            "ik.CHECK_HOURS = (8, 22)\n"
+            "print(ik.seconds_until_check_hours_open(ik.datetime(2024, 3, 31, 1, 0)))\n",
+            _make_isolated_home(None),
+            extra_env={"TZ": "CET-1CEST,M3.5.0,M10.5.0/3"},
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(float(result.stdout.strip()), 6 * 3600)
+
+
+class TestCheckHoursCron(unittest.TestCase):
+    """main() w trybie cron poza CHECK_HOURS: bez zapytania do IKEA, kod 0,
+    komendy Telegrama obsluzone wczesniej; /sprawdz omija okno."""
+
+    def setUp(self):
+        self._orig_backoff = ik.get_blocking_backoff_state().to_dict()
+        self._orig_health = ik.get_health_state()
+        ik.set_blocking_backoff_state(ik.BackoffState())
+        ik.FORCE_CHECK_REQUESTED.clear()
+        self.addCleanup(ik.FORCE_CHECK_REQUESTED.clear)
+        for patcher in (
+            mock.patch.object(ik, "initialize_runtime"),
+            mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"),
+            mock.patch.object(ik, "RUN_MODE", "cron"),
+            mock.patch.object(ik, "CHECK_HOURS", (8, 22)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_backoff))
+        ik.set_health_state(self._orig_health)
+
+    def _main(self, within, telegram=None):
+        calls = []
+        with mock.patch.object(ik, "within_check_hours", return_value=within), \
+             mock.patch.object(ik, "seconds_until_check_hours_open", return_value=0 if within else 3600), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", telegram is not None), \
+             mock.patch.object(ik, "handle_telegram_updates",
+                               side_effect=lambda: (calls.append("telegram"), telegram and telegram())), \
+             mock.patch.object(ik, "fetch_store_offers") as mock_fetch, \
+             mock.patch.object(ik, "run_ikea_check_cycle",
+                               side_effect=lambda: calls.append("cycle") or 0), \
+             mock.patch.object(ik, "send_forced_check_summary",
+                               side_effect=lambda: calls.append("summary")), \
+             mock.patch.object(ik, "log") as mock_log:
+            result = ik.main()
+        mock_fetch.assert_not_called()
+        messages = [str(call.args[0]) for call in mock_log.call_args_list]
+        return result, calls, messages
+
+    def test_outside_window_skips_without_ikea_request(self):
+        result, calls, messages = self._main(within=False, telegram=lambda: None)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["telegram"])
+        skip_logs = [m for m in messages if "Poza oknem" in m]
+        self.assertEqual(len(skip_logs), 1)
+        self.assertIn("8:00-22:00", skip_logs[0])
+        self.assertIn(ik.format_local_timestamp(time.time() + 3600)[:13], skip_logs[0])
+
+    def test_outside_window_leaves_health_unchanged(self):
+        preset = ik.default_health_state()
+        preset.update(consecutive_failed_cycles=2, last_error="x")
+        ik.set_health_state(preset)
+        self._main(within=False)
+        self.assertEqual(ik.get_health_state(), preset)
+
+    def test_inside_window_runs_cycle(self):
+        result, calls, _ = self._main(within=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["cycle"])
+
+    def test_forced_request_overrides_window(self):
+        result, calls, messages = self._main(
+            within=False, telegram=ik.FORCE_CHECK_REQUESTED.set
+        )
+        self.assertEqual(calls, ["telegram", "cycle", "summary"])
+        self.assertFalse(any("Poza oknem" in m for m in messages))
+
+    def test_backoff_skip_still_applies(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=429, next_allowed_check_at=time.time() + 600,
+        ))
+        result, calls, _ = self._main(within=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [])
+
+
+class TestCheckHoursDaemon(_ForcedCheckStateTestCase):
+    """run_daemon() z CHECK_HOURS: termin w zamknietym oknie czeka na jego
+    otwarcie (jeden log na zamkniecie), long poll liczony do otwarcia okna,
+    /sprawdz omija okno. Okno symulowane na zegarze testu."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": 1000.0}
+        self.open_intervals = [(1300.0, 1400.0), (2000.0, float("inf"))]
+        self.polls = []
+        self.waits = []
+        self.cycles = []
+        self.stop_after_cycles = 1
+        for patcher in (
+            mock.patch.object(ik, "install_shutdown_signal_handlers"),
+            mock.patch.object(ik, "TELEGRAM_ENABLED", True),
+            mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 25),
+            mock.patch.object(ik, "TELEGRAM_POLL_INTERVAL_SECONDS", 15),
+            mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 90),
+            mock.patch.object(ik, "CHECK_INTERVAL_JITTER_PERCENT", 0),
+            mock.patch.object(ik, "CHECK_HOURS", (8, 22)),
+            mock.patch.object(ik, "within_check_hours", side_effect=self._within),
+            mock.patch.object(ik, "seconds_until_check_hours_open", side_effect=self._until_open),
+            mock.patch.object(ik.time, "monotonic", side_effect=lambda: self.clock["t"]),
+            mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=self._fake_wait),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _within(self, now=None):
+        return any(start <= self.clock["t"] < end for start, end in self.open_intervals)
+
+    def _until_open(self, now=None):
+        if self._within():
+            return 0.0
+        return min(start - self.clock["t"] for start, _ in self.open_intervals
+                   if start > self.clock["t"])
+
+    def _fake_wait(self, timeout):
+        self.waits.append(timeout)
+        self.clock["t"] += timeout
+        if len(self.waits) > 500:
+            ik.SHUTDOWN_EVENT.set()  # bezpiecznik testu
+        return ik.SHUTDOWN_EVENT.is_set()
+
+    def _poll(self, long_poll_seconds=0):
+        self.polls.append(long_poll_seconds)
+        self.clock["t"] += long_poll_seconds
+
+    def _cycle(self):
+        self.cycles.append(self.clock["t"])
+        if len(self.cycles) >= self.stop_after_cycles:
+            ik.SHUTDOWN_EVENT.set()
+        return 0
+
+    def _run(self, poll=None):
+        with mock.patch.object(ik, "handle_telegram_updates", side_effect=poll or self._poll), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=self._cycle), \
+             mock.patch.object(ik, "send_forced_check_summary"), \
+             mock.patch.object(ik, "log") as mock_log:
+            self.assertEqual(ik.run_daemon(), 0)
+        messages = [str(call.args[0]) for call in mock_log.call_args_list]
+        return [m for m in messages if "Poza oknem" in m]
+
+    def test_due_check_waits_for_window_with_full_long_polls(self):
+        closed_logs = self._run()
+        self.assertEqual(self.cycles, [1300.0])
+        # Bez poprawki po terminie (1090) bylyby zapytania z timeoutem 0-1 s.
+        self.assertEqual(self.polls, [25] * 12)
+        self.assertEqual(len(closed_logs), 1)
+        self.assertIn("8:00-22:00", closed_logs[0])
+
+    def test_closed_window_logged_once_per_closing(self):
+        self.stop_after_cycles = 3
+        closed_logs = self._run()
+        self.assertEqual(self.cycles, [1300.0, 1390.0, 2000.0])
+        self.assertEqual(len(closed_logs), 2)
+        # 15 - do terminu w otwartym oknie (1390); 10 - do otwarcia o 2000.
+        self.assertEqual(self.polls, [25] * 15 + [15] + [25] * 24 + [10])
+
+    def test_forced_request_runs_outside_window(self):
+        def poll(long_poll_seconds=0):
+            self._poll(long_poll_seconds)
+            if len(self.polls) == 2:
+                ik.FORCE_CHECK_REQUESTED.set()
+
+        closed_logs = self._run(poll)
+        self.assertEqual(self.cycles, [1050.0])
+        self.assertEqual(closed_logs, [])
+
+    def test_without_telegram_waits_poll_interval(self):
+        with mock.patch.object(ik, "TELEGRAM_ENABLED", False):
+            closed_logs = self._run()
+        self.assertEqual(self.cycles, [1300.0])
+        self.assertEqual(set(self.waits), {15})
+        self.assertEqual(len(closed_logs), 1)
+
+    def test_startup_log_mentions_window(self):
+        with mock.patch.object(ik, "handle_telegram_updates", side_effect=self._poll), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=self._cycle), \
+             mock.patch.object(ik, "log") as mock_log:
+            ik.run_daemon()
+        self.assertIn("okno CHECK_HOURS: 8:00-22:00", mock_log.call_args_list[0].args[0])
+
+
+class TestCheckHoursStatus(unittest.TestCase):
+    def test_status_shows_window(self):
+        with mock.patch.object(ik, "CHECK_HOURS", None):
+            self.assertIn("Okno sprawdzania (CHECK_HOURS): bez ograniczen", ik.format_status_message())
+        with mock.patch.object(ik, "CHECK_HOURS", (8, 22)), \
+             mock.patch.object(ik, "within_check_hours", return_value=True):
+            self.assertIn(
+                "Okno sprawdzania (CHECK_HOURS): 8:00-22:00 - teraz otwarte",
+                ik.format_status_message(),
+            )
+        with mock.patch.object(ik, "CHECK_HOURS", (22, 6)), \
+             mock.patch.object(ik, "within_check_hours", return_value=False), \
+             mock.patch.object(ik, "seconds_until_check_hours_open", return_value=0):
+            self.assertIn(
+                "Okno sprawdzania (CHECK_HOURS): 22:00-6:00 - teraz zamkniete, otwarcie ",
+                ik.format_status_message(),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
