@@ -469,7 +469,9 @@ python3 -m unittest tests/test_ikea_okazje.py
 ```
 
 Standardowy `unittest`, bez sieci, bez `.env` użytkownika (testy izolują
-`HOME` we własnym tymczasowym katalogu).
+`HOME` we własnym tymczasowym katalogu). GitHub Actions
+(`.github/workflows/tests.yml`) uruchamia je przy każdym pushu i pull
+requeście na Pythonie 3.10, 3.12 i 3.13.
 
 ## Stan dostawy per kanał
 
