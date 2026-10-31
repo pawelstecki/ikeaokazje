@@ -237,6 +237,7 @@ Wiadomości e-mail używają analogicznego grupowania.
 /usunsklep <ID>      - usuń sklep z monitoringu
 /status              - sklepy/słowa/numery/filtry i stan sprawdzania
 /oferty              - dopasowania z ostatniego sprawdzenia
+/sprawdz             - sprawdź oferty teraz (najczęściej co 5 min)
 /pomoc               - lista komend
 ```
 
@@ -256,6 +257,28 @@ w jednej wiadomości: produkty, które się nie zmieszczą, są tylko
 policzone („... i jeszcze N produktow”), a przy produkcie z wieloma
 sztukami widać najwyżej 10 linków.
 
+`/sprawdz` (albo `/check`) sprawdza oferty od razu, bez czekania na
+kolejny cykl. Bot odpowiada od razu, a po sprawdzeniu wysyła jedną
+krótką wiadomość z wynikiem (liczba dopasowań i nowych ofert albo błąd);
+powiadomienia o nowych ofertach idą osobno, jak zwykle. Żeby nie
+zwiększać ruchu do IKEA:
+
+- w trakcie backoffu po 403/429 komenda niczego nie uruchamia, tylko
+  podaje, do kiedy trwa backoff;
+- od startu poprzedniego sprawdzenia (zwykłego albo na żądanie) musi
+  minąć co najmniej 5 minut (`MIN_CHECK_INTERVAL_SECONDS` w kodzie) -
+  inaczej bot podaje, od kiedy będzie można; czas startu każdego
+  sprawdzenia jest zapisywany w `~/.ikea_okazje_dynamic.json`, więc
+  limit działa też między uruchomieniami z crona;
+- kolejne `/sprawdz`, zanim pierwsze się wykona, nie planuje drugiego
+  sprawdzenia.
+
+W trybie `daemon` sprawdzenie rusza zaraz po odebraniu komendy, a kolejne
+zwykłe sprawdzenie jest planowane od tej chwili (co
+`CHECK_INTERVAL_SECONDS`). W trybie `cron` komenda zadziała przy
+najbliższym uruchomieniu skryptu - sprawdzenie i tak by się wtedy
+odbyło, `/sprawdz` dodaje tylko wiadomość z wynikiem.
+
 Bot reaguje tylko na wiadomości z `TELEGRAM_CHAT_ID` z `.env` - inni
 nadawcy są ignorowani. Komenda z nazwą bota (np. `/status@MojBot`, tak
 wysyła ją Telegram w grupach) działa tak samo jak `/status`. Edycja
@@ -266,7 +289,9 @@ nową wiadomość.
 
 - `~/.ikea_okazje_dynamic.json` - aktywne sklepy, słowa i numery
   artykułów (źródło prawdy po pierwszym starcie, patrz wyżej), plus stan
-  backoffu, alertu dostępu i alertu o awarii monitora (opisane niżej).
+  backoffu, alertu dostępu i alertu o awarii monitora (opisane niżej)
+  oraz czas startu ostatniego sprawdzenia (`"last_check_started_at"`,
+  limit dla `/sprawdz`).
 - `~/.ikea_okazje_seen_offers.json` - identyfikatory już znanych ofert,
   aby nie zgłaszać ich ponownie. Nowe oferty są dopisywane do tego pliku
   wyłącznie wtedy, gdy wszystkie włączone kanały (e-mail, cała seria

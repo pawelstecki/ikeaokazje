@@ -6113,8 +6113,9 @@ class _LastMatchesTestCase(unittest.TestCase):
             return json.load(f)
 
 
-class TestLastMatchesWrittenByCycle(_LastMatchesTestCase):
-    """_run_check_cycle() zapisuje dopasowania, gdy pobral choc jeden sklep."""
+class _CycleTestCase(_LastMatchesTestCase):
+    """Prawdziwy run_ikea_check_cycle() ze zmockowanym pobieraniem sklepow
+    i kanalami (sklepy 100 i 200, slowo 'stol')."""
 
     def setUp(self):
         super().setUp()
@@ -6146,6 +6147,10 @@ class TestLastMatchesWrittenByCycle(_LastMatchesTestCase):
             product["heroImage"] = "https://www.ikea.com/x.jpg"
             return [product, _api_product(uuid="u2", title="Krzeslo")]
         return []
+
+
+class TestLastMatchesWrittenByCycle(_CycleTestCase):
+    """_run_check_cycle() zapisuje dopasowania, gdy pobral choc jeden sklep."""
 
     def test_full_cycle_writes_compact_matches(self):
         before = time.time()
@@ -6431,6 +6436,369 @@ class TestStatusCheckInfo(_LastMatchesTestCase):
         health.update(last_error="sklep 100: HTTP 404", consecutive_failed_cycles=1)
         ik.set_health_state(health)
         self.assertNotIn("Alert o awarii", ik.format_status_message())
+
+
+class _ForcedCheckStateTestCase(unittest.TestCase):
+    """Czysta flaga /sprawdz i odtworzenie last_check_started_at/backoffu."""
+
+    def setUp(self):
+        self._orig_started = ik.DYNAMIC_STATE.get("last_check_started_at")
+        self._orig_backoff = ik.get_blocking_backoff_state().to_dict()
+        ik.DYNAMIC_STATE["last_check_started_at"] = None
+        ik.set_blocking_backoff_state(ik.BackoffState())
+        ik.FORCE_CHECK_REQUESTED.clear()
+        ik.SHUTDOWN_EVENT.clear()
+
+    def tearDown(self):
+        ik.FORCE_CHECK_REQUESTED.clear()
+        ik.SHUTDOWN_EVENT.clear()
+        ik.DYNAMIC_STATE["last_check_started_at"] = self._orig_started
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_backoff))
+
+
+class TestForcedCheckRequest(_ForcedCheckStateTestCase):
+    """/sprawdz (/check): flaga tylko poza backoffem, po minimalnym odstepie
+    i bez juz czekajacej prosby."""
+
+    ACCEPTED = "Sprawdzam oferty teraz, wynik przyjdzie w osobnej wiadomosci."
+
+    def test_idle_request_sets_flag_and_replies_immediately(self):
+        self.assertEqual(ik.handle_command("/sprawdz", ""), self.ACCEPTED)
+        self.assertTrue(ik.FORCE_CHECK_REQUESTED.is_set())
+
+    def test_alias_check(self):
+        self.assertEqual(ik.handle_command("/check", ""), self.ACCEPTED)
+        self.assertTrue(ik.FORCE_CHECK_REQUESTED.is_set())
+
+    def test_repeated_request_is_already_scheduled(self):
+        ik.handle_command("/sprawdz", "")
+        reply = ik.handle_command("/sprawdz", "")
+        self.assertIn("juz zaplanowane", reply)
+        self.assertTrue(ik.FORCE_CHECK_REQUESTED.is_set())
+
+    def test_active_backoff_blocks_request(self):
+        deadline = time.time() + 1800
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=429, next_allowed_check_at=deadline,
+        ))
+        reply = ik.handle_command("/sprawdz", "")
+        self.assertFalse(ik.FORCE_CHECK_REQUESTED.is_set())
+        self.assertIn("HTTP 429", reply)
+        self.assertIn(ik.format_local_timestamp(deadline), reply)
+
+    def test_expired_backoff_does_not_block(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() - 1,
+        ))
+        self.assertEqual(ik.handle_command("/sprawdz", ""), self.ACCEPTED)
+
+    def test_min_gap_since_last_check_start(self):
+        now = 1700000000.0
+        ik.DYNAMIC_STATE["last_check_started_at"] = now - 100
+        reply = ik.request_forced_check(now)
+        self.assertFalse(ik.FORCE_CHECK_REQUESTED.is_set())
+        self.assertIn("mniej niz 5 min temu", reply)
+        self.assertIn(ik.format_local_timestamp(now + 200), reply)
+
+        self.assertEqual(ik.request_forced_check(now + 200), self.ACCEPTED)
+        self.assertTrue(ik.FORCE_CHECK_REQUESTED.is_set())
+
+    def test_seconds_until_allowed(self):
+        now = 1700000000.0
+        self.assertEqual(ik.seconds_until_forced_check_allowed(now), 0.0)
+        for started, expected in ((now - 100, 200.0), (now - 300, 0.0), (now - 9999, 0.0),
+                                  (now, 300.0), (now + 3600, 300.0)):
+            with self.subTest(started=started):
+                ik.DYNAMIC_STATE["last_check_started_at"] = started
+                self.assertEqual(ik.seconds_until_forced_check_allowed(now), expected)
+
+    def test_corrupted_start_time_does_not_block(self):
+        for value in ("wczoraj", float("nan"), [1], True):
+            with self.subTest(value=value):
+                ik.FORCE_CHECK_REQUESTED.clear()
+                ik.DYNAMIC_STATE["last_check_started_at"] = value
+                self.assertEqual(ik.request_forced_check(), self.ACCEPTED)
+
+    def test_help_and_docstring_list_command(self):
+        self.assertIn("/sprawdz", ik.format_help_message())
+        self.assertIn("/sprawdz", ik.__doc__)
+
+
+class TestCheckStartPersistence(_CycleTestCase):
+    """last_check_started_at: zapisywany na starcie kazdego prawdziwego
+    pobierania (takze zablokowanego), nie dla cykli pominietych."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_started = ik.DYNAMIC_STATE.get("last_check_started_at")
+        ik.DYNAMIC_STATE["last_check_started_at"] = None
+        self.addCleanup(ik.DYNAMIC_STATE.__setitem__, "last_check_started_at", self._orig_started)
+
+    def test_real_fetch_records_start_on_disk(self):
+        before = time.time()
+        started = {}
+
+        def fetch(store_id):
+            started.setdefault("value", ik.get_last_check_started_at())
+            return []
+
+        self._run(fetch)
+        self.assertGreaterEqual(started["value"], before)
+        self.assertEqual(ik.get_last_check_started_at(), started["value"])
+        self.assertEqual(ik.load_dynamic_state()["last_check_started_at"], started["value"])
+
+    def test_blocked_fetch_is_a_real_attempt(self):
+        self._run(_fetch_all_blocked)
+        self.assertIsNotNone(ik.get_last_check_started_at())
+
+    def test_skipped_cycles_do_not_record(self):
+        ik.STORE_IDS = []
+        self._run(_fetch_ok)
+        self.assertIsNone(ik.get_last_check_started_at())
+
+        ik.STORE_IDS = ["100"]
+        ik.SEARCH_TERMS = []
+        ik.refresh_normalized_terms()
+        self._run(_fetch_ok)
+        self.assertIsNone(ik.get_last_check_started_at())
+
+    def test_save_failure_only_logged(self):
+        with mock.patch.object(ik, "save_dynamic_state", side_effect=OSError("tylko odczyt")), \
+             mock.patch.object(ik, "log") as mock_log:
+            ik.record_check_started(now=1700000000.0)
+        self.assertEqual(ik.get_last_check_started_at(), 1700000000.0)
+        self.assertIn("tylko odczyt", mock_log.call_args.args[0])
+        self.assertTrue(mock_log.call_args.kwargs.get("to_stderr"))
+
+    def test_old_file_migrates_and_corrupted_value_tolerated(self):
+        with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for raw, present in ((None, False), ("wczoraj", True), (1700000000.5, True)):
+            with self.subTest(raw=raw):
+                data.pop("last_check_started_at", None)
+                if present:
+                    data["last_check_started_at"] = raw
+                with open(ik.DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                reloaded = ik.load_dynamic_state()
+                expected = 1700000000.5 if raw == 1700000000.5 else None
+                self.assertEqual(reloaded["last_check_started_at"], expected)
+                self.assertEqual(reloaded["store_ids"], data["store_ids"])
+                with open(ik.DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
+                    self.assertIn("last_check_started_at", json.load(f))
+
+
+class TestForcedCheckSummary(_CycleTestCase):
+    """LAST_CYCLE_SUMMARY z prawdziwego cyklu i tekst podsumowania /sprawdz."""
+
+    def _summary_text(self):
+        return ik.format_forced_check_summary(ik.LAST_CYCLE_SUMMARY)
+
+    def test_counts_matches_and_new_offers(self):
+        self.assertEqual(self._run(self._fetch_product_in_200), 0)
+        self.assertEqual(ik.LAST_CYCLE_SUMMARY["matches"], 1)
+        self.assertEqual(ik.LAST_CYCLE_SUMMARY["new_offers"], 1)
+        self.assertEqual(ik.LAST_CYCLE_SUMMARY["exit_code"], 0)
+        text = self._summary_text()
+        self.assertIn("Sprawdzono: 1 dopasowan, 1 nowych", text)
+        self.assertIn("powiadomienia o nowych ofertach ida osobno", text)
+        self.assertIn("/oferty", text)
+        self.assertNotIn("Uwaga", text)
+
+        self._run(self._fetch_product_in_200)
+        self.assertIn("Sprawdzono: 1 dopasowan, 0 nowych", self._summary_text())
+
+    def test_summary_reset_between_cycles(self):
+        self._run(self._fetch_product_in_200)
+        ik.STORE_IDS = []
+        self._run(_fetch_ok)
+        self.assertIsNone(ik.LAST_CYCLE_SUMMARY["matches"])
+        self.assertEqual(self._summary_text(), "Sprawdzenie pominiete: brak aktywnych sklepow.")
+
+    def test_first_run(self):
+        os.remove(ik.STATE_FILE)
+        self._run(self._fetch_product_in_200)
+        text = self._summary_text()
+        self.assertIn("Sprawdzono: 1 dopasowan, 0 nowych", text)
+        self.assertIn("Pierwsze sprawdzenie", text)
+
+    def test_partial_cycle_lists_failed_stores(self):
+        self._run(_fetch_partial_404)
+        text = self._summary_text()
+        self.assertIn("Sprawdzono: 0 dopasowan, 0 nowych", text)
+        self.assertIn("Uwaga: nie udalo sie pobrac sklepow: Sklep 100 (100).", text)
+
+    def test_all_blocked(self):
+        self._run(_fetch_all_blocked)
+        self.assertIn("IKEA odrzucila zapytania (HTTP 403)", self._summary_text())
+
+    def test_all_failed_shows_escaped_sanitized_error(self):
+        def fetch(store_id):
+            raise RuntimeError(f"HTTP 404 (sklep {store_id}): <html> https://web-api.ikea.com/x")
+
+        self._run(fetch)
+        text = self._summary_text()
+        self.assertTrue(text.startswith("Sprawdzenie nieudane: sklep 100: HTTP 404"), text)
+        self.assertIn("&lt;html&gt;", text)
+        self.assertNotIn("<html>", text)
+        self.assertNotIn("https://", text)
+
+    def test_no_search_criteria(self):
+        ik.SEARCH_TERMS = []
+        ik.refresh_normalized_terms()
+        self._run(_fetch_ok)
+        self.assertEqual(
+            self._summary_text(),
+            "Sprawdzenie pominiete: brak slow kluczowych i numerow artykulow.",
+        )
+
+    def test_channel_failure(self):
+        ik.send_email.side_effect = RuntimeError("smtp down")
+        self.assertEqual(self._run(self._fetch_product_in_200), 2)
+        text = self._summary_text()
+        self.assertIn("Sprawdzono: 1 dopasowan, 1 nowych", text)
+        self.assertIn("Czesc powiadomien nie zostala wyslana", text)
+
+    def test_seen_state_error(self):
+        with open(ik.STATE_FILE, "w", encoding="utf-8") as f:
+            f.write("{uszkodzony")
+        self.assertEqual(self._run(self._fetch_product_in_200), 1)
+        text = self._summary_text()
+        self.assertIn("Sprawdzono: 1 dopasowan, ? nowych", text)
+        self.assertIn("Blad: plik stanu (odczyt)", text)
+
+    def test_unexpected_exception(self):
+        with mock.patch.object(ik, "flatten_matching_offers", side_effect=RuntimeError("<boom>")), \
+             mock.patch.object(ik, "log"):
+            self.assertEqual(self._run(_fetch_ok), 1)
+        self.assertEqual(
+            self._summary_text(),
+            "Sprawdzenie nieudane: nieoczekiwany blad: RuntimeError: &lt;boom&gt;",
+        )
+
+
+class TestForcedCheckDaemon(_ForcedCheckStateTestCase):
+    """run_daemon(): /sprawdz uruchamia cykl od razu, potem harmonogram od
+    nowa; podsumowanie idzie raz, a jego blad jest tylko logowany."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = {"t": 1000.0}
+        self.cycles = []
+        self.polls = 0
+        for patcher in (
+            mock.patch.object(ik, "install_shutdown_signal_handlers"),
+            mock.patch.object(ik, "TELEGRAM_ENABLED", True),
+            mock.patch.object(ik, "TELEGRAM_CHAT_ID", "4242"),
+            mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 25),
+            mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 90),
+            mock.patch.object(ik, "CHECK_INTERVAL_JITTER_PERCENT", 0),
+            mock.patch.object(ik.time, "monotonic", side_effect=lambda: self.clock["t"]),
+            mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=self._fake_wait),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _fake_wait(self, timeout):
+        self.clock["t"] += timeout
+        return ik.SHUTDOWN_EVENT.is_set()
+
+    def _poll(self, long_poll_seconds=0):
+        self.polls += 1
+        if self.polls == 1:
+            self.clock["t"] += 5
+            ik.FORCE_CHECK_REQUESTED.set()  # /sprawdz w pierwszym long pollu
+        else:
+            self.clock["t"] += long_poll_seconds
+        if self.polls > 50:
+            ik.SHUTDOWN_EVENT.set()
+
+    def _cycle(self):
+        self.cycles.append(self.clock["t"])
+        ik.LAST_CYCLE_SUMMARY = dict(ik.new_cycle_summary(), matches=4, new_offers=2, exit_code=0)
+        self.clock["t"] += 3  # czas trwania cyklu
+        if len(self.cycles) == 2:
+            ik.SHUTDOWN_EVENT.set()
+        return 0
+
+    def _run(self, send_side_effect=None):
+        with mock.patch.object(ik, "handle_telegram_updates", side_effect=self._poll), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=self._cycle), \
+             mock.patch.object(ik, "telegram_send_message", side_effect=send_side_effect) as send, \
+             mock.patch.object(ik, "log") as mock_log:
+            self.assertEqual(ik.run_daemon(), 0)
+        return send, mock_log
+
+    def test_forced_cycle_runs_immediately_then_reschedules(self):
+        send, _ = self._run()
+        # Cykl od razu po pollu z /sprawdz, nastepny CHECK_INTERVAL po jego koncu.
+        self.assertEqual(self.cycles, [1005.0, 1008.0 + 90])
+        self.assertFalse(ik.FORCE_CHECK_REQUESTED.is_set())
+        send.assert_called_once()
+        self.assertEqual(send.call_args.kwargs, {"disable_preview": True})
+        self.assertIn("Sprawdzono: 4 dopasowan, 2 nowych", send.call_args.args[0])
+
+    def test_summary_failure_is_logged_and_loop_continues(self):
+        send, mock_log = self._run(send_side_effect=ik.TelegramApiError("HTTP 500"))
+        self.assertEqual(len(self.cycles), 2)
+        send.assert_called_once()
+        stderr_messages = [
+            call.args[0] for call in mock_log.call_args_list if call.kwargs.get("to_stderr")
+        ]
+        self.assertTrue(any("wyniku /sprawdz" in m and "HTTP 500" in m for m in stderr_messages))
+
+
+class TestForcedCheckCron(_ForcedCheckStateTestCase):
+    """main() w trybie cron: /sprawdz z komend przed cyklem daje po cyklu
+    jedno podsumowanie; bez prosby - bez podsumowania."""
+
+    def _main(self, updates, cycle_exit_code=0):
+        def fake_cycle():
+            ik.LAST_CYCLE_SUMMARY = dict(
+                ik.new_cycle_summary(), matches=3, new_offers=1, exit_code=cycle_exit_code
+            )
+            calls.append("cycle")
+            return cycle_exit_code
+
+        calls = []
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_CHAT_ID", "4242"), \
+             mock.patch.object(ik, "RUN_MODE", "cron"), \
+             mock.patch.object(ik, "load_telegram_offset", return_value=0), \
+             mock.patch.object(ik, "save_telegram_offset"), \
+             mock.patch.object(ik, "telegram_get_updates", return_value=updates), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=fake_cycle), \
+             mock.patch.object(ik, "telegram_send_message",
+                               side_effect=lambda text, **kw: calls.append(text)):
+            result = ik.main()
+        return result, calls
+
+    @staticmethod
+    def _command(text):
+        return [{"update_id": 7, "message": {"chat": {"id": 4242}, "text": text}}]
+
+    def test_forced_request_reply_then_cycle_then_summary(self):
+        result, calls = self._main(self._command("/sprawdz"), cycle_exit_code=2)
+        self.assertEqual(result, 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0], TestForcedCheckRequest.ACCEPTED)
+        self.assertEqual(calls[1], "cycle")
+        self.assertIn("Sprawdzono: 3 dopasowan, 1 nowych", calls[2])
+        self.assertFalse(ik.FORCE_CHECK_REQUESTED.is_set())
+
+    def test_no_request_no_summary(self):
+        result, calls = self._main(self._command("/status"))
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], "cycle")
+
+    def test_request_blocked_by_min_gap_runs_regular_cycle_without_summary(self):
+        ik.DYNAMIC_STATE["last_check_started_at"] = time.time() - 60
+        result, calls = self._main(self._command("/sprawdz"))
+        self.assertIn("mniej niz 5 min temu", calls[0])
+        self.assertEqual(calls[1:], ["cycle"])
 
 
 if __name__ == "__main__":

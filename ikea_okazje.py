@@ -17,6 +17,8 @@ Komendy Telegrama (tylko z czatu TELEGRAM_CHAT_ID):
     /status            - pokaz monitorowane slowa/numery/sklepy i stan
                          sprawdzania (ostatnie sprawdzenie, backoff, alert)
     /oferty            - dopasowania z ostatniego sprawdzenia
+    /sprawdz           - sprawdz oferty teraz (nie w trakcie backoffu i nie
+                         czesciej niz co MIN_CHECK_INTERVAL_SECONDS)
     /pomoc             - lista komend
 
 Tryby pracy (RUN_MODE):
@@ -573,6 +575,9 @@ NORMALIZED_EXCLUDE: list = []
 
 # Sygnal zamkniecia trybu daemon; handlery sygnalow instaluje dopiero run_daemon().
 SHUTDOWN_EVENT = threading.Event()
+# Prosba o sprawdzenie ofert od razu (/sprawdz): ustawia handle_command(),
+# konsumuja run_daemon() i main() w trybie cron.
+FORCE_CHECK_REQUESTED = threading.Event()
 
 
 def normalize_text(s: str) -> str:
@@ -664,6 +669,7 @@ def load_dynamic_state() -> dict:
         had_access_notification = "ikea_access_notification" in data
         had_blocking_backoff = "blocking_backoff" in data
         had_health = "health" in data
+        had_last_check_started = "last_check_started_at" in data
         raw_access_notification = data.get("ikea_access_notification")
         had_pending_outage_field = (
             isinstance(raw_access_notification, dict)
@@ -680,6 +686,7 @@ def load_dynamic_state() -> dict:
             "ikea_access_notification": access_notification,
             "blocking_backoff": blocking_backoff,
             "health": migrate_health_state(data.get("health")),
+            "last_check_started_at": _finite_float_or_none(data.get("last_check_started_at")),
         }
         if (
             not had_store_ids
@@ -687,6 +694,7 @@ def load_dynamic_state() -> dict:
             or not had_pending_outage_field
             or not had_blocking_backoff
             or not had_health
+            or not had_last_check_started
             or normalized_article_numbers != raw_article_numbers
         ):
             save_dynamic_state(state)
@@ -698,6 +706,7 @@ def load_dynamic_state() -> dict:
         "ikea_access_notification": default_access_notification_state(),
         "blocking_backoff": default_blocking_backoff_state_dict(),
         "health": default_health_state(),
+        "last_check_started_at": None,
     }
     save_dynamic_state(state)
     return state
@@ -743,6 +752,22 @@ def set_health_state(state: dict) -> None:
     nieudanych cykli ani nie powtarzal wyslanego alertu."""
     DYNAMIC_STATE["health"] = migrate_health_state(state)
     save_dynamic_state(DYNAMIC_STATE)
+
+
+def get_last_check_started_at() -> "float | None":
+    """Start ostatniego prawdziwego sprawdzenia IKEA (czas scienny) albo None."""
+    return _finite_float_or_none(DYNAMIC_STATE.get("last_check_started_at"))
+
+
+def record_check_started(now=None) -> None:
+    """Zapisuje start prawdziwego sprawdzenia - minimalny odstep /sprawdz
+    obowiazuje tez miedzy uruchomieniami cron. Blad zapisu tylko w logu:
+    wartosc w pamieci i tak chroni ten proces."""
+    DYNAMIC_STATE["last_check_started_at"] = time.time() if now is None else now
+    try:
+        save_dynamic_state(DYNAMIC_STATE)
+    except OSError as exc:
+        log(f"Blad zapisu czasu startu sprawdzenia: {exception_text(exc)}", to_stderr=True)
 
 
 def save_dynamic_state(state: dict) -> None:
@@ -2386,6 +2411,7 @@ def format_help_message() -> str:
         "/usunsklep &lt;ID&gt; - usun sklep z monitoringu\n"
         "/status - pokaz aktualny monitoring i stan sprawdzania\n"
         "/oferty - dopasowania z ostatniego sprawdzenia\n"
+        f"/sprawdz - sprawdz oferty teraz (najczesciej co {MIN_CHECK_INTERVAL_SECONDS // 60} min)\n"
         "/pomoc - ta lista"
     )
 
@@ -2490,6 +2516,9 @@ def handle_command(cmd: str, arg: str) -> str:
 
     if cmd in ("/oferty", "/offers"):
         return format_last_matches_message()
+
+    if cmd in ("/sprawdz", "/check"):
+        return request_forced_check()
 
     if cmd in ("/pomoc", "/help", "/start"):
         return format_help_message()
@@ -2684,6 +2713,26 @@ def _enabled_channels() -> list:
     return channels
 
 
+def new_cycle_summary() -> dict:
+    """Puste podsumowanie cyklu. matches/new_offers zostaja None, dopoki
+    cykl nie policzy dopasowan."""
+    return {
+        "exit_code": None,
+        "outcome": None,
+        "error": None,
+        "skip_reason": None,
+        "blocked_status_code": None,
+        "failed_store_ids": [],
+        "matches": None,
+        "new_offers": None,
+        "first_run": False,
+    }
+
+
+# Podsumowanie ostatniego cyklu (run_ikea_check_cycle()) dla wiadomosci po /sprawdz.
+LAST_CYCLE_SUMMARY: dict = new_cycle_summary()
+
+
 def run_ikea_check_cycle() -> int:
     """Jeden cykl: pobranie ofert, backoff i alert o dostepie, dostawa per
     kanal, a na koncu jedna aktualizacja bloku 'health' (alert o dluzszej
@@ -2692,7 +2741,10 @@ def run_ikea_check_cycle() -> int:
 
     Kod wyjscia: 0 - sukces/brak nowych ofert; 1 - zaden sklep nie pobrany,
     blad odczytu stanu albo nieoczekiwany blad; 2 - ktorys kanal zawiodl
-    (postep zapisany); 3 - blad zapisu pliku stanu."""
+    (postep zapisany); 3 - blad zapisu pliku stanu. Podsumowanie cyklu
+    (dla /sprawdz) zostaje w LAST_CYCLE_SUMMARY."""
+    global LAST_CYCLE_SUMMARY
+    LAST_CYCLE_SUMMARY = new_cycle_summary()
     try:
         exit_code, outcome, error_description = _run_check_cycle()
     except Exception as exc:
@@ -2703,6 +2755,7 @@ def run_ikea_check_cycle() -> int:
         )
         exit_code, outcome = 1, CYCLE_UNHEALTHY
         error_description = f"nieoczekiwany blad: {type(exc).__name__}: {exc}"
+    LAST_CYCLE_SUMMARY.update(exit_code=exit_code, outcome=outcome, error=error_description)
 
     try:
         update_health_state(outcome, error_description)
@@ -2726,16 +2779,23 @@ def _run_check_cycle() -> tuple:
     brakujacych; do 'seen' oferta trafia po dostarczeniu wszystkimi
     aktywnymi kanalami. Bledy kanalow (kod 2) nie psuja wyniku - alert i
     tak nie mialby jak dojsc."""
+    summary = LAST_CYCLE_SUMMARY
     if not SEARCH_TERMS and not SEARCH_ARTICLE_NUMBERS:
         log(
             "Brak aktywnych slow kluczowych i numerow artykulow - "
             "monitoring ofert jest wstrzymany."
         )
+        summary["skip_reason"] = "brak slow kluczowych i numerow artykulow"
         return 0, CYCLE_SKIPPED, None
 
     # Jeden profil klienta na caly cykl (wszystkie strony i sklepy).
     global CURRENT_CLIENT_PROFILE
     CURRENT_CLIENT_PROFILE = choose_client_profile()
+
+    if STORE_IDS:
+        record_check_started()
+    else:
+        summary["skip_reason"] = "brak aktywnych sklepow"
 
     try:
         content, store_errors = fetch_all_offers()
@@ -2744,6 +2804,7 @@ def _run_check_cycle() -> tuple:
         return 1, CYCLE_UNHEALTHY, f"blad zapytania do API: {exception_text(exc)}"
 
     update_blocking_backoff_state(store_errors)
+    summary["failed_store_ids"] = [str(store_id) for store_id in store_errors]
 
     # Alert o dostepie dziala w cron i daemon (stan jest trwaly).
     if not STORE_IDS:
@@ -2755,6 +2816,7 @@ def _run_check_cycle() -> tuple:
             exc.status_code for exc in store_errors.values()
             if isinstance(exc, BlockedByServerError)
         })[-1]
+        summary["blocked_status_code"] = blocked_status_code
         handle_access_notification_state(True, blocked_status_code)
         # Pelna blokada ma wlasny alert o dostepie - bez podwojnego alertu.
         fetch_outcome, fetch_error = CYCLE_SKIPPED, None
@@ -2784,6 +2846,7 @@ def _run_check_cycle() -> tuple:
     if STORE_IDS:
         # Tu co najmniej jeden sklep jest pobrany - jest co pokazac w /oferty.
         record_last_matches(matching_offers, list(store_errors))
+        summary["matches"] = len(matching_offers)
     current_uuids = {o["offer_uuid"] for o in matching_offers if o.get("offer_uuid")}
 
     try:
@@ -2812,6 +2875,7 @@ def _run_check_cycle() -> tuple:
             "Pierwsze uruchomienie: zapisano stan bez wysylania alertu. "
             f"Znaleziono dopasowan: {len(matching_offers)}."
         )
+        summary.update(new_offers=0, first_run=True)
         return 0, fetch_outcome, fetch_error
 
     # Oferty znikniete z API wypadaja z pending - tylko przy komplecie
@@ -2838,6 +2902,7 @@ def _run_check_cycle() -> tuple:
         remaining = active_channels_set - delivered_so_far
         if remaining:
             new_offers.append(o)
+    summary["new_offers"] = len(new_offers)
 
     any_channel_failed = False
     if new_offers:
@@ -2948,6 +3013,110 @@ def log_cron_backoff_skip(remaining_seconds: float) -> None:
     )
 
 
+# ---------------- /sprawdz - SPRAWDZENIE NA ZADANIE ----------------
+
+def seconds_until_forced_check_allowed(now_wall_clock=None) -> float:
+    """Ile sekund do konca MIN_CHECK_INTERVAL_SECONDS od startu ostatniego
+    sprawdzenia (0 - wolno). Start "w przyszlosci" (cofniety zegar) blokuje
+    najwyzej na pelny odstep, nie na godziny."""
+    last_started = get_last_check_started_at()
+    if last_started is None:
+        return 0.0
+    now_wall_clock = time.time() if now_wall_clock is None else now_wall_clock
+    remaining = MIN_CHECK_INTERVAL_SECONDS - (now_wall_clock - last_started)
+    return min(float(MIN_CHECK_INTERVAL_SECONDS), max(0.0, remaining))
+
+
+def request_forced_check(now_wall_clock=None) -> str:
+    """Obsluga /sprawdz: ustawia FORCE_CHECK_REQUESTED, chyba ze trwa
+    backoff po 403/429, od startu ostatniego sprawdzenia minelo mniej niz
+    MIN_CHECK_INTERVAL_SECONDS albo prosba juz czeka. Zwraca odpowiedz."""
+    if FORCE_CHECK_REQUESTED.is_set():
+        return "Sprawdzenie ofert jest juz zaplanowane - wynik przyjdzie w osobnej wiadomosci."
+    now_wall_clock = time.time() if now_wall_clock is None else now_wall_clock
+    if blocking_backoff_active(now_wall_clock) is not None:
+        backoff = get_blocking_backoff_state()
+        code_txt = (
+            f"HTTP {backoff.last_status_code}" if backoff.last_status_code is not None
+            else "HTTP 403/429"
+        )
+        return (
+            f"IKEA ograniczyla zapytania ({code_txt}) - trwa backoff, sprawdzenie "
+            f"bedzie mozliwe po {format_local_timestamp(backoff.next_allowed_check_at)}."
+        )
+    wait_seconds = seconds_until_forced_check_allowed(now_wall_clock)
+    if wait_seconds > 0:
+        return (
+            "Ostatnie sprawdzenie ofert zaczelo sie mniej niz "
+            f"{MIN_CHECK_INTERVAL_SECONDS // 60} min temu - /sprawdz bedzie mozliwe po "
+            f"{format_local_timestamp(now_wall_clock + wait_seconds)}."
+        )
+    FORCE_CHECK_REQUESTED.set()
+    log("Telegram: zadanie sprawdzenia ofert od razu (/sprawdz).")
+    return "Sprawdzam oferty teraz, wynik przyjdzie w osobnej wiadomosci."
+
+
+def _escaped_error_text(error) -> str:
+    """Opis bledu do wiadomosci Telegrama: bez sekretow i URL, escapowany."""
+    return escape_html(sanitize_error_description(error or "nieznany blad"))
+
+
+def format_forced_check_summary(summary: dict) -> str:
+    """Krotkie podsumowanie cyklu na zadanie (LAST_CYCLE_SUMMARY)."""
+    if summary.get("skip_reason"):
+        return f"Sprawdzenie pominiete: {escape_html(summary['skip_reason'])}."
+    if summary.get("blocked_status_code") is not None:
+        return (
+            f"Sprawdzenie nieudane: IKEA odrzucila zapytania "
+            f"(HTTP {summary['blocked_status_code']}). Kolejna proba po backoffie - "
+            "szczegoly w /status."
+        )
+    if summary.get("matches") is None:
+        return f"Sprawdzenie nieudane: {_escaped_error_text(summary.get('error'))}"
+
+    new_offers = summary.get("new_offers")
+    new_txt = "?" if new_offers is None else str(new_offers)
+    lines = [
+        f"Sprawdzono: {summary['matches']} dopasowan, {new_txt} nowych (powiadomienia "
+        "o nowych ofertach ida osobno). Lista: /oferty"
+    ]
+    if summary.get("first_run"):
+        lines.append("Pierwsze sprawdzenie: obecne oferty zapisano jako znane, bez powiadomien.")
+    if summary.get("failed_store_ids"):
+        lines.append(
+            "Uwaga: nie udalo sie pobrac sklepow: "
+            f"{_store_list_text(summary['failed_store_ids'])}."
+        )
+    exit_code = summary.get("exit_code")
+    if exit_code == 2:
+        lines.append("Czesc powiadomien nie zostala wyslana - szczegoly w logach.")
+    elif exit_code not in (0, None):
+        lines.append(f"Blad: {_escaped_error_text(summary.get('error'))}")
+    return "\n".join(lines)
+
+
+def send_forced_check_summary() -> None:
+    """Wysyla podsumowanie cyklu na TELEGRAM_CHAT_ID; blad tylko w logu."""
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        telegram_send_message(
+            format_forced_check_summary(LAST_CYCLE_SUMMARY), disable_preview=True
+        )
+    except Exception as exc:
+        log(f"Nie udalo sie wyslac wyniku /sprawdz: {exception_text(exc)}", to_stderr=True)
+
+
+def run_check_cycle_now(forced: bool) -> int:
+    """Cykl IKEA; po cyklu na zadanie (/sprawdz) idzie jego podsumowanie."""
+    if forced:
+        log("Sprawdzanie ofert na zadanie (/sprawdz).")
+    exit_code = run_ikea_check_cycle()
+    if forced:
+        send_forced_check_summary()
+    return exit_code
+
+
 def telegram_long_poll_timeout(seconds_until_check: float) -> int:
     """Timeout long pollingu: TELEGRAM_LONG_POLL_SECONDS, ale nie dluzej niz
     do nastepnego sprawdzenia IKEA (w gore do pelnej sekundy), zeby
@@ -3013,8 +3182,11 @@ def run_daemon() -> int:
         if SHUTDOWN_EVENT.is_set():
             break
 
-        if time.monotonic() - last_ikea_check_monotonic >= next_check_interval:
-            run_ikea_check_cycle()
+        # /sprawdz uruchamia cykl od razu; harmonogram liczy sie potem od nowa.
+        forced = FORCE_CHECK_REQUESTED.is_set()
+        if forced or time.monotonic() - last_ikea_check_monotonic >= next_check_interval:
+            FORCE_CHECK_REQUESTED.clear()
+            run_check_cycle_now(forced)
             # Znacznik po cyklu, zeby czas pobierania nie skracal interwalu.
             last_ikea_check_monotonic = time.monotonic()
 
@@ -3086,7 +3258,10 @@ def main() -> int:
         log_cron_backoff_skip(remaining)
         return 0
 
-    return run_ikea_check_cycle()
+    # /sprawdz z komend wyzej: ten sam cykl, plus podsumowanie na Telegramie.
+    forced = FORCE_CHECK_REQUESTED.is_set()
+    FORCE_CHECK_REQUESTED.clear()
+    return run_check_cycle_now(forced)
 
 
 if __name__ == "__main__":
