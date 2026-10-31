@@ -551,7 +551,7 @@ class TestGracefulShutdown(unittest.TestCase):
     def test_no_new_cycle_started_after_shutdown_event_set_mid_loop(self):
         call_count = {"n": 0}
 
-        def fake_handle_telegram_updates():
+        def fake_handle_telegram_updates(long_poll_seconds=0):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 # Sygnal "przychodzi" tuz po pierwszej obslugie komend
@@ -5694,6 +5694,250 @@ class TestTelegramLinkPreview(unittest.TestCase):
             errors = ik.notify_status_message("temat", "tresc", "tresc telegram")
         self.assertEqual(errors, [])
         send.assert_called_once_with("tresc telegram", disable_preview=True)
+
+
+class TestTelegramLongPollConfig(unittest.TestCase):
+    """TELEGRAM_LONG_POLL_SECONDS: liczba calkowita 0..50, domyslnie 25."""
+
+    def _parse(self, raw):
+        return ik.parse_non_negative_int(
+            raw, "TELEGRAM_LONG_POLL_SECONDS", ik.DEFAULT_TELEGRAM_LONG_POLL_SECONDS,
+            max_value=ik.MAX_TELEGRAM_LONG_POLL_SECONDS,
+        )
+
+    def test_valid_values(self):
+        self.assertEqual(ik.DEFAULT_TELEGRAM_LONG_POLL_SECONDS, 25)
+        self.assertEqual(self._parse(None), 25)
+        self.assertEqual(self._parse(" "), 25)
+        self.assertEqual(self._parse("0"), 0)
+        self.assertEqual(self._parse(" 50 "), 50)
+
+    def test_invalid_values_raise(self):
+        for raw in ("51", "-1", "abc", "2.5", "1e3"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._parse(raw)
+                message = str(ctx.exception)
+                self.assertIn("TELEGRAM_LONG_POLL_SECONDS", message)
+                self.assertIn(ik.CONFIG_FILE, message)
+                self.assertIn("od 0 do 50", message)
+
+    def test_startup_default_and_override(self):
+        base = "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n"
+            "assert ik.TELEGRAM_LONG_POLL_SECONDS == 25, ik.TELEGRAM_LONG_POLL_SECONDS\n"
+            "import os\n"
+            "with open(ik.CONFIG_FILE, 'a', encoding='utf-8') as f:\n"
+            "    f.write('TELEGRAM_LONG_POLL_SECONDS=0\\n')\n"
+            "ik.initialize_runtime()\n"
+            "assert ik.TELEGRAM_LONG_POLL_SECONDS == 0, ik.TELEGRAM_LONG_POLL_SECONDS\n"
+            "print('OK')\n",
+            _make_isolated_home(base),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_invalid_value_fails_at_startup(self):
+        result = _run_module_with_env(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nTELEGRAM_LONG_POLL_SECONDS=60\n"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TELEGRAM_LONG_POLL_SECONDS", result.stderr)
+
+
+class TestTelegramLongPollRequests(unittest.TestCase):
+    """getUpdates z timeoutem long pollingu i przekazanie go z
+    handle_telegram_updates(); urlopen zmockowany."""
+
+    def setUp(self):
+        patcher = mock.patch.object(ik, "TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _get_updates(self, *args, **kwargs):
+        with mock.patch.object(ik.urllib.request, "urlopen", return_value=_telegram_ok([])) as urlopen:
+            ik.telegram_get_updates(*args, **kwargs)
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        return payload, urlopen.call_args.kwargs["timeout"]
+
+    def test_short_poll_by_default(self):
+        payload, http_timeout = self._get_updates(3)
+        self.assertEqual(payload, {"offset": 3, "timeout": 0})
+        self.assertEqual(http_timeout, ik.REQUEST_TIMEOUT)
+
+    def test_long_poll_timeout_passed_to_api_and_http(self):
+        payload, http_timeout = self._get_updates(3, timeout=25)
+        self.assertEqual(payload, {"offset": 3, "timeout": 25})
+        self.assertEqual(http_timeout, 25 + ik.REQUEST_TIMEOUT)
+
+    def test_handle_updates_passes_long_poll_seconds(self):
+        for kwargs, expected in (({}, 0), ({"long_poll_seconds": 7}, 7)):
+            with self.subTest(kwargs=kwargs):
+                with mock.patch.object(ik, "load_telegram_offset", return_value=11), \
+                     mock.patch.object(ik, "telegram_get_updates", return_value=[]) as get_updates, \
+                     mock.patch.object(ik, "save_telegram_offset") as save_offset:
+                    ik.handle_telegram_updates(**kwargs)
+                get_updates.assert_called_once_with(11, timeout=expected)
+                save_offset.assert_not_called()
+
+    def test_cron_mode_uses_short_poll(self):
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "blocking_backoff_active", return_value=None), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=0), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 25), \
+             mock.patch.object(ik, "RUN_MODE", "cron"), \
+             mock.patch.object(ik, "load_telegram_offset", return_value=0), \
+             mock.patch.object(ik, "telegram_get_updates", return_value=[]) as get_updates:
+            ik.main()
+        get_updates.assert_called_once_with(0, timeout=0)
+
+    def test_long_poll_timeout_bounded_by_next_check(self):
+        with mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 25):
+            self.assertEqual(ik.telegram_long_poll_timeout(1000), 25)
+            self.assertEqual(ik.telegram_long_poll_timeout(25), 25)
+            self.assertEqual(ik.telegram_long_poll_timeout(10.2), 11)
+            self.assertEqual(ik.telegram_long_poll_timeout(0.3), 1)
+            self.assertEqual(ik.telegram_long_poll_timeout(0), 0)
+            self.assertEqual(ik.telegram_long_poll_timeout(-5), 0)
+
+
+class TestDaemonLongPolling(unittest.TestCase):
+    """Petla run_daemon() z long pollingiem: zegar monotoniczny, Telegram,
+    cykl IKEA i SHUTDOWN_EVENT.wait sa zmockowane (bez realnego czekania)."""
+
+    def setUp(self):
+        self._orig_backoff = ik.get_blocking_backoff_state().to_dict()
+        ik.set_blocking_backoff_state(ik.BackoffState())
+        ik.SHUTDOWN_EVENT.clear()
+        self.clock = {"t": 1000.0}
+        self.polls = []
+        self.waits = []
+        self.cycles = []
+        for patcher in (
+            mock.patch.object(ik, "install_shutdown_signal_handlers"),
+            mock.patch.object(ik, "TELEGRAM_ENABLED", True),
+            mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 25),
+            mock.patch.object(ik, "TELEGRAM_POLL_INTERVAL_SECONDS", 15),
+            mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 90),
+            mock.patch.object(ik, "CHECK_INTERVAL_JITTER_PERCENT", 0),
+            mock.patch.object(ik.time, "monotonic", side_effect=lambda: self.clock["t"]),
+            mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=self._fake_wait),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_backoff))
+        ik.SHUTDOWN_EVENT.clear()
+
+    def _fake_wait(self, timeout):
+        self.waits.append(timeout)
+        self.clock["t"] += timeout
+        if len(self.waits) > 50:
+            ik.SHUTDOWN_EVENT.set()  # bezpiecznik testu
+        return ik.SHUTDOWN_EVENT.is_set()
+
+    def _poll_taking(self, seconds_fn):
+        def fake_poll(long_poll_seconds=0):
+            self.polls.append(long_poll_seconds)
+            self.clock["t"] += seconds_fn(long_poll_seconds)
+        return fake_poll
+
+    def _cycle_then_stop(self):
+        self.cycles.append(self.clock["t"])
+        ik.SHUTDOWN_EVENT.set()
+        return 0
+
+    def _run(self, poll, cycle=None):
+        with mock.patch.object(ik, "handle_telegram_updates", side_effect=poll), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=cycle or self._cycle_then_stop), \
+             mock.patch.object(ik, "log") as mock_log:
+            result = ik.run_daemon()
+        self.assertEqual(result, 0)
+        return " ".join(str(call.args[0]) for call in mock_log.call_args_list)
+
+    def test_poll_timeout_bounded_by_next_ikea_check(self):
+        self._run(self._poll_taking(lambda timeout: timeout))
+        self.assertEqual(self.polls, [25, 25, 25, 15])
+        self.assertEqual(self.cycles, [1090.0])
+        # Po udanym long pollu bez pelnego TELEGRAM_POLL_INTERVAL_SECONDS.
+        self.assertEqual(self.waits, [0.0] * 4)
+
+    def test_quick_poll_response_waits_short_minimum(self):
+        def poll(long_poll_seconds=0):
+            self.polls.append(long_poll_seconds)
+            self.clock["t"] += 0.25
+            if len(self.polls) == 3:
+                ik.SHUTDOWN_EVENT.set()
+
+        self._run(poll)
+        self.assertEqual(self.polls, [25, 25, 25])
+        self.assertEqual(len(self.waits), 2)
+        for timeout in self.waits:
+            self.assertAlmostEqual(timeout, ik.TELEGRAM_LONG_POLL_MIN_INTERVAL_SECONDS - 0.25)
+        self.assertEqual(self.cycles, [])
+
+    def test_due_check_polls_with_zero_timeout_then_short_wait(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() - 10,
+        ))
+        self._run(self._poll_taking(lambda timeout: 0))
+        self.assertEqual(self.polls, [0])
+        self.assertEqual(self.cycles, [1000.0])
+        self.assertEqual(self.waits, [ik.TELEGRAM_LONG_POLL_MIN_INTERVAL_SECONDS])
+
+    def test_telegram_error_waits_poll_interval(self):
+        def failing_poll(long_poll_seconds=0):
+            self.polls.append(long_poll_seconds)
+            if len(self.polls) == 2:
+                ik.SHUTDOWN_EVENT.set()
+            raise RuntimeError("Telegram API (getUpdates) zwrocilo HTTP 409: Conflict")
+
+        messages = self._run(failing_poll)
+        self.assertEqual(self.waits, [15])
+        self.assertIn("HTTP 409", messages)
+
+    def test_long_poll_disabled_keeps_short_polling(self):
+        with mock.patch.object(ik, "TELEGRAM_LONG_POLL_SECONDS", 0):
+            messages = self._run(self._poll_taking(lambda timeout: 0.1))
+        self.assertTrue(self.polls)
+        self.assertEqual(set(self.polls), {0})
+        self.assertEqual(set(self.waits), {15})
+        self.assertEqual(len(self.cycles), 1)
+        self.assertIn("Telegram co 15s", messages)
+        self.assertNotIn("long polling", messages)
+
+    def test_telegram_disabled_keeps_poll_interval_wait(self):
+        with mock.patch.object(ik, "TELEGRAM_ENABLED", False):
+            messages = self._run(self._poll_taking(lambda timeout: 0))
+        self.assertEqual(self.polls, [])
+        self.assertEqual(set(self.waits), {15})
+        self.assertEqual(len(self.cycles), 1)
+        self.assertIn("Telegram wylaczony", messages)
+
+    def test_startup_log_mentions_long_polling(self):
+        messages = self._run(self._poll_taking(lambda timeout: timeout))
+        self.assertIn("long polling do 25s", messages)
+
+    def test_shutdown_during_long_poll_skips_due_cycle(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=time.time() + 5,
+        ))
+
+        def poll_interrupted(long_poll_seconds=0):
+            self.polls.append(long_poll_seconds)
+            self.clock["t"] += long_poll_seconds
+            ik.SHUTDOWN_EVENT.set()  # SIGTERM w trakcie long pollu
+
+        messages = self._run(poll_interrupted)
+        self.assertEqual(len(self.polls), 1)
+        self.assertLessEqual(self.polls[0], 6)
+        self.assertEqual(self.cycles, [])
+        self.assertEqual(self.waits, [])
+        self.assertIn("Zatrzymywanie", messages)
 
 
 if __name__ == "__main__":

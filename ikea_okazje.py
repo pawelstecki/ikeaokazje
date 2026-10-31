@@ -20,8 +20,9 @@ Komendy Telegrama (tylko z czatu TELEGRAM_CHAT_ID):
 Tryby pracy (RUN_MODE):
     "cron"   (domyslny) - jedno przejscie i wyjscie; w trakcie backoffu
                po 403/429 przejscie konczy sie bez zapytania do IKEA.
-    "daemon" - petla w tle (np. systemd): Telegram co
-               TELEGRAM_POLL_INTERVAL_SECONDS, oferty co
+    "daemon" - petla w tle (np. systemd): Telegram przez long polling
+               (TELEGRAM_LONG_POLL_SECONDS; 0 = co
+               TELEGRAM_POLL_INTERVAL_SECONDS), oferty co
                CHECK_INTERVAL_SECONDS; lagodne zakonczenie po SIGTERM/SIGINT.
 
 Konfiguracja uzytkownika jest w ~/.config/ikea-okazje.env (patrz
@@ -80,6 +81,14 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 2700
 # podnoszona z ostrzezeniem (czeste odpytywanie prywatnego API).
 MIN_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS = 15
+# Long polling getUpdates w trybie daemon (TELEGRAM_LONG_POLL_SECONDS z
+# .env; 0 = krotkie odpytywanie co TELEGRAM_POLL_INTERVAL_SECONDS). Max 50:
+# z REQUEST_TIMEOUT daje 65 s na zapytanie, ponizej TimeoutStopSec=90s.
+DEFAULT_TELEGRAM_LONG_POLL_SECONDS = 25
+MAX_TELEGRAM_LONG_POLL_SECONDS = 50
+# Minimalny odstep miedzy zapytaniami long pollingu - bez petli bez
+# czekania, gdy Telegram odpowiada od razu.
+TELEGRAM_LONG_POLL_MIN_INTERVAL_SECONDS = 1.0
 
 # Po tylu kolejnych nieudanych cyklach idzie alert o awarii monitora
 # (HEALTH_ALERT_AFTER_CYCLES z .env ma pierwszenstwo; 0 wylacza alert).
@@ -351,9 +360,9 @@ def parse_check_interval_seconds(raw):
     return value
 
 
-def parse_non_negative_int(raw, key: str, default: int) -> int:
-    """Liczba calkowita >= 0 z .env; pusty -> default, inna wartosc ->
-    RuntimeError."""
+def parse_non_negative_int(raw, key: str, default: int, max_value: "int | None" = None) -> int:
+    """Liczba calkowita >= 0 (i <= max_value, jesli podane) z .env; pusty ->
+    default, inna wartosc -> RuntimeError."""
     if raw is None or raw.strip() == "":
         return default
     text = raw.strip()
@@ -361,10 +370,13 @@ def parse_non_negative_int(raw, key: str, default: int) -> int:
         value = int(text)
     except ValueError:
         value = -1
-    if value < 0:
+    if value < 0 or (max_value is not None and value > max_value):
+        expected = (
+            "liczba calkowita >= 0" if max_value is None
+            else f"liczba calkowita od 0 do {max_value}"
+        )
         raise RuntimeError(
-            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' - oczekiwana "
-            "liczba calkowita >= 0."
+            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' - oczekiwana {expected}."
         )
     return value
 
@@ -515,6 +527,7 @@ VERIFY_TLS = True
 RUN_MODE = "cron"
 CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL_SECONDS
 TELEGRAM_POLL_INTERVAL_SECONDS = DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS
+TELEGRAM_LONG_POLL_SECONDS = DEFAULT_TELEGRAM_LONG_POLL_SECONDS
 HEALTH_ALERT_AFTER_CYCLES = DEFAULT_HEALTH_ALERT_AFTER_CYCLES
 
 STORE_URL_SLUGS: dict = {}
@@ -740,7 +753,7 @@ def initialize_runtime() -> None:
     global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
     global ALERT_EXISTING_ON_FIRST_RUN, SMTP_MODE, VERIFY_TLS
     global RUN_MODE, CHECK_INTERVAL_SECONDS, TELEGRAM_POLL_INTERVAL_SECONDS
-    global HEALTH_ALERT_AFTER_CYCLES
+    global TELEGRAM_LONG_POLL_SECONDS, HEALTH_ALERT_AFTER_CYCLES
     global STORE_URL_SLUGS
     global SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, USE_AUTH
     global EMAIL_ENABLED, EMAIL_TO
@@ -774,6 +787,12 @@ def initialize_runtime() -> None:
         ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS"),
         "TELEGRAM_POLL_INTERVAL_SECONDS",
         DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS,
+    )
+    TELEGRAM_LONG_POLL_SECONDS = parse_non_negative_int(
+        ENV.get("TELEGRAM_LONG_POLL_SECONDS"),
+        "TELEGRAM_LONG_POLL_SECONDS",
+        DEFAULT_TELEGRAM_LONG_POLL_SECONDS,
+        max_value=MAX_TELEGRAM_LONG_POLL_SECONDS,
     )
     HEALTH_ALERT_AFTER_CYCLES = parse_non_negative_int(
         ENV.get("HEALTH_ALERT_AFTER_CYCLES"),
@@ -2056,10 +2075,12 @@ def save_telegram_offset(offset: int) -> None:
     os.replace(tmp_path, TELEGRAM_OFFSET_FILE)
 
 
-def telegram_get_updates(offset: int) -> list:
+def telegram_get_updates(offset: int, timeout: int = 0) -> list:
+    """getUpdates; timeout > 0 to long polling - Telegram trzyma zapytanie
+    do timeout sekund, wiec limit HTTP jest o REQUEST_TIMEOUT dluzszy."""
     try:
         result = telegram_api_call(
-            "getUpdates", {"offset": offset, "timeout": 0}, REQUEST_TIMEOUT
+            "getUpdates", {"offset": offset, "timeout": timeout}, timeout + REQUEST_TIMEOUT
         )
     except TelegramApiError as exc:
         if exc.status_code == 409:
@@ -2232,11 +2253,12 @@ def handle_command(cmd: str, arg: str) -> str:
     return f"Nieznana komenda: {escape_html(cmd)}\n\n{format_help_message()}"
 
 
-def handle_telegram_updates() -> None:
+def handle_telegram_updates(long_poll_seconds: int = 0) -> None:
     """Sprawdza nowe wiadomosci od ostatniego razu i wykonuje komendy.
-    Ignoruje wiadomosci od kogokolwiek innego niz TELEGRAM_CHAT_ID."""
+    Ignoruje wiadomosci od kogokolwiek innego niz TELEGRAM_CHAT_ID.
+    long_poll_seconds > 0: czeka na wiadomosci do tylu sekund (daemon)."""
     offset = load_telegram_offset()
-    updates = telegram_get_updates(offset)
+    updates = telegram_get_updates(offset, timeout=long_poll_seconds)
 
     max_update_id = offset - 1
     for update in updates:
@@ -2677,17 +2699,32 @@ def log_cron_backoff_skip(remaining_seconds: float) -> None:
     )
 
 
+def telegram_long_poll_timeout(seconds_until_check: float) -> int:
+    """Timeout long pollingu: TELEGRAM_LONG_POLL_SECONDS, ale nie dluzej niz
+    do nastepnego sprawdzenia IKEA (w gore do pelnej sekundy), zeby
+    harmonogram ofert nie przesuwal sie o wiecej niz ok. 1 s."""
+    return min(TELEGRAM_LONG_POLL_SECONDS, max(0, math.ceil(seconds_until_check)))
+
+
 def run_daemon() -> int:
     """Petla trybu daemon: Telegram czesto, oferty IKEA rzadziej. Interwaly
     sa odliczane time.monotonic(), zeby skoki zegara (NTP) ich nie
     zmienialy; trwaly termin backoffu (czas scienny) jest przeliczany na
-    sekundy przy starcie i po kazdym cyklu. Po SIGTERM/SIGINT konczy sie
-    bez nowego cyklu i zwraca 0."""
+    sekundy przy starcie i po kazdym cyklu. Z long pollingiem czeka na
+    komendy w samym getUpdates zamiast w SHUTDOWN_EVENT.wait(). Po
+    SIGTERM/SIGINT konczy sie bez nowego cyklu (najpozniej po biezacym
+    zapytaniu long pollingu) i zwraca 0."""
     install_shutdown_signal_handlers()
+    long_polling = TELEGRAM_ENABLED and TELEGRAM_LONG_POLL_SECONDS > 0
+    if not TELEGRAM_ENABLED:
+        telegram_txt = "Telegram wylaczony"
+    elif long_polling:
+        telegram_txt = f"Telegram: long polling do {TELEGRAM_LONG_POLL_SECONDS}s"
+    else:
+        telegram_txt = f"Telegram co {TELEGRAM_POLL_INTERVAL_SECONDS}s"
     log(
         f"Start w trybie daemon (IKEA co ~{CHECK_INTERVAL_SECONDS}s "
-        f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, Telegram co "
-        f"{TELEGRAM_POLL_INTERVAL_SECONDS}s)."
+        f"+/-{CHECK_INTERVAL_JITTER_PERCENT}% jitter, {telegram_txt})."
     )
 
     # Restart nie resetuje aktywnego backoffu - respektujemy zapisany termin.
@@ -2708,9 +2745,19 @@ def run_daemon() -> int:
     last_ikea_check_monotonic = time.monotonic()
 
     while not SHUTDOWN_EVENT.is_set():
+        # Bez long pollingu i po bledzie Telegrama (backoff) czekamy pelny
+        # TELEGRAM_POLL_INTERVAL_SECONDS.
+        long_poll_succeeded = False
         if TELEGRAM_ENABLED:
+            long_poll_seconds = 0
+            if long_polling:
+                long_poll_seconds = telegram_long_poll_timeout(
+                    next_check_interval - (time.monotonic() - last_ikea_check_monotonic)
+                )
+            poll_started_monotonic = time.monotonic()
             try:
-                handle_telegram_updates()
+                handle_telegram_updates(long_poll_seconds=long_poll_seconds)
+                long_poll_succeeded = long_polling
             except Exception as exc:
                 log(f"Blad obslugi komend Telegrama: {exc}", to_stderr=True)
 
@@ -2735,8 +2782,17 @@ def run_daemon() -> int:
                 next_check_interval = compute_jittered_interval()
                 log(f"Nastepne sprawdzenie ofert za {next_check_interval:.0f}s.")
 
+        if long_poll_succeeded:
+            # Long poll juz czekal; dobijamy tylko do minimalnego odstepu.
+            wait_seconds = max(
+                0.0,
+                TELEGRAM_LONG_POLL_MIN_INTERVAL_SECONDS
+                - (time.monotonic() - poll_started_monotonic),
+            )
+        else:
+            wait_seconds = TELEGRAM_POLL_INTERVAL_SECONDS
         # wait() budzi sie od razu po ustawieniu SHUTDOWN_EVENT (sleep() nie).
-        SHUTDOWN_EVENT.wait(TELEGRAM_POLL_INTERVAL_SECONDS)
+        SHUTDOWN_EVENT.wait(wait_seconds)
 
     log("Zatrzymywanie (SIGTERM/SIGINT) - koncze petle daemona bez uruchamiania nowego cyklu.")
     return 0

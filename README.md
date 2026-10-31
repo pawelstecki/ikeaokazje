@@ -51,7 +51,8 @@ Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 | `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
-| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy | `15` |
+| `TELEGRAM_LONG_POLL_SECONDS` | tylko `daemon` - ile sekund jedno zapytanie do Telegrama czeka na nowe komendy (long polling); liczba całkowita `0`-`50`, `0` wyłącza long polling | `25` |
+| `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy przy `TELEGRAM_LONG_POLL_SECONDS=0`; przy long pollingu to przerwa po błędzie Telegrama | `15` |
 | `HEALTH_ALERT_AFTER_CYCLES` | po ilu kolejnych nieudanych cyklach wysłać alert o awarii monitora; `0` wyłącza alert (patrz "Alert o awarii monitora") | `3` |
 
 Nieprawidłowa wartość pola liczbowego albo `RUN_MODE` (literówka, tekst
@@ -139,8 +140,13 @@ interwału crona.
 ### systemd (RUN_MODE=daemon)
 
 Działa w tle: oferty sprawdzane co `CHECK_INTERVAL_SECONDS` (domyślnie
-45 min), komendy Telegrama co `TELEGRAM_POLL_INTERVAL_SECONDS`
-(domyślnie 15 s, praktycznie natychmiast).
+45 min), komendy Telegrama przez long polling - zapytanie czeka do
+`TELEGRAM_LONG_POLL_SECONDS` (domyślnie 25 s) na nową wiadomość, więc bot
+odpowiada od razu, a zapytań do Telegrama jest ok. 3500 na dobę zamiast
+5760. Long polling nie opóźnia sprawdzania ofert o więcej niż ok. 1 s.
+`TELEGRAM_LONG_POLL_SECONDS=0` przywraca sprawdzanie komend co
+`TELEGRAM_POLL_INTERVAL_SECONDS` (domyślnie 15 s). Tryb `cron` zawsze
+sprawdza komendy jednym krótkim zapytaniem.
 
 W `.env` (**nie** w pliku usługi - `Environment=` tam nie ma
 pierwszeństwa nad `.env`, więc niczego by nie zmieniło):
@@ -176,6 +182,11 @@ błędy skryptu (kody 1-3) są restartowane normalnie.
 
 `systemctl stop`/`restart` wysyła `SIGTERM` - daemon kończy bieżący cykl,
 loguje podsumowanie i wychodzi czysto (bez naruszania plików stanu).
+Jeśli `SIGTERM` trafi w trwające zapytanie long pollingu, daemon czeka na
+jego koniec: zatrzymanie może trwać do `TELEGRAM_LONG_POLL_SECONDS`
+(domyślnie 25 s; przy maksimum 50 s i wolnej sieci do ok. 65 s). To mieści
+się w domyślnym `TimeoutStopSec=90s` systemd - jeśli ustawiasz w usłudze
+krótszy `TimeoutStopSec`, zmniejsz też `TELEGRAM_LONG_POLL_SECONDS`.
 
 ### Ręczne uruchomienie
 
