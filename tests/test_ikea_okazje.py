@@ -5532,5 +5532,169 @@ class TestTelegramSeriesPacing(unittest.TestCase):
         self.assertIn("HTTP 400", message)
 
 
+def _image(n):
+    return f"https://www.ikea.com/pl/pl/images/products/produkt-{n}.jpg"
+
+
+class TestTelegramLinkPreview(unittest.TestCase):
+    """Podglad linku: zdjecie pierwszej grupy w kazdej wiadomosci z ofertami
+    (link_preview_options), bez podgladu w odpowiedziach na komendy i w
+    komunikatach o stanie monitora."""
+
+    def setUp(self):
+        for patcher in (
+            mock.patch.object(ik, "TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN),
+            mock.patch.object(ik, "TELEGRAM_CHAT_ID", "4242"),
+            mock.patch.object(ik, "TELEGRAM_SERIES_DELAY_SECONDS", 0),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _payload_for(self, **kwargs):
+        with mock.patch.object(ik.urllib.request, "urlopen", return_value=_telegram_ok()) as urlopen:
+            ik.telegram_send_message("tekst", **kwargs)
+        return json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+
+    def _first_title_number(self, text):
+        return int(re.search(r"<b>Produkt (\d+)</b>", text).group(1))
+
+    # --- wybor adresu zdjecia ---
+
+    def test_preview_image_url_accepts_only_https_strings(self):
+        url = _image(1)
+        self.assertEqual(ik.telegram_preview_image_url({"hero_image": url}), url)
+        for value in (None, "", "http://www.ikea.com/x.jpg", "/images/x.jpg",
+                      "//www.ikea.com/x.jpg", 123, ["https://x"]):
+            with self.subTest(value=value):
+                self.assertIsNone(ik.telegram_preview_image_url({"hero_image": value}))
+        self.assertIsNone(ik.telegram_preview_image_url({}))
+
+    def test_api_hero_image_reaches_offer(self):
+        product = {
+            "title": "Stol", "description": "opis", "originalPrice": 200,
+            "articleNumbers": ["12345678"], "currency": "PLN", "storeId": "294",
+            "heroImage": _image(7),
+            "offers": [{"offerUuid": "u1", "offerNumber": "1", "price": 100}],
+        }
+        with mock.patch.object(ik, "NORMALIZED_TERMS", ["stol"]), \
+             mock.patch.object(ik, "NORMALIZED_EXCLUDE", []), \
+             mock.patch.object(ik, "MIN_DISCOUNT_PERCENT", None), \
+             mock.patch.object(ik, "MAX_PRICE", None):
+            offers = ik.flatten_matching_offers([product])
+        groups = ik.group_offers_for_notification(offers)
+        self.assertEqual(ik.split_telegram_messages_with_previews(groups)[0][1], _image(7))
+
+    # --- splitter ---
+
+    def test_texts_identical_to_split_telegram_messages(self):
+        fixtures = [
+            [_make_offer(offer_uuid=str(i), offer_number=str(i), description="długi " * 100,
+                         hero_image=_image(1)) for i in range(150)],
+            [_make_offer(offer_uuid=str(i), title=f"Produkt {i}", hero_image=_image(i),
+                         description="opis " * 200) for i in range(12)],
+            [_make_offer()],
+        ]
+        for offers in fixtures:
+            groups = ik.group_offers_for_notification(offers)
+            pairs = ik.split_telegram_messages_with_previews(groups)
+            self.assertEqual([text for text, _ in pairs], ik.split_telegram_messages(groups))
+        self.assertEqual(ik.split_telegram_messages_with_previews([]), [])
+
+    def test_single_message_uses_first_group_image(self):
+        groups = ik.group_offers_for_notification([
+            _make_offer(offer_uuid="a", title="Produkt 0", hero_image=_image(0)),
+            _make_offer(offer_uuid="b", title="Produkt 1", hero_image=_image(1)),
+        ])
+        pairs = ik.split_telegram_messages_with_previews(groups)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0][1], _image(0))
+
+    def test_first_group_without_image_gives_no_preview(self):
+        groups = ik.group_offers_for_notification([
+            _make_offer(offer_uuid="a", title="Produkt 0", hero_image=None),
+            _make_offer(offer_uuid="b", title="Produkt 1", hero_image=_image(1)),
+        ])
+        pairs = ik.split_telegram_messages_with_previews(groups)
+        self.assertEqual(len(pairs), 1)
+        self.assertIsNone(pairs[0][1])
+
+    def test_each_message_gets_image_of_its_first_group(self):
+        offers = [
+            _make_offer(offer_uuid=str(i), title=f"Produkt {i}", hero_image=_image(i),
+                        description="opis " * 200)
+            for i in range(12)
+        ]
+        pairs = ik.split_telegram_messages_with_previews(ik.group_offers_for_notification(offers))
+        self.assertGreater(len(pairs), 2)
+        for text, preview in pairs:
+            self.assertEqual(preview, _image(self._first_title_number(text)))
+
+    def test_split_group_repeats_its_image_in_continuations(self):
+        offers = [
+            _make_offer(offer_uuid="x", title="Produkt 99", hero_image=_image(99)),
+        ] + [
+            _make_offer(offer_uuid=str(i), offer_number=f"8772470{i}", title="Produkt 5",
+                        description="długi " * 100, hero_image=_image(5))
+            for i in range(150)
+        ]
+        pairs = ik.split_telegram_messages_with_previews(ik.group_offers_for_notification(offers))
+        self.assertGreater(len(pairs), 2)
+        self.assertEqual(pairs[0][1], _image(99))
+        continuation = [preview for text, preview in pairs if "(cd.)" in text]
+        self.assertTrue(continuation)
+        self.assertEqual(set(continuation), {_image(5)})
+
+    # --- wysylka ---
+
+    def test_send_telegram_passes_preview_per_message(self):
+        offers = [
+            _make_offer(offer_uuid=str(i), title=f"Produkt {i}",
+                        hero_image=_image(i) if i % 2 == 0 else None,
+                        description="opis " * 200)
+            for i in range(12)
+        ]
+        expected = ik.split_telegram_messages_with_previews(ik.group_offers_for_notification(offers))
+        with mock.patch.object(ik, "telegram_send_message") as send:
+            ik.send_telegram(offers)
+        sent = [(call.args[0], call.kwargs.get("preview_url")) for call in send.call_args_list]
+        self.assertEqual(sent, expected)
+        self.assertIn(None, [preview for _, preview in sent])
+
+    def test_payload_with_preview_url(self):
+        payload = self._payload_for(preview_url=_image(3))
+        self.assertEqual(
+            payload["link_preview_options"], {"url": _image(3), "prefer_large_media": True}
+        )
+        self.assertNotIn("disable_web_page_preview", payload)
+
+    def test_payload_without_preview_keeps_default_link_preview(self):
+        payload = self._payload_for()
+        self.assertNotIn("link_preview_options", payload)
+        self.assertNotIn("disable_web_page_preview", payload)
+
+    def test_payload_with_disabled_preview(self):
+        payload = self._payload_for(disable_preview=True, preview_url=_image(3))
+        self.assertEqual(payload["link_preview_options"], {"is_disabled": True})
+
+    def test_command_reply_has_preview_disabled(self):
+        update = {"update_id": 10, "message": {"chat": {"id": 4242}, "text": "/pomoc"}}
+        with mock.patch.object(ik, "load_telegram_offset", return_value=10), \
+             mock.patch.object(ik, "telegram_get_updates", return_value=[update]), \
+             mock.patch.object(ik, "save_telegram_offset"), \
+             mock.patch.object(ik, "telegram_send_message") as send:
+            ik.handle_telegram_updates()
+        send.assert_called_once()
+        self.assertTrue(send.call_args.kwargs.get("disable_preview"))
+        self.assertEqual(str(send.call_args.kwargs.get("chat_id")), "4242")
+
+    def test_status_message_has_preview_disabled(self):
+        with mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "telegram_send_message") as send:
+            errors = ik.notify_status_message("temat", "tresc", "tresc telegram")
+        self.assertEqual(errors, [])
+        send.assert_called_once_with("tresc telegram", disable_preview=True)
+
+
 if __name__ == "__main__":
     unittest.main()

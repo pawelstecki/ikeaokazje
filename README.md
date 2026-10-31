@@ -198,6 +198,12 @@ artykułu, numer oferty i link do rezerwacji (jeśli oferta ma numer
 i skrypt zna slug sklepu - w przeciwnym razie zamiast linku dostajesz
 numer oferty do ręcznego wyszukania).
 
+W Telegramie podgląd linku pod wiadomością pokazuje zdjęcie produktu
+(pierwszego produktu w danej wiadomości), jeśli API IKEA podaje jego
+adres `https://`; bez zdjęcia Telegram pokazuje zwykły podgląd pierwszego
+linku. Odpowiedzi na komendy i komunikaty o stanie monitora (dostęp,
+awaria) idą bez podglądu.
+
 Gdy IKEA wystawia kilka egzemplarzy tego samego produktu (identyczna
 nazwa, sklep, cena, stan), powiadomienie zawiera jeden wspólny opis
 i listę osobnych linków do rezerwacji każdego egzemplarza. Jeśli łączna

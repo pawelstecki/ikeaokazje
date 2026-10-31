@@ -1457,8 +1457,23 @@ TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 4000
 
 
+def telegram_preview_image_url(shared: dict) -> "str | None":
+    """Zdjecie produktu (hero_image) do podgladu linku albo None - wtedy
+    Telegram pokazuje podglad pierwszego linku z tresci."""
+    url = shared.get("hero_image")
+    if isinstance(url, str) and url.startswith("https://"):
+        return url
+    return None
+
+
 def split_telegram_messages(groups: list) -> list:
-    """Dzieli grupy ofert na gotowe wiadomosci HTML Telegrama. Gwarancje:
+    """Same teksty wiadomosci z split_telegram_messages_with_previews()."""
+    return [text for text, _ in split_telegram_messages_with_previews(groups)]
+
+
+def split_telegram_messages_with_previews(groups: list) -> list:
+    """Dzieli grupy ofert na gotowe wiadomosci HTML Telegrama i zwraca liste
+    (tekst, adres zdjecia pierwszej grupy w wiadomosci albo None). Gwarancje:
     - zadna wiadomosc nie przekracza TELEGRAM_SAFE_LIMIT;
     - kazda oferta (numer + pelny link) jest w dokladnie jednej wiadomosci,
       podzial nigdy nie tnie tagu, encji ani wiersza oferty;
@@ -1494,11 +1509,14 @@ def split_telegram_messages(groups: list) -> list:
     messages = []
     current_parts = [banner]
     current_len = len(banner)
+    # Podglad wiadomosci = zdjecie pierwszej grupy w tej wiadomosci.
+    current_preview = None
 
     for group in groups:
         shared = group["shared"]
         items = group["items"]
         item_lines = [_format_offer_item_telegram(item) for item in items]
+        group_preview = telegram_preview_image_url(shared)
 
         if len(items) == 1:
             items_overhead = len("\n") + len(item_lines[0])
@@ -1519,13 +1537,15 @@ def split_telegram_messages(groups: list) -> list:
                 full_group_block = f"{full_hdr}\n{count_label}\n" + "\n".join(item_lines)
 
             if current_len + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
+                if len(current_parts) == 1:
+                    current_preview = group_preview
                 current_parts.append(full_group_block)
                 current_len += len(separator) + len(full_group_block)
                 continue
 
         # Proba 2: nie miesci sie - zamykamy biezaca wiadomosc (jesli niepusta).
         if len(current_parts) > 1:
-            messages.append("\n\n".join(current_parts))
+            messages.append(("\n\n".join(current_parts), current_preview))
             current_parts = [banner]
             current_len = len(banner)
 
@@ -1538,13 +1558,14 @@ def split_telegram_messages(groups: list) -> list:
                 full_group_block = f"{full_hdr}\n{count_label}\n" + "\n".join(item_lines)
 
             if len(banner) + len(separator) + len(full_group_block) <= TELEGRAM_SAFE_LIMIT:
+                current_preview = group_preview
                 current_parts.append(full_group_block)
                 current_len = len(banner) + len(separator) + len(full_group_block)
                 continue
 
         # Proba 4: grupa za duza na jedna wiadomosc - dzielimy jej oferty.
         if len(current_parts) > 1:
-            messages.append("\n\n".join(current_parts))
+            messages.append(("\n\n".join(current_parts), current_preview))
             current_parts = [banner]
             current_len = len(banner)
 
@@ -1580,16 +1601,16 @@ def split_telegram_messages(groups: list) -> list:
                 else:
                     break
 
-            messages.append("\n".join(msg_parts))
+            messages.append(("\n".join(msg_parts), group_preview))
 
         current_parts = [banner]
         current_len = len(banner)
 
     if len(current_parts) > 1:
-        messages.append("\n\n".join(current_parts))
+        messages.append(("\n\n".join(current_parts), current_preview))
 
     # Niezmiennik dlugosci - ostatnia linia obrony przed wyslaniem.
-    for idx, msg in enumerate(messages, 1):
+    for idx, (msg, _) in enumerate(messages, 1):
         if len(msg) > TELEGRAM_SAFE_LIMIT:
             raise ValueError(
                 f"Wiadomosc {idx}/{len(messages)} przekracza bezpieczny limit "
@@ -1698,15 +1719,21 @@ def telegram_api_call(method: str, payload: dict, timeout: float):
     return data.get("result")
 
 
-def telegram_send_message(text: str, chat_id=None) -> None:
-    """Wysyla wiadomosc HTML. Po HTTP 429 czeka retry_after i ponawia raz;
-    gdy w trakcie czekania przyjdzie SIGTERM, konczy bledem bez ponowienia."""
+def telegram_send_message(text: str, chat_id=None, preview_url=None, disable_preview=False) -> None:
+    """Wysyla wiadomosc HTML. preview_url - obraz w podgladzie linku (bez
+    niego Telegram bierze pierwszy link z tresci), disable_preview - bez
+    podgladu. Po HTTP 429 czeka retry_after i ponawia raz; gdy w trakcie
+    czekania przyjdzie SIGTERM, konczy bledem bez ponowienia."""
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
     }
+    # link_preview_options (Bot API 7.0) zastepuje disable_web_page_preview.
+    if disable_preview:
+        payload["link_preview_options"] = {"is_disabled": True}
+    elif preview_url:
+        payload["link_preview_options"] = {"url": preview_url, "prefer_large_media": True}
     try:
         telegram_api_call("sendMessage", payload, REQUEST_TIMEOUT)
         return
@@ -1729,20 +1756,21 @@ def telegram_send_message(text: str, chat_id=None) -> None:
 
 def send_telegram(new_offers) -> None:
     """Wysyla oferty Telegramem. Cala seria jest budowana i walidowana
-    (split_telegram_messages()) przed wyslaniem pierwszej wiadomosci."""
+    (split_telegram_messages_with_previews()) przed wyslaniem pierwszej
+    wiadomosci; kazda dostaje w podgladzie zdjecie swojej pierwszej grupy."""
     groups = group_offers_for_notification(new_offers)
-    messages = split_telegram_messages(groups)
+    messages = split_telegram_messages_with_previews(groups)
     if not messages:
         return
 
     sent_count = 0
-    for index, msg in enumerate(messages):
+    for index, (msg, preview_url) in enumerate(messages):
         if index > 0:
             # Po SIGTERM wait() wraca od razu - reszta serii idzie bez
             # przerwy, zeby cykl skonczyl sie szybko.
             SHUTDOWN_EVENT.wait(TELEGRAM_SERIES_DELAY_SECONDS)
         try:
-            telegram_send_message(msg)
+            telegram_send_message(msg, preview_url=preview_url)
             sent_count += 1
         except Exception as exc:
             raise RuntimeError(
@@ -1786,7 +1814,7 @@ def notify_status_message(email_subject: str, email_body: str, telegram_text: st
 
     if TELEGRAM_ENABLED:
         try:
-            telegram_send_message(telegram_text)
+            telegram_send_message(telegram_text, disable_preview=True)
         except Exception as exc:
             errors.append(f"telegram: {exc}")
 
@@ -2238,7 +2266,7 @@ def handle_telegram_updates() -> None:
             reply = f"Blad przy obsludze komendy: {exc}"
 
         try:
-            telegram_send_message(reply, chat_id=chat_id)
+            telegram_send_message(reply, chat_id=chat_id, disable_preview=True)
         except Exception as exc:
             log(f"Nie udalo sie odpowiedziec na Telegramie: {exc}", to_stderr=True)
 
