@@ -5116,6 +5116,63 @@ class TestHealthAlert(unittest.TestCase):
         self.assertFalse(health["alert_active"])
         self.assertIn("sklep 100", health["last_error"])
 
+    # --- nakladanie sie z alertem o dostepie 403/429 ---
+
+    def test_one_403_incident_gives_one_alert_and_one_recovery(self):
+        # Przebieg z recenzji: blokada przechodzi miedzy czesciowa a pelna.
+        def partial_403(store_id):
+            if store_id == "100":
+                raise ik.BlockedByServerError(403, "HTTP 403 (sklep 100, strona 0): blocked")
+            return []
+
+        timeline = [
+            (partial_403, 1),         # 1: A=403 B=ok
+            (_fetch_all_blocked, 1),  # 2: pelna blokada -> pending_outage
+            (_fetch_all_blocked, 1),  # 3: alert o dostepie
+            (partial_403, 2),         # 4
+            (partial_403, 3),         # 5: prog alertu o awarii osiagniety
+            (_fetch_ok, 0),           # 6: pelny sukces
+        ]
+        for cycle, (fetch, expected_failed) in enumerate(timeline, 1):
+            with self.subTest(cycle=cycle):
+                self._run(fetch)
+                self.assertEqual(
+                    ik.get_health_state()["consecutive_failed_cycles"], expected_failed
+                )
+
+        self.assertEqual(
+            self._health_subjects(),
+            [ik.ACCESS_OUTAGE_EMAIL_SUBJECT, ik.ACCESS_RECOVERY_EMAIL_SUBJECT],
+        )
+        health = ik.get_health_state()
+        self.assertFalse(health["alert_active"])
+        self.assertIsNone(health["last_error"])
+        self.assertFalse(ik.get_access_notification_state()["outage_active"])
+
+    def test_health_alert_held_while_access_outage_pending_or_active(self):
+        for pending, active in ((True, False), (False, True)):
+            with self.subTest(pending_outage=pending, outage_active=active):
+                ik.set_health_state(ik.default_health_state())
+                ik.set_access_notification_state(active, 403, pending_outage=pending)
+                for _ in range(4):
+                    ik.update_health_state(ik.CYCLE_UNHEALTHY, "sklep 100: HTTP 403")
+                health = ik.get_health_state()
+                self.assertEqual(health["consecutive_failed_cycles"], 4)
+                self.assertEqual(health["last_error"], "sklep 100: HTTP 403")
+                self.assertFalse(health["alert_active"])
+                self.notify.assert_not_called()
+
+    def test_persistent_single_store_403_without_full_outage_still_alerts(self):
+        def partial_403(store_id):
+            if store_id == "100":
+                raise ik.BlockedByServerError(403, "HTTP 403 (sklep 100, strona 0): blocked")
+            return []
+
+        for _ in range(3):
+            self._run(partial_403)
+        self.assertEqual(self._health_subjects(), [ik.HEALTH_ALERT_EMAIL_SUBJECT])
+        self.assertIn("HTTP 403", self.notify.call_args.args[1])
+
     # --- powiadomienie o powrocie ---
 
     def test_recovery_message_sent_exactly_once(self):

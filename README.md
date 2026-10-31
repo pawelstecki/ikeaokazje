@@ -429,7 +429,11 @@ nie da się odczytać albo zapisać pliku `~/.ikea_okazje_seen_offers.json`
 albo gdy w cyklu wystąpi nieoczekiwany wyjątek (daemon go loguje
 i działa dalej). Cykl, w którym wszystkie sklepy dostały wyłącznie
 403/429, nie liczy się ani jako udany, ani jako nieudany - ma własny
-alert opisany wyżej. Błąd wysyłki powiadomienia o ofercie nie psuje
+alert opisany wyżej. Dopóki alert o utracie dostępu czeka na
+potwierdzenie albo jest aktywny, alert o awarii nie jest wysyłany
+(licznik i ostatni błąd dalej się zapisują), więc blokada 403/429, która
+przechodzi między częściową a pełną, daje jeden alert i jedno
+powiadomienie o odzyskaniu. Błąd wysyłki powiadomienia o ofercie nie psuje
 cyklu (taki alert i tak by nie doszedł; błąd jest w logu).
 
 Po `HEALTH_ALERT_AFTER_CYCLES` (domyślnie 3) nieudanych cyklach z rzędu

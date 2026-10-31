@@ -2272,7 +2272,9 @@ def update_health_state(outcome: str, error_description=None) -> None:
     nieudanych cyklach (0 - bez alertu) albo informacje o powrocie do
     dzialania po wyslanym alercie. Gdy dostawa zawiedzie na wszystkich
     kanalach, alert_active sie nie zmienia i nastepny taki cykl ponawia.
-    Cykl pominiety (CYCLE_SKIPPED) niczego nie zmienia."""
+    Alert nie idzie, gdy alert o dostepie 403/429 czeka na potwierdzenie
+    albo jest aktywny (licznik i last_error rosna dalej). Cykl pominiety
+    (CYCLE_SKIPPED) niczego nie zmienia."""
     if outcome == CYCLE_SKIPPED:
         return
     state = get_health_state()
@@ -2303,7 +2305,16 @@ def update_health_state(outcome: str, error_description=None) -> None:
         to_stderr=True,
     )
     threshold = HEALTH_ALERT_AFTER_CYCLES
-    if threshold > 0 and failed_cycles >= threshold and not state["alert_active"]:
+    alert_due = threshold > 0 and failed_cycles >= threshold and not state["alert_active"]
+    access = get_access_notification_state()
+    if alert_due and (access.get("pending_outage") or access.get("outage_active")):
+        # Trwa utrata dostepu 403/429 z wlasnym alertem - jeden incydent to
+        # jeden alert i jedno odzyskanie, a nie dwa.
+        log(
+            "Alert o awarii monitora wstrzymany - trwa (albo czeka na "
+            "potwierdzenie) utrata dostepu do IKEA (HTTP 403/429)."
+        )
+    elif alert_due:
         message = build_health_alert_message(state)
         errors = notify_status_message(
             HEALTH_ALERT_EMAIL_SUBJECT, message, "⚠️ " + escape_html(message)
