@@ -6049,5 +6049,389 @@ class TestBackoffStateFromDictHardening(unittest.TestCase):
             self.assertEqual(ik.compute_local_backoff_delay(failure_count), expected)
 
 
+class TestFormatLocalTimestampRobustness(unittest.TestCase):
+    """format_local_timestamp() dostaje wartosci z plikow stanu - nigdy nie rzuca."""
+
+    def test_valid_and_none(self):
+        self.assertEqual(ik.format_local_timestamp(None), "nigdy")
+        epoch = 1700000000.5
+        self.assertEqual(
+            ik.format_local_timestamp(epoch),
+            ik.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        self.assertEqual(
+            ik.format_local_timestamp(1700000000),
+            ik.datetime.fromtimestamp(1700000000).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def test_invalid_values_give_fallback_text(self):
+        for value in (float("inf"), float("-inf"), float("nan"), 1e20, -1e20, 10 ** 400,
+                      "1700000000", "jutro", [1], {"a": 1}, True, False):
+            with self.subTest(value=value):
+                self.assertEqual(ik.format_local_timestamp(value), "nieznany czas")
+
+
+class _LastMatchesTestCase(unittest.TestCase):
+    """Wspolne przygotowanie: osobny LAST_MATCHES_FILE i odtworzenie stanu."""
+
+    def setUp(self):
+        tmp_dir = tempfile.mkdtemp(prefix="ikea_okazje_last_matches_")
+        self.last_matches_path = os.path.join(tmp_dir, "last_matches.json")
+        self._orig = {
+            "store_ids": list(ik.STORE_IDS),
+            "terms": list(ik.SEARCH_TERMS),
+            "numbers": list(ik.SEARCH_ARTICLE_NUMBERS),
+            "health": ik.get_health_state(),
+            "access": dict(ik.get_access_notification_state()),
+            "backoff": ik.get_blocking_backoff_state().to_dict(),
+        }
+        for patcher in (
+            mock.patch.object(ik, "LAST_MATCHES_FILE", self.last_matches_path),
+            mock.patch.object(ik.time, "sleep"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        ik.set_health_state(ik.default_health_state())
+        ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def tearDown(self):
+        ik.STORE_IDS = self._orig["store_ids"]
+        ik.SEARCH_TERMS = self._orig["terms"]
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = self._orig["numbers"]
+        ik.set_health_state(self._orig["health"])
+        access = self._orig["access"]
+        ik.set_access_notification_state(
+            access.get("outage_active", False),
+            access.get("last_status_code"),
+            pending_outage=access.get("pending_outage", False),
+        )
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig["backoff"]))
+
+    def _read_last_matches(self):
+        with open(self.last_matches_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+class TestLastMatchesWrittenByCycle(_LastMatchesTestCase):
+    """_run_check_cycle() zapisuje dopasowania, gdy pobral choc jeden sklep."""
+
+    def setUp(self):
+        super().setUp()
+        ik.STORE_IDS = ["100", "200"]
+        ik.SEARCH_TERMS = ["stol"]
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = []
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        self.addCleanup(lambda: os.path.exists(ik.STATE_FILE) and os.remove(ik.STATE_FILE))
+        _save_seen(set())
+        for patcher in (
+            mock.patch.object(ik, "EMAIL_ENABLED", True),
+            mock.patch.object(ik, "TELEGRAM_ENABLED", False),
+            mock.patch.object(ik, "send_email"),
+            mock.patch.object(ik, "notify_status_message", return_value=[]),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _run(self, fetch):
+        with mock.patch.object(ik, "fetch_store_offers", side_effect=fetch):
+            return ik.run_ikea_check_cycle()
+
+    @staticmethod
+    def _fetch_product_in_200(store_id):
+        if store_id == "200":
+            product = _api_product(uuid="u1", title="Stol <drewniany>")
+            product["heroImage"] = "https://www.ikea.com/x.jpg"
+            return [product, _api_product(uuid="u2", title="Krzeslo")]
+        return []
+
+    def test_full_cycle_writes_compact_matches(self):
+        before = time.time()
+        self.assertEqual(self._run(self._fetch_product_in_200), 0)
+        data = self._read_last_matches()
+        self.assertGreaterEqual(data["checked_at"], before)
+        self.assertLessEqual(data["checked_at"], time.time())
+        self.assertEqual(data["incomplete_store_ids"], [])
+        self.assertEqual(len(data["offers"]), 1)
+        offer = data["offers"][0]
+        self.assertEqual(set(offer), {
+            "title", "description", "price", "currency", "original_price",
+            "discount_percent", "condition", "store_id", "offer_number",
+            "reservation_link", "offer_uuid",
+        })
+        self.assertEqual(offer["title"], "Stol <drewniany>")
+        self.assertEqual(offer["offer_uuid"], "u1")
+        self.assertEqual(offer["price"], 100)
+        self.assertEqual(offer["discount_percent"], 50)
+        self.assertTrue(offer["reservation_link"].startswith("https://www.ikea.com/"))
+
+    def test_partial_cycle_records_incomplete_stores(self):
+        def fetch(store_id):
+            if store_id == "100":
+                raise RuntimeError("HTTP 404 (sklep 100, strona 0): not found")
+            return self._fetch_product_in_200(store_id)
+
+        self._run(fetch)
+        data = self._read_last_matches()
+        self.assertEqual(data["incomplete_store_ids"], ["100"])
+        self.assertEqual([o["offer_uuid"] for o in data["offers"]], ["u1"])
+
+    def test_no_matches_writes_empty_list(self):
+        self._run(_fetch_ok)
+        self.assertEqual(self._read_last_matches()["offers"], [])
+
+    def test_first_run_also_writes_matches(self):
+        os.remove(ik.STATE_FILE)
+        self._run(self._fetch_product_in_200)
+        self.assertEqual(len(self._read_last_matches()["offers"]), 1)
+
+    def test_not_written_when_no_store_fetched(self):
+        ik.save_last_matches([_make_offer()], [], 123.0)
+        for fetch in (_fetch_all_404, _fetch_all_blocked):
+            with self.subTest(fetch=fetch.__name__):
+                self._run(fetch)
+                data = self._read_last_matches()
+                self.assertEqual(data["checked_at"], 123.0)
+                self.assertEqual(len(data["offers"]), 1)
+
+    def test_not_written_without_store_ids(self):
+        ik.STORE_IDS = []
+        self._run(_fetch_ok)
+        self.assertFalse(os.path.exists(self.last_matches_path))
+
+    def test_write_failure_only_logged(self):
+        with mock.patch.object(ik, "save_last_matches", side_effect=OSError("brak miejsca")), \
+             mock.patch.object(ik, "log") as mock_log:
+            result = self._run(self._fetch_product_in_200)
+        self.assertEqual(result, 0)
+        health = ik.get_health_state()
+        self.assertEqual(health["consecutive_failed_cycles"], 0)
+        self.assertIsNotNone(health["last_successful_check_at"])
+        stderr_messages = [
+            call.args[0] for call in mock_log.call_args_list if call.kwargs.get("to_stderr")
+        ]
+        self.assertTrue(any("brak miejsca" in m for m in stderr_messages), stderr_messages)
+
+    def test_write_failure_keeps_unhealthy_outcome_and_error(self):
+        def fetch(store_id):
+            if store_id == "100":
+                raise RuntimeError("HTTP 404 (sklep 100, strona 0): not found")
+            return []
+
+        with mock.patch.object(ik, "save_last_matches", side_effect=TypeError("zly typ")):
+            result = self._run(fetch)
+        self.assertEqual(result, 0)
+        health = ik.get_health_state()
+        self.assertEqual(health["consecutive_failed_cycles"], 1)
+        self.assertIn("sklep 100", health["last_error"])
+
+    def test_atomic_write_leaves_no_tmp_file(self):
+        self._run(self._fetch_product_in_200)
+        self.assertFalse(os.path.exists(self.last_matches_path + ".tmp"))
+
+
+class TestOffersCommand(_LastMatchesTestCase):
+    """/oferty (/offers): dopasowania z LAST_MATCHES_FILE w jednej wiadomosci."""
+
+    def test_no_file(self):
+        reply = ik.handle_command("/oferty", "")
+        self.assertEqual(reply, "Brak danych - jeszcze nie bylo sprawdzenia ofert.")
+
+    def test_alias_offers(self):
+        self.assertEqual(ik.handle_command("/offers", ""), ik.handle_command("/oferty", ""))
+
+    def test_no_matches(self):
+        ik.save_last_matches([], [], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertIn("Brak dopasowan", reply)
+        self.assertIn(ik.format_local_timestamp(1700000000.0), reply)
+        self.assertIn("z chwili tego sprawdzenia", reply)
+
+    def test_groups_with_links_price_and_store(self):
+        offers = [
+            _make_offer(offer_uuid="u1", offer_number="101",
+                        reservation_link="https://www.ikea.com/a?x=1&y=2"),
+            _make_offer(offer_uuid="u2", offer_number="102", reservation_link=None),
+            _make_offer(offer_uuid="u3", title="Krzeslo <b>X</b>", store_id="204",
+                        price=50, discount_percent=None, offer_number="103",
+                        reservation_link="https://www.ikea.com/c"),
+        ]
+        ik.save_last_matches(offers, [], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertIn(f"({ik.format_local_timestamp(1700000000.0)})", reply)
+        self.assertIn("z chwili tego sprawdzenia", reply)
+        self.assertIn("Ofert: 3, produktow: 2.", reply)
+        self.assertIn("<b>Stol</b>", reply)
+        self.assertIn("Wroclaw | 100 PLN (z 200, rabat 50%)", reply)
+        self.assertIn(
+            'Sztuk: 2 - <a href="https://www.ikea.com/a?x=1&amp;y=2">Rezerwuj</a>, oferta 102',
+            reply,
+        )
+        self.assertIn("<b>Krzeslo &lt;b&gt;X&lt;/b&gt;</b>", reply)
+        self.assertIn("Krakow | 50 PLN (z 200, rabat n/d)", reply)
+        self.assertIn('Sztuk: 1 - <a href="https://www.ikea.com/c">Rezerwuj</a>', reply)
+        self.assertNotIn("Uwaga", reply)
+        self.assertNotIn("i jeszcze", reply)
+
+    def test_incomplete_stores_note(self):
+        ik.save_last_matches([_make_offer()], ["294", "<x>"], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertIn("Uwaga: brak danych ze sklepow: Wroclaw (294), Sklep &lt;x&gt; (&lt;x&gt;)", reply)
+        self.assertNotIn("<x>", reply)
+
+    def test_incomplete_stores_note_without_matches(self):
+        ik.save_last_matches([], ["294"], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertIn("brak danych ze sklepow: Wroclaw (294)", reply)
+        self.assertIn("Brak dopasowan", reply)
+
+    def test_reply_stays_under_safe_limit_and_counts_hidden_products(self):
+        offers = [
+            _make_offer(offer_uuid=f"u{i}", offer_number=str(i), title=f"Produkt {i}",
+                        description="dlugi opis " * 20,
+                        reservation_link=f"https://www.ikea.com/pl/pl/second-hand/{i}")
+            for i in range(100)
+        ]
+        ik.save_last_matches(offers, [], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertLessEqual(len(reply), ik.TELEGRAM_SAFE_LIMIT)
+        shown = len(re.findall(r"<b>Produkt \d+</b>", reply))
+        self.assertGreater(shown, 0)
+        self.assertLess(shown, 100)
+        self.assertTrue(reply.endswith(f"... i jeszcze {100 - shown} produktow"))
+        # Kolejnosc zachowana - pokazane sa pierwsze grupy.
+        self.assertIn("<b>Produkt 0</b>", reply)
+        self.assertIn(f"<b>Produkt {shown - 1}</b>", reply)
+
+    def test_last_group_fits_without_tail_reserve(self):
+        offers = [_make_offer(offer_uuid=f"u{i}", title=f"Produkt {i}") for i in range(3)]
+        ik.save_last_matches(offers, [], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertEqual(len(re.findall(r"<b>Produkt \d+</b>", reply)), 3)
+        self.assertNotIn("i jeszcze", reply)
+
+    def test_large_group_links_are_capped(self):
+        offers = [
+            _make_offer(offer_uuid=f"u{i}", offer_number=str(i),
+                        reservation_link=f"https://www.ikea.com/pl/pl/second-hand/{i}")
+            for i in range(40)
+        ]
+        ik.save_last_matches(offers, [], 1700000000.0)
+        reply = ik.handle_command("/oferty", "")
+        self.assertLessEqual(len(reply), ik.TELEGRAM_SAFE_LIMIT)
+        self.assertEqual(reply.count(">Rezerwuj</a>"), ik.LAST_MATCHES_MAX_LINKS_PER_GROUP)
+        self.assertIn("Sztuk: 40 - ", reply)
+        self.assertIn(f" i jeszcze {40 - ik.LAST_MATCHES_MAX_LINKS_PER_GROUP}", reply)
+
+    def test_offer_without_link_and_number(self):
+        ik.save_last_matches(
+            [_make_offer(offer_number=None, reservation_link=None)], [], 1700000000.0
+        )
+        self.assertIn("Sztuk: 1 - oferta bez numeru", ik.handle_command("/oferty", ""))
+
+    def test_corrupted_file_gives_message_not_exception(self):
+        for content in ("{uszkodzony", "[1, 2]", "\xff"):
+            with self.subTest(content=content):
+                with open(self.last_matches_path, "w", encoding="latin-1") as f:
+                    f.write(content)
+                with mock.patch.object(ik, "log"):
+                    reply = ik.handle_command("/oferty", "")
+                self.assertIn("Nie udalo sie odczytac", reply)
+
+    def test_tampered_fields_are_sanitized(self):
+        with open(self.last_matches_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "checked_at": "wczoraj",
+                "incomplete_store_ids": "294",
+                "offers": [
+                    "nie-slownik",
+                    {"title": ["<b>"], "price": "<i>1</i>", "discount_percent": "<u>",
+                     "currency": "PLN", "store_id": 294, "offer_number": 7,
+                     "reservation_link": "javascript:alert(1)"},
+                ],
+            }, f)
+        reply = ik.handle_command("/oferty", "")
+        self.assertIn("(nieznany czas)", reply)
+        self.assertNotIn("<i>", reply)
+        self.assertNotIn("<u>", reply)
+        self.assertNotIn("javascript:", reply)
+        self.assertIn("Sztuk: 1 - oferta 7", reply)
+        self.assertIn("Wroclaw | n/d PLN", reply)
+        self.assertNotIn("Uwaga", reply)
+
+    def test_help_and_docstring_list_command(self):
+        self.assertIn("/oferty", ik.format_help_message())
+        self.assertIn("/oferty", ik.__doc__)
+
+
+class TestStatusCheckInfo(_LastMatchesTestCase):
+    """/status: ostatnie udane sprawdzenie, liczba dopasowan, backoff, alert."""
+
+    def test_defaults_without_history(self):
+        reply = ik.format_status_message()
+        self.assertIn("Ostatnie udane sprawdzenie: jeszcze nie bylo", reply)
+        self.assertIn("Dopasowania w ostatnim sprawdzeniu: brak danych", reply)
+        self.assertNotIn("Backoff", reply)
+        self.assertNotIn("Alert o awarii", reply)
+
+    def test_last_success_and_match_count(self):
+        health = ik.default_health_state()
+        health["last_successful_check_at"] = 1700000000.0
+        ik.set_health_state(health)
+        ik.save_last_matches([_make_offer(offer_uuid="a"), _make_offer(offer_uuid="b")], [], 1700000100.0)
+        reply = ik.handle_command("/status", "")
+        self.assertIn(
+            f"Ostatnie udane sprawdzenie: {ik.format_local_timestamp(1700000000.0)}", reply
+        )
+        self.assertIn(
+            f"Dopasowania w ostatnim sprawdzeniu ({ik.format_local_timestamp(1700000100.0)}): "
+            "2 - lista: /oferty",
+            reply,
+        )
+
+    def test_unreadable_matches_file(self):
+        with open(self.last_matches_path, "w", encoding="utf-8") as f:
+            f.write("{")
+        self.assertIn("brak danych (plik nieczytelny)", ik.format_status_message())
+
+    def test_active_backoff_shown_with_deadline_and_code(self):
+        deadline = time.time() + 1800
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=429, next_allowed_check_at=deadline,
+        ))
+        reply = ik.format_status_message()
+        self.assertIn(
+            "Backoff po blokadzie IKEA (HTTP 429): sprawdzanie wstrzymane do "
+            f"{ik.format_local_timestamp(deadline)}",
+            reply,
+        )
+
+    def test_expired_backoff_not_shown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=429, next_allowed_check_at=time.time() - 5,
+        ))
+        self.assertNotIn("Backoff", ik.format_status_message())
+
+    def test_active_health_alert_with_escaped_error(self):
+        health = ik.default_health_state()
+        health.update(alert_active=True, last_error="HTTP 500: <html>&</html>",
+                      consecutive_failed_cycles=4)
+        ik.set_health_state(health)
+        reply = ik.format_status_message()
+        self.assertIn(
+            "Alert o awarii monitora aktywny. Ostatni blad: HTTP 500: &lt;html&gt;&amp;&lt;/html&gt;",
+            reply,
+        )
+        self.assertNotIn("<html>", reply)
+
+    def test_inactive_alert_with_error_not_shown(self):
+        health = ik.default_health_state()
+        health.update(last_error="sklep 100: HTTP 404", consecutive_failed_cycles=1)
+        ik.set_health_state(health)
+        self.assertNotIn("Alert o awarii", ik.format_status_message())
+
+
 if __name__ == "__main__":
     unittest.main()

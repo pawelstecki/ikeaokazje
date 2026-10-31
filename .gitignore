@@ -7,5 +7,6 @@ ikea-okazje.env
 .ikea_okazje_last_raw.json
 .ikea_okazje_dynamic.json
 .ikea_okazje_telegram_offset.json
+.ikea_okazje_last_matches.json
 *.lock
 *.log

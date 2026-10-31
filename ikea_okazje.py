@@ -14,7 +14,9 @@ Komendy Telegrama (tylko z czatu TELEGRAM_CHAT_ID):
     /sklepy            - pokaz aktywne i dostepne sklepy
     /dodajsklep <ID>   - dodaj sklep do monitoringu
     /usunsklep <ID>    - usun sklep z monitoringu
-    /status            - pokaz monitorowane slowa/numery/sklepy
+    /status            - pokaz monitorowane slowa/numery/sklepy i stan
+                         sprawdzania (ostatnie sprawdzenie, backoff, alert)
+    /oferty            - dopasowania z ostatniego sprawdzenia
     /pomoc             - lista komend
 
 Tryby pracy (RUN_MODE):
@@ -223,6 +225,8 @@ RAW_DUMP_FILE = os.path.expanduser("~/.ikea_okazje_last_raw.json")
 CONFIG_FILE = os.path.expanduser("~/.config/ikea-okazje.env")
 DYNAMIC_STATE_FILE = os.path.expanduser("~/.ikea_okazje_dynamic.json")
 TELEGRAM_OFFSET_FILE = os.path.expanduser("~/.ikea_okazje_telegram_offset.json")
+# Dopasowania z ostatniego sprawdzenia (dla /oferty i /status).
+LAST_MATCHES_FILE = os.path.expanduser("~/.ikea_okazje_last_matches.json")
 
 SMTP_TIMEOUT = 30
 REQUEST_TIMEOUT = 15
@@ -1288,6 +1292,87 @@ def _write_seen_state(seen: set, pending: dict) -> None:
     os.replace(tmp_path, STATE_FILE)
 
 
+# Pola oferty w LAST_MATCHES_FILE - tylko to, czego potrzebuje /oferty.
+LAST_MATCHES_TEXT_FIELDS = (
+    "title", "description", "currency", "condition", "store_id",
+    "offer_number", "reservation_link", "offer_uuid",
+)
+LAST_MATCHES_NUMBER_FIELDS = ("price", "original_price", "discount_percent")
+
+
+def save_last_matches(matching_offers: list, incomplete_store_ids, checked_at: float) -> None:
+    """Atomowy zapis dopasowan ostatniego sprawdzenia; incomplete_store_ids
+    to sklepy, ktorych w tym cyklu nie udalo sie pobrac."""
+    fields = LAST_MATCHES_TEXT_FIELDS + LAST_MATCHES_NUMBER_FIELDS
+    payload = {
+        "checked_at": checked_at,
+        "incomplete_store_ids": [str(store_id) for store_id in incomplete_store_ids],
+        "offers": [{field: offer.get(field) for field in fields} for offer in matching_offers],
+    }
+    tmp_path = LAST_MATCHES_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, LAST_MATCHES_FILE)
+
+
+def _sanitize_last_match_offer(raw: dict) -> dict:
+    """Oferta z LAST_MATCHES_FILE z bezpiecznymi typami: tekst albo None,
+    skonczona liczba albo None - zeby reczna edycja pliku nie wstrzyknela
+    HTML ani nie wywrocila /oferty."""
+    offer = {}
+    for field in LAST_MATCHES_TEXT_FIELDS:
+        value = raw.get(field)
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            value = None
+        offer[field] = None if value is None else str(value)
+    for field in LAST_MATCHES_NUMBER_FIELDS:
+        value = raw.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            offer[field] = value
+        else:
+            offer[field] = _finite_float_or_none(value)
+    return offer
+
+
+def load_last_matches() -> "dict | None":
+    """Zapisane dopasowania albo None, gdy pliku nie ma. Nieczytelny plik ->
+    OSError/ValueError; niepoprawne pola sa pomijane albo zerowane."""
+    if not os.path.exists(LAST_MATCHES_FILE):
+        return None
+    with open(LAST_MATCHES_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("plik nie zawiera obiektu JSON")
+    raw_offers = data.get("offers")
+    raw_incomplete = data.get("incomplete_store_ids")
+    return {
+        "checked_at": _finite_float_or_none(data.get("checked_at")),
+        "incomplete_store_ids": [
+            str(store_id) for store_id in raw_incomplete
+            if isinstance(store_id, (str, int)) and not isinstance(store_id, bool)
+        ] if isinstance(raw_incomplete, list) else [],
+        "offers": [
+            _sanitize_last_match_offer(offer) for offer in raw_offers
+            if isinstance(offer, dict)
+        ] if isinstance(raw_offers, list) else [],
+    }
+
+
+def record_last_matches(matching_offers: list, incomplete_store_ids) -> None:
+    """Zapis dopasowan z cyklu; blad tylko w logu - /oferty to dodatek, nie
+    moze zmienic kodu wyjscia ani wyniku cyklu dla bloku 'health'."""
+    try:
+        save_last_matches(matching_offers, incomplete_store_ids, time.time())
+    except Exception as exc:
+        log(
+            f"Blad zapisu ostatnich dopasowan ({LAST_MATCHES_FILE}): {exception_text(exc)}",
+            to_stderr=True,
+        )
+
+
 def format_offer_group_email(group: dict) -> str:
     """Formatuje grupe ofert dla e-maila: wspolny opis + lista egzemplarzy."""
     s = group["shared"]
@@ -1969,10 +2054,17 @@ HEALTH_RECOVERY_MESSAGE = (
 
 
 def format_local_timestamp(epoch) -> str:
-    """Czas lokalny 'RRRR-MM-DD GG:MM:SS' albo 'nigdy' dla None."""
+    """Czas lokalny 'RRRR-MM-DD GG:MM:SS', 'nigdy' dla None albo 'nieznany
+    czas' dla nie-liczby i wartosci spoza zakresu - dostaje tez wartosci z
+    plikow stanu, ktore moga byc uszkodzone."""
     if epoch is None:
         return "nigdy"
-    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        return "nieznany czas"
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError, OSError):
+        return "nieznany czas"
 
 
 def build_health_alert_message(state: dict) -> str:
@@ -2109,6 +2201,138 @@ def telegram_get_updates(offset: int, timeout: int = 0) -> list:
     return result if isinstance(result, list) else []
 
 
+# /oferty: limity jednej grupy, zeby kazda zmiescila sie w wiadomosci.
+LAST_MATCHES_MAX_LINKS_PER_GROUP = 10
+LAST_MATCHES_GROUP_HEADER_MAX_CHARS = 600
+
+
+def _store_list_text(store_ids) -> str:
+    """'Wroclaw (294), Sklep 999 (999)' - escapowane."""
+    return ", ".join(
+        f"{escape_html(store_display_name(sid))} ({escape_html(str(sid))})" for sid in store_ids
+    )
+
+
+def _format_last_match_item(item: dict) -> str:
+    """Link 'Rezerwuj' albo numer oferty, gdy linku nie ma. Tylko https -
+    plik z dopasowaniami mogl byc edytowany recznie."""
+    link = item.get("reservation_link")
+    if isinstance(link, str) and link.startswith("https://"):
+        return f'<a href="{escape_html_attr(link)}">Rezerwuj</a>'
+    offer_number = item.get("offer_number")
+    if offer_number:
+        return f"oferta {escape_html(str(offer_number))}"
+    return "oferta bez numeru"
+
+
+def _format_last_matches_group(group: dict) -> str:
+    header = _format_group_header_telegram(
+        group["shared"], max_len=LAST_MATCHES_GROUP_HEADER_MAX_CHARS
+    )
+    items = group["items"]
+    shown = items[:LAST_MATCHES_MAX_LINKS_PER_GROUP]
+    line = f"Sztuk: {len(items)} - " + ", ".join(_format_last_match_item(i) for i in shown)
+    if len(items) > len(shown):
+        line += f" i jeszcze {len(items) - len(shown)}"
+    return f"{header}\n{line}"
+
+
+def format_last_matches_message() -> str:
+    """Odpowiedz na /oferty: dopasowania z LAST_MATCHES_FILE, pogrupowane
+    jak w powiadomieniach, w jednej wiadomosci (nadmiar grup jest tylko
+    liczony)."""
+    try:
+        data = load_last_matches()
+    except (OSError, ValueError) as exc:
+        log(f"Blad odczytu {LAST_MATCHES_FILE}: {exception_text(exc)}", to_stderr=True)
+        return (
+            "Nie udalo sie odczytac zapisanych dopasowan - plik zostanie "
+            "nadpisany przy nastepnym sprawdzeniu ofert."
+        )
+    if data is None:
+        return "Brak danych - jeszcze nie bylo sprawdzenia ofert."
+
+    checked_at = data["checked_at"]
+    checked_txt = format_local_timestamp(checked_at) if checked_at is not None else "nieznany czas"
+    offers = data["offers"]
+    groups = group_offers_for_notification(offers)
+    lines = [
+        f"<b>Dopasowania z ostatniego sprawdzenia</b> ({checked_txt})",
+        "Lista wg slow kluczowych i numerow z chwili tego sprawdzenia.",
+    ]
+    if data["incomplete_store_ids"]:
+        lines.append(
+            "Uwaga: brak danych ze sklepow: "
+            f"{_store_list_text(data['incomplete_store_ids'])} - ich ofert moze tu brakowac."
+        )
+    if not offers:
+        lines.append("")
+        lines.append("Brak dopasowan w tym sprawdzeniu.")
+        return "\n".join(lines)
+    lines.append(f"Ofert: {len(offers)}, produktow: {len(groups)}.")
+
+    separator = "\n\n"
+    # Miejsce na dopisek o pominietych grupach, rezerwowane przed kazda
+    # grupa poza ostatnia.
+    tail_reserve = len(separator) + len(f"... i jeszcze {len(groups)} produktow")
+    parts = ["\n".join(lines)]
+    length = len(parts[0])
+    for index, group in enumerate(groups):
+        block = _format_last_matches_group(group)
+        reserve = 0 if index == len(groups) - 1 else tail_reserve
+        if length + len(separator) + len(block) + reserve > TELEGRAM_SAFE_LIMIT:
+            break
+        parts.append(block)
+        length += len(separator) + len(block)
+    hidden = len(groups) - (len(parts) - 1)
+    if hidden:
+        parts.append(f"... i jeszcze {hidden} produktow")
+    return separator.join(parts)
+
+
+def _format_status_check_lines() -> list:
+    """Linie /status o sprawdzaniu ofert: ostatnie udane sprawdzenie, liczba
+    dopasowan, backoff i alert o awarii."""
+    health = get_health_state()
+    last_ok = health["last_successful_check_at"]
+    lines = [
+        "Ostatnie udane sprawdzenie: "
+        + (format_local_timestamp(last_ok) if last_ok is not None else "jeszcze nie bylo")
+    ]
+    try:
+        data = load_last_matches()
+    except (OSError, ValueError):
+        lines.append("Dopasowania w ostatnim sprawdzeniu: brak danych (plik nieczytelny)")
+    else:
+        if data is None:
+            lines.append("Dopasowania w ostatnim sprawdzeniu: brak danych")
+        else:
+            checked_at = data["checked_at"]
+            checked_txt = (
+                format_local_timestamp(checked_at) if checked_at is not None else "nieznany czas"
+            )
+            lines.append(
+                f"Dopasowania w ostatnim sprawdzeniu ({checked_txt}): "
+                f"{len(data['offers'])} - lista: /oferty"
+            )
+    if blocking_backoff_active() is not None:
+        backoff = get_blocking_backoff_state()
+        code_txt = (
+            f"HTTP {backoff.last_status_code}" if backoff.last_status_code is not None
+            else "HTTP 403/429"
+        )
+        lines.append(
+            f"Backoff po blokadzie IKEA ({code_txt}): sprawdzanie wstrzymane do "
+            f"{format_local_timestamp(backoff.next_allowed_check_at)}"
+        )
+    if health["alert_active"]:
+        lines.append(
+            "Alert o awarii monitora aktywny. Ostatni blad: "
+            f"{escape_html(health['last_error'] or 'brak opisu')}"
+        )
+    return lines
+
+
 def format_status_message() -> str:
     lines = ["<b>Aktualny monitoring:</b>", "", "Aktywne sklepy:"]
     if STORE_IDS:
@@ -2126,6 +2350,8 @@ def format_status_message() -> str:
     if MAX_PRICE is not None:
         lines.append(f"Maks. cena: {MAX_PRICE}")
     lines.append(f"Tryb pracy: {escape_html(RUN_MODE)}")
+    lines.append("")
+    lines.extend(_format_status_check_lines())
     return "\n".join(lines)
 
 
@@ -2158,7 +2384,8 @@ def format_help_message() -> str:
         "/sklepy - pokaz aktywne i dostepne sklepy\n"
         "/dodajsklep &lt;ID&gt; - dodaj sklep do monitoringu\n"
         "/usunsklep &lt;ID&gt; - usun sklep z monitoringu\n"
-        "/status - pokaz aktualny monitoring\n"
+        "/status - pokaz aktualny monitoring i stan sprawdzania\n"
+        "/oferty - dopasowania z ostatniego sprawdzenia\n"
         "/pomoc - ta lista"
     )
 
@@ -2260,6 +2487,9 @@ def handle_command(cmd: str, arg: str) -> str:
 
     if cmd in ("/status", "/lista"):
         return format_status_message()
+
+    if cmd in ("/oferty", "/offers"):
+        return format_last_matches_message()
 
     if cmd in ("/pomoc", "/help", "/start"):
         return format_help_message()
@@ -2551,6 +2781,9 @@ def _run_check_cycle() -> tuple:
         )
 
     matching_offers = flatten_matching_offers(content)
+    if STORE_IDS:
+        # Tu co najmniej jeden sklep jest pobrany - jest co pokazac w /oferty.
+        record_last_matches(matching_offers, list(store_errors))
     current_uuids = {o["offer_uuid"] for o in matching_offers if o.get("offer_uuid")}
 
     try:

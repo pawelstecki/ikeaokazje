@@ -235,9 +235,26 @@ Wiadomości e-mail używają analogicznego grupowania.
 /sklepy              - pokaż aktywne i dostępne sklepy
 /dodajsklep <ID>     - dodaj sklep do monitoringu (tylko znane ID)
 /usunsklep <ID>      - usuń sklep z monitoringu
-/status              - aktualne sklepy/słowa/numery/filtry
+/status              - sklepy/słowa/numery/filtry i stan sprawdzania
+/oferty              - dopasowania z ostatniego sprawdzenia
 /pomoc               - lista komend
 ```
+
+`/status` poza sklepami, słowami i filtrami pokazuje czas ostatniego
+udanego sprawdzenia, liczbę dopasowań z ostatniego sprawdzenia, aktywny
+backoff po 403/429 (do kiedy i po jakim kodzie HTTP) oraz aktywny alert
+o awarii monitora razem z ostatnim błędem.
+
+`/oferty` pokazuje wszystkie dopasowania zapisane przy ostatnim
+sprawdzeniu ofert (także te, o których powiadomienie już przyszło),
+pogrupowane jak w powiadomieniach: nazwa, sklep, cena i rabat, liczba
+sztuk i linki „Rezerwuj” (albo numer oferty, gdy linku nie ma). Lista
+odpowiada słowom kluczowym i numerom z chwili tamtego sprawdzenia - po
+`/dodaj` albo `/usun` zmieni się dopiero po kolejnym. Jeśli któryś sklep
+wtedy nie odpowiedział, odpowiedź o tym uprzedza. Wszystko mieści się
+w jednej wiadomości: produkty, które się nie zmieszczą, są tylko
+policzone („... i jeszcze N produktow”), a przy produkcie z wieloma
+sztukami widać najwyżej 10 linków.
 
 Bot reaguje tylko na wiadomości z `TELEGRAM_CHAT_ID` z `.env` - inni
 nadawcy są ignorowani. Komenda z nazwą bota (np. `/status@MojBot`, tak
@@ -259,6 +276,12 @@ nową wiadomość.
   może otrzymać duplikat; brak gwarancji exactly-once).
 - `~/.ikea_okazje_telegram_offset.json` - offset ostatnio przetworzonej
   wiadomości Telegrama.
+- `~/.ikea_okazje_last_matches.json` - dopasowania z ostatniego
+  sprawdzenia (dla `/oferty` i `/status`) i lista sklepów, których wtedy
+  nie udało się pobrać. Nadpisywany po każdym sprawdzeniu, w którym
+  udało się pobrać co najmniej jeden sklep. Można go bezpiecznie usunąć;
+  błąd zapisu trafia tylko do logu i nie wpływa na powiadomienia ani na
+  alert o awarii monitora.
 
 Zmiana `STORE_IDS`/`SEARCH_TERMS`/`SEARCH_ARTICLE_NUMBERS` w `.env` **nie
 ma efektu**, jeśli `~/.ikea_okazje_dynamic.json` już istnieje - edytuj
