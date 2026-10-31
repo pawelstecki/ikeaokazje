@@ -1227,8 +1227,7 @@ def group_offers_for_notification(offers: list) -> list:
 
     Nie zmienia semantyki offer_uuid ani pliku seen_offers - grupowanie
     jest WYLACZNIE na potrzeby formatowania wiadomosci."""
-    from collections import OrderedDict
-    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+    groups: dict = {}
     for o in offers:
         key = _offer_group_key(o)
         if key not in groups:
@@ -1258,15 +1257,6 @@ def group_offers_for_notification(offers: list) -> list:
     return list(groups.values())
 
 
-def load_seen_uuids() -> set:
-    """Zwraca zbior UUID-ow juz w pelni dostarczonych (klucz 'seen').
-    Stary plik bez klucza 'pending' nadal dziala poprawnie.\""""
-    if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return set(json.load(f).get("seen", []))
-
-
 def load_seen_state() -> dict:
     """Wczytuje pelny stan plikow ofert: klucz 'seen' (zbior UUID w pelni
     dostarczonych) i 'pending' (slownik uuid -> lista kanalow, ktore juz
@@ -1283,21 +1273,6 @@ def load_seen_state() -> dict:
             for uuid, channels in (data.get("pending") or {}).items()
         },
     }
-
-
-def save_seen_uuids(uuids: set) -> None:
-    """Zapisuje tylko klucz 'seen', zachowujac istniejacy klucz 'pending'
-    z dysku (atomowy zapis przez .tmp, nie gubi pending).\""""
-    # Wczytaj istniejacy pending, zeby go nie zgubic przy zapisie seen
-    existing_pending = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                existing_pending = (json.load(f).get("pending") or {})
-        except (OSError, json.JSONDecodeError):
-            existing_pending = {}
-
-    _write_seen_state(uuids, existing_pending)
 
 
 def save_seen_state(seen: set, pending: dict) -> None:
@@ -1320,29 +1295,6 @@ def _write_seen_state(seen: set, pending: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, STATE_FILE)
-
-
-def format_offer_block(o: dict) -> str:
-    discount_txt = f"{o['discount_percent']}%" if o["discount_percent"] is not None else "n/d"
-    lines = [
-        f"Produkt: {o['title']} - {o['description']}",
-        f"Cena: {o['price']} {o['currency']} (cena wyjsciowa: {o['original_price']} {o['currency']}, rabat: {discount_txt})",
-        f"Stan: {o['condition']} ({o['condition_desc']})",
-        f"Powod przeceny: {o['reason_discount']}",
-        f"Info: {o['additional_info']}",
-        f"Numer artykulu: {', '.join(o['article_numbers'] or [])}",
-        f"Numer oferty: {o['offer_number']}",
-        f"Sklep (storeId): {o['store_id']} - {store_display_name(o['store_id'])}",
-        f"Zdjecie: {o['hero_image']}",
-    ]
-    if o.get("reservation_link"):
-        lines.append(f"Link do rezerwacji: {o['reservation_link']}")
-    else:
-        lines.append(
-            "Rezerwacja: otwórz stronę \"Okazje na Okrągło online\", "
-            "wybierz właściwy sklep i znajdź ofertę po numerze oferty."
-        )
-    return "\n".join(lines)
 
 
 def format_offer_group_email(group: dict) -> str:
@@ -1423,34 +1375,6 @@ def send_email(new_offers) -> None:
     deliver_email_message(subject, body)
 
 
-def format_offer_telegram(o: dict) -> str:
-    discount_txt = f"{o['discount_percent']}%" if o["discount_percent"] is not None else "n/d"
-    title = escape_html(o["title"] or "")
-    description = escape_html(o["description"] or "")
-    currency = escape_html(str(o["currency"])) if o.get("currency") is not None else ""
-    condition = escape_html(str(o["condition"])) if o.get("condition") is not None else "n/d"
-    offer_number_txt = escape_html(str(o["offer_number"])) if o.get("offer_number") else "brak"
-    if o.get("store_id"):
-        store_id_txt = escape_html(f"{o['store_id']} - {store_display_name(o['store_id'])}")
-    else:
-        store_id_txt = "brak"
-
-    price_txt = escape_html(str(o["price"])) if o.get("price") is not None else "n/d"
-    original_price_txt = escape_html(str(o["original_price"])) if o.get("original_price") is not None else "n/d"
-
-    lines = [
-        f"<b>{title}</b> - {description}",
-        f"Cena: <b>{price_txt} {currency}</b> "
-        f"(z {original_price_txt} {currency}, rabat {discount_txt})",
-        f"Stan: {condition}",
-        f"Numer oferty: {offer_number_txt} | Sklep: {store_id_txt}",
-    ]
-    if o.get("reservation_link"):
-        safe_link = escape_html_attr(o["reservation_link"])
-        lines.append(f'<a href="{safe_link}">Przejdź do rezerwacji oferty</a>')
-    return "\n".join(lines)
-
-
 def escape_html(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -1524,20 +1448,10 @@ def _minimal_group_header_telegram(shared: dict) -> str:
     return f"<b>…</b>\n{meta_line}"
 
 
-def _full_title_min_header_telegram(shared: dict) -> str:
-    """Zwraca naglowek grupy z pelnym tytulem i metadanymi (sklep, cena, stan),
-    ale bez opisu. Okresla minimalna ilosc miejsca potrzebna, aby pokazac pelny
-    tytul produktu wraz ze wspolnymi danymi grupy."""
-    raw_title = str(shared.get("title") or "")
-    safe_title = escape_html(raw_title)
-    meta_line = _format_meta_line_telegram(shared)
-    return f"<b>{safe_title}</b>\n{meta_line}"
-
-
 def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
     """Formatuje naglowek grupy ofert dla Telegrama (wspolne pola produktu).
-    Uzywany przez format_offer_group_telegram() i jako naglowek
-    (lub naglowek kontynuacji) przy podziale grupy na wiadomosci.
+    Uzywany jako naglowek (lub naglowek kontynuacji) przy podziale grupy na
+    wiadomosci w split_telegram_messages().
 
     Jesli max_len jest podane i pelny naglowek przekracza ten limit, funkcja
     bezpiecznie skróci opis (lub w razie potrzeby tytul) PRZED escapowaniem HTML,
@@ -1593,24 +1507,6 @@ def _format_offer_item_telegram(item: dict) -> str:
         return f'• oferta {offer_number_txt} — <a href="{safe_link}">Rezerwuj</a>'
     else:
         return f"• oferta {offer_number_txt} — link niedostępny"
-
-
-def format_offer_group_telegram(group: dict, max_header_len: int = None) -> str:
-    """Formatuje cala grupe (naglowek + wszystkie egzemplarze) jako jeden
-    blok tekstu Telegram HTML. Uzywany gdy cala grupa miesci sie w jednej
-    wiadomosci."""
-    shared = group["shared"]
-    items = group["items"]
-    header = _format_group_header_telegram(shared, max_len=max_header_len)
-
-    if len(items) == 1:
-        item_line = _format_offer_item_telegram(items[0])
-        return f"{header}\n{item_line}"
-
-    lines = [header, f"{len(items)} nowych sztuk:"]
-    for item in items:
-        lines.append(_format_offer_item_telegram(item))
-    return "\n".join(lines)
 
 
 # Telegram API limit to 4096 znakow. Uzywamy bezpiecznego marginesu.
@@ -1810,14 +1706,6 @@ def send_telegram(new_offers) -> None:
     if not messages:
         return
 
-    # Koncowa kontrola poprawnosci przed wyslaniem pierwszej wiadomosci
-    for idx, msg in enumerate(messages, 1):
-        if len(msg) > TELEGRAM_SAFE_LIMIT:
-            raise ValueError(
-                f"Wiadomosc Telegrama {idx}/{len(messages)} przekracza bezpieczny limit "
-                f"{TELEGRAM_SAFE_LIMIT} znakow (faktyczna dlugosc: {len(msg)})."
-            )
-
     sent_count = 0
     for msg in messages:
         try:
@@ -1830,39 +1718,13 @@ def send_telegram(new_offers) -> None:
             )
 
 
-def notify(new_offers) -> dict:
-    """Wysyla powiadomienie tylko przez faktycznie skonfigurowane i wlaczone
-    kanaly. Gdy SMTP_MODE='disabled', e-mail jest calkowicie pomijany (bez
-    inicjowania jakiegokolwiek polaczenia SMTP).
-
-    Zwraca slownik z kluczami 'email' i 'telegram', kazdemu odpowiada
-    None (sukces/nieskonf.) albo string z opisem bledu. Pozwala
-    run_ikea_check_cycle() podejmowac decyzje o zapisie seen_offers
-    per kanal."""
-    result = {"email": None, "telegram": None}
-
-    if EMAIL_ENABLED:
-        try:
-            send_email(new_offers)
-        except Exception as exc:
-            result["email"] = f"e-mail: {exc}"
-
-    if TELEGRAM_ENABLED:
-        try:
-            send_telegram(new_offers)
-        except Exception as exc:
-            result["telegram"] = f"telegram: {exc}"
-
-    return result
-
-
 # ---------------- POWIADOMIENIA O UTRACIE/ODZYSKANIU DOSTEPU (403/429) ----------------
 # Minimalny, dodatkowy mechanizm stanu (patrz ikea_access_notification w
-# load_dynamic_state()) - odrebny od notify()/new_offers powyzej, bo dotyczy
+# load_dynamic_state()) - odrebny od powiadomien o nowych ofertach, bo dotyczy
 # stanu DOSTEPU do API IKEA jako calosci (pelny cykl bez zadnych danych z
 # powodu HTTP 403/429), nie konkretnych ofert. Uzywa jednak tych samych,
-# aktualnie skonfigurowanych kanalow (e-mail/Telegram) i tego samego wzorca
-# zbierania bledow jak notify() - patrz notify_access_status() nizej.
+# aktualnie skonfigurowanych kanalow (e-mail/Telegram) - patrz
+# notify_access_status() nizej.
 
 ACCESS_OUTAGE_EMAIL_SUBJECT = "IKEA Okazje: brak dostepu (HTTP 403/429)"
 ACCESS_OUTAGE_MESSAGE = (
@@ -1881,10 +1743,10 @@ ACCESS_RECOVERY_TELEGRAM_MESSAGE = "✅ " + ACCESS_RECOVERY_MESSAGE
 
 
 def notify_access_status(email_subject: str, email_body: str, telegram_text: str) -> list:
-    """Jak notify() powyzej, ale dla krotkich komunikatow o stanie dostepu
-    (utrata/odzyskanie) - te same, aktualnie skonfigurowane i wlaczone
-    kanaly (EMAIL_ENABLED/TELEGRAM_ENABLED), zaden nowy kanal powiadomien.
-    Zwraca liste bledow dostawy w tym samym formacie co notify(), zeby
+    """Wysyla krotki komunikat o stanie dostepu (utrata/odzyskanie) przez
+    te same, aktualnie skonfigurowane i wlaczone kanaly
+    (EMAIL_ENABLED/TELEGRAM_ENABLED), zaden nowy kanal powiadomien.
+    Zwraca liste bledow dostawy (po jednym napisie na kanal), zeby
     wolajacy (handle_access_notification_state()) mogl zastosowac
     identyczna logike "czy to byla calkowita porazka dostawy" jak dla
     powiadomien o nowych ofertach."""
@@ -1952,8 +1814,7 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
           odzyskaniu i resetuje caly stan.
 
     Jesli sama dostawa powiadomienia (utraty ALBO odzyskania) calkowicie
-    zawiedzie (wszystkie aktywne kanaly zwrocily blad - identycznie jak w
-    run_ikea_check_cycle() dla notify(new_offers)), stan NIE jest
+    zawiedzie (wszystkie aktywne kanaly zwrocily blad), stan NIE jest
     oznaczany jako wyslany/zresetowany - kolejny KWALIFIKUJACY cykl z tym
     samym wynikiem sprobuje wyslac powiadomienie ponownie, zamiast cicho
     "zgubic" alert (pending_outage/outage_active zostaja takie, jakie

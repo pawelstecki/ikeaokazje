@@ -89,6 +89,21 @@ def _run_module_with_env(env_file_contents: str) -> subprocess.CompletedProcess:
     )
 
 
+def _load_seen() -> set:
+    """Zbior UUID z klucza 'seen' w STATE_FILE."""
+    return ik.load_seen_state()["seen"]
+
+
+def _save_seen(uuids) -> None:
+    """Zapisuje klucz 'seen' w STATE_FILE, zachowujac istniejacy klucz
+    'pending' (nieczytelny/uszkodzony plik traktowany jak brak pending)."""
+    try:
+        pending = ik.load_seen_state()["pending"]
+    except (OSError, json.JSONDecodeError):
+        pending = {}
+    ik.save_seen_state(set(uuids), pending)
+
+
 class TestSideEffectFreeImport(unittest.TestCase):
     """`import ikea_okazje` samo w sobie nie powinno robic NIC poza
     zdefiniowaniem funkcji/stalych/harmless defaultow - patrz
@@ -690,39 +705,71 @@ class TestNotificationConfigValidation(unittest.TestCase):
 
 
 class TestEmailDisabledMode(unittest.TestCase):
-    def test_notify_skips_email_when_disabled(self):
-        orig_email_enabled = ik.EMAIL_ENABLED
-        orig_telegram_enabled = ik.TELEGRAM_ENABLED
-        ik.EMAIL_ENABLED = False
-        ik.TELEGRAM_ENABLED = False
-        try:
-            with mock.patch.object(ik, "send_email") as mock_send_email, \
-                 mock.patch.object(ik, "send_telegram") as mock_send_telegram:
-                result = ik.notify([{"title": "x"}])
-            mock_send_email.assert_not_called()
-            mock_send_telegram.assert_not_called()
-            self.assertIsNone(result["email"])
-            self.assertIsNone(result["telegram"])
-        finally:
-            ik.EMAIL_ENABLED = orig_email_enabled
-            ik.TELEGRAM_ENABLED = orig_telegram_enabled
+    """EMAIL_ENABLED=False (SMTP_MODE=disabled) - run_ikea_check_cycle()
+    nie wywoluje send_email() w ogole."""
 
-    def test_notify_uses_only_telegram_when_email_disabled(self):
-        orig_email_enabled = ik.EMAIL_ENABLED
-        orig_telegram_enabled = ik.TELEGRAM_ENABLED
-        ik.EMAIL_ENABLED = False
-        ik.TELEGRAM_ENABLED = True
-        try:
-            with mock.patch.object(ik, "send_email") as mock_send_email, \
-                 mock.patch.object(ik, "send_telegram") as mock_send_telegram:
-                result = ik.notify([{"title": "x"}])
-            mock_send_email.assert_not_called()
-            mock_send_telegram.assert_called_once()
-            self.assertIsNone(result["email"])
-            self.assertIsNone(result["telegram"])
-        finally:
-            ik.EMAIL_ENABLED = orig_email_enabled
-            ik.TELEGRAM_ENABLED = orig_telegram_enabled
+    def setUp(self):
+        self._orig_store_ids = list(ik.STORE_IDS)
+        self._orig_terms = list(ik.SEARCH_TERMS)
+        self._orig_numbers = list(ik.SEARCH_ARTICLE_NUMBERS)
+        ik.SEARCH_TERMS = ["stol"]
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = []
+        ik.STORE_IDS = ["294"]
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+        _save_seen(set())  # nie-first-run
+
+    def tearDown(self):
+        ik.STORE_IDS = self._orig_store_ids
+        ik.SEARCH_TERMS = self._orig_terms
+        ik.refresh_normalized_terms()
+        ik.SEARCH_ARTICLE_NUMBERS = self._orig_numbers
+        if os.path.exists(ik.STATE_FILE):
+            os.remove(ik.STATE_FILE)
+
+    def _product(self, uuid):
+        return {
+            "title": "Stol drewniany",
+            "description": "opis",
+            "originalPrice": 200,
+            "articleNumbers": ["12345678"],
+            "currency": "PLN",
+            "storeId": "294",
+            "offers": [{
+                "offerUuid": uuid,
+                "offerNumber": "12345",
+                "price": 100,
+                "productConditionTitle": "Nowy",
+                "productConditionDescription": "brak",
+                "reasonDiscount": "wystawowy",
+                "additionalInfo": None,
+            }],
+            "heroImage": None,
+        }
+
+    def test_cycle_skips_email_when_disabled(self):
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[self._product("uuid-off")]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "send_email") as mock_send_email, \
+             mock.patch.object(ik, "send_telegram") as mock_send_telegram:
+            result = ik.run_ikea_check_cycle()
+        self.assertEqual(result, 0)
+        mock_send_email.assert_not_called()
+        mock_send_telegram.assert_not_called()
+
+    def test_cycle_uses_only_telegram_when_email_disabled(self):
+        with mock.patch.object(ik, "fetch_store_offers", return_value=[self._product("uuid-tg")]), \
+             mock.patch.object(ik, "EMAIL_ENABLED", False), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "send_email") as mock_send_email, \
+             mock.patch.object(ik, "send_telegram") as mock_send_telegram:
+            result = ik.run_ikea_check_cycle()
+        self.assertEqual(result, 0)
+        mock_send_email.assert_not_called()
+        mock_send_telegram.assert_called_once()
+        self.assertIn("uuid-tg", _load_seen())
 
 
 class TestModuleStartupNotificationConfig(unittest.TestCase):
@@ -904,7 +951,14 @@ class TestTelegramCommandHtmlSafety(unittest.TestCase):
         self.assertNotIn("<script>", reply)
 
 
-class TestFormatOfferTelegramEscaping(unittest.TestCase):
+class TestTelegramMessageEscaping(unittest.TestCase):
+    """Escapowanie HTML w gotowych wiadomosciach Telegrama
+    (group_offers_for_notification() + split_telegram_messages())."""
+
+    def _render(self, offer):
+        groups = ik.group_offers_for_notification([offer])
+        return "\n".join(ik.split_telegram_messages(groups))
+
     def _offer(self, **overrides):
         offer = {
             "offer_uuid": "uuid-1",
@@ -929,7 +983,7 @@ class TestFormatOfferTelegramEscaping(unittest.TestCase):
 
     def test_title_and_description_with_html_chars_are_escaped(self):
         o = self._offer(title="<b>Stall</b>", description="a & b < c > d")
-        text = ik.format_offer_telegram(o)
+        text = self._render(o)
         self.assertNotIn("<b>Stall</b>", text)
         self.assertIn("&lt;b&gt;Stall&lt;/b&gt;", text)
         self.assertIn("a &amp; b &lt; c &gt; d", text)
@@ -941,7 +995,7 @@ class TestFormatOfferTelegramEscaping(unittest.TestCase):
             offer_number="<y>123",
             store_id="<z>294",
         )
-        text = ik.format_offer_telegram(o)
+        text = self._render(o)
         self.assertNotIn("<i>uzyty</i>", text)
         self.assertNotIn("<x>PLN", text)
         self.assertNotIn("<y>123", text)
@@ -951,14 +1005,14 @@ class TestFormatOfferTelegramEscaping(unittest.TestCase):
         o = self._offer(
             reservation_link='https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/wroc%C5%82aw/123"onmouseover="x'
         )
-        text = ik.format_offer_telegram(o)
+        text = self._render(o)
         self.assertIn('href="', text)
         self.assertNotIn('123"onmouseover="x"', text)
         self.assertIn("&quot;onmouseover=&quot;x", text)
 
     def test_no_reservation_link_when_missing(self):
         o = self._offer(reservation_link=None)
-        text = ik.format_offer_telegram(o)
+        text = self._render(o)
         self.assertNotIn("<a href", text)
         self.assertNotIn("/search/?q=", text)
 
@@ -1075,19 +1129,21 @@ class TestRunCycleStoreFailureHandling(unittest.TestCase):
 
     def test_all_stores_failing_returns_error_and_no_notify(self):
         ik.STORE_IDS = ["100", "200"]
-        ik.save_seen_uuids({"existing-uuid"})
+        _save_seen({"existing-uuid"})
 
         with mock.patch.object(ik, "fetch_store_offers", side_effect=RuntimeError("boom")), \
-             mock.patch.object(ik, "notify") as mock_notify:
+             mock.patch.object(ik, "send_email") as mock_send_email, \
+             mock.patch.object(ik, "send_telegram") as mock_send_telegram:
             result = ik.run_ikea_check_cycle()
 
         self.assertEqual(result, 1)
-        mock_notify.assert_not_called()
-        self.assertEqual(ik.load_seen_uuids(), {"existing-uuid"})
+        mock_send_email.assert_not_called()
+        mock_send_telegram.assert_not_called()
+        self.assertEqual(_load_seen(), {"existing-uuid"})
 
     def test_one_store_failing_does_not_corrupt_seen_file(self):
         ik.STORE_IDS = ["100", "200"]
-        ik.save_seen_uuids({"existing-uuid"})
+        _save_seen({"existing-uuid"})
 
         def fake_fetch(store_id):
             if store_id == "100":
@@ -1098,7 +1154,7 @@ class TestRunCycleStoreFailureHandling(unittest.TestCase):
             result = ik.run_ikea_check_cycle()
 
         self.assertEqual(result, 0)
-        self.assertEqual(ik.load_seen_uuids(), {"existing-uuid"})
+        self.assertEqual(_load_seen(), {"existing-uuid"})
 
 
 class TestEmptyCriteriaWarning(unittest.TestCase):
@@ -1437,7 +1493,7 @@ class TestAccessNotificationState(unittest.TestCase):
 
     def test_one_channel_succeeds_other_fails_still_marks_alerted(self):
         # Wymog: dostawa jest uznana za sukces, jesli PRZYNAJMNIEJ JEDEN
-        # aktywny kanal sie powiodl (istniejacy wzorzec z notify()) - tylko
+        # aktywny kanal sie powiodl - tylko
         # CALKOWITA porazka wszystkich aktywnych kanalow nie oznacza alertu
         # jako wyslany. Wymusza dwa aktywne kanaly (e-mail + Telegram) na
         # czas testu, niezaleznie od faktycznej konfiguracji testowego .env.
@@ -2750,7 +2806,7 @@ class TestTelegramGroupedFormatting(unittest.TestCase):
     def test_single_item_group_no_count_label(self):
         offers = [_make_offer()]
         groups = ik.group_offers_for_notification(offers)
-        formatted = ik.format_offer_group_telegram(groups[0])
+        formatted = "\n".join(ik.split_telegram_messages(groups))
         self.assertNotIn("nowych sztuk", formatted)
 
     def test_multi_item_group_has_count_label(self):
@@ -2760,7 +2816,7 @@ class TestTelegramGroupedFormatting(unittest.TestCase):
             _make_offer(offer_number="3"),
         ]
         groups = ik.group_offers_for_notification(offers)
-        formatted = ik.format_offer_group_telegram(groups[0])
+        formatted = "\n".join(ik.split_telegram_messages(groups))
         self.assertIn("3 nowych sztuk:", formatted)
 
     def test_item_with_link_has_rezerwuj_anchor(self):
@@ -2780,13 +2836,6 @@ class TestTelegramGroupedFormatting(unittest.TestCase):
         groups = ik.group_offers_for_notification(offers)
         item_text = ik._format_offer_item_telegram(groups[0]["items"][0])
         self.assertIn("&lt;123&gt;", item_text)
-
-    def test_all_items_present_in_formatted_group(self):
-        offers = [_make_offer(offer_number=str(i)) for i in range(5)]
-        groups = ik.group_offers_for_notification(offers)
-        formatted = ik.format_offer_group_telegram(groups[0])
-        for i in range(5):
-            self.assertIn(str(i), formatted)
 
 class TestTelegramMessageSplitting(unittest.TestCase):
     def test_small_groups_fit_in_one_message(self):
@@ -2887,42 +2936,6 @@ class TestSendTelegramErrorHandling(unittest.TestCase):
                 ik.send_telegram(offers)
             self.assertIn("0/", str(ctx.exception))
 
-class TestNotifyReturnType(unittest.TestCase):
-    def test_notify_returns_dict_on_success(self):
-        with mock.patch.object(ik, "send_email"), \
-             mock.patch.object(ik, "send_telegram"), \
-             mock.patch.object(ik, "EMAIL_ENABLED", True), \
-             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
-            res = ik.notify([_make_offer()])
-            self.assertEqual(res, {"email": None, "telegram": None})
-
-    def test_notify_returns_email_error(self):
-        with mock.patch.object(ik, "send_email", side_effect=RuntimeError("Fail")), \
-             mock.patch.object(ik, "send_telegram"), \
-             mock.patch.object(ik, "EMAIL_ENABLED", True), \
-             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
-            res = ik.notify([_make_offer()])
-            self.assertIn("e-mail:", res["email"])
-            self.assertIsNone(res["telegram"])
-
-    def test_notify_returns_telegram_error(self):
-        with mock.patch.object(ik, "send_email"), \
-             mock.patch.object(ik, "send_telegram", side_effect=RuntimeError("Fail2")), \
-             mock.patch.object(ik, "EMAIL_ENABLED", True), \
-             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
-            res = ik.notify([_make_offer()])
-            self.assertIsNone(res["email"])
-            self.assertIn("telegram:", res["telegram"])
-
-    def test_notify_returns_both_errors(self):
-        with mock.patch.object(ik, "send_email", side_effect=RuntimeError("FailE")), \
-             mock.patch.object(ik, "send_telegram", side_effect=RuntimeError("FailT")), \
-             mock.patch.object(ik, "EMAIL_ENABLED", True), \
-             mock.patch.object(ik, "TELEGRAM_ENABLED", True):
-            res = ik.notify([_make_offer()])
-            self.assertIn("e-mail:", res["email"])
-            self.assertIn("telegram:", res["telegram"])
-
 class TestSeenOffersDeliverySemantics(unittest.TestCase):
     def setUp(self):
         self._orig_store_ids = list(ik.STORE_IDS)
@@ -2937,7 +2950,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         if os.path.exists(ik.STATE_FILE):
             os.remove(ik.STATE_FILE)
         # Stwórz plik seen zeby nie było first-run
-        ik.save_seen_uuids(set())
+        _save_seen(set())
 
     def tearDown(self):
         ik.STORE_IDS = self._orig_store_ids
@@ -2983,7 +2996,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
             result = ik.run_ikea_check_cycle()
 
         self.assertEqual(result, 2)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertNotIn("uuid-1", seen)
         self.assertNotIn("uuid-2", seen)
 
@@ -2996,7 +3009,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
             result2 = ik.run_ikea_check_cycle()
 
         self.assertEqual(result2, 0)
-        seen2 = ik.load_seen_uuids()
+        seen2 = _load_seen()
         self.assertIn("uuid-1", seen2)
         self.assertIn("uuid-2", seen2)
 
@@ -3015,7 +3028,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertEqual(len(email_calls), 1)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertNotIn("uuid-4", seen)  # nie w seen, tylko w pending
 
         # Drugi cykl - Telegram odzyskuje sprawnosc i odbiera oferte.
@@ -3031,7 +3044,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result2, 0)
         self.assertEqual(len(email_calls), 1)  # e-mail juz dostarczyl w cyklu 1 - brak duplikatu
         self.assertEqual(len(tg_calls), 1)     # Telegram pomyslnie otrzymuje oferty
-        seen2 = ik.load_seen_uuids()
+        seen2 = _load_seen()
         self.assertIn("uuid-4", seen2)
 
     def test_telegram_success_email_fail_does_not_save_seen(self):
@@ -3049,7 +3062,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertEqual(len(tg_calls), 1)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertNotIn("uuid-5", seen)  # nie w seen, tylko w pending
 
         # Drugi cykl - e-mail odzyskuje sprawnosc i odbiera oferte.
@@ -3065,7 +3078,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result2, 0)
         self.assertEqual(len(email_calls), 1)  # e-mail pomyslnie otrzymuje oferty
         self.assertEqual(len(tg_calls), 1)     # Telegram juz dostarczyl w cyklu 1 - brak duplikatu
-        seen2 = ik.load_seen_uuids()
+        seen2 = _load_seen()
         self.assertIn("uuid-5", seen2)
 
     def test_telegram_message_2_fails_while_email_succeeds(self):
@@ -3093,7 +3106,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(len(email_delivered), 1)
         self.assertEqual(call_count["n"], 2)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         for u in uuids:
             self.assertNotIn(u, seen)
 
@@ -3111,7 +3124,7 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         self.assertEqual(result2, 0)
         self.assertEqual(len(email_delivered), 1)  # e-mail juz dostarczyl w cyklu 1 - brak duplikatu
         self.assertGreater(len(tg_delivered), 1)   # Telegram dostarcza cala serie wiadomosci
-        seen2 = ik.load_seen_uuids()
+        seen2 = _load_seen()
         for u in uuids:
             self.assertIn(u, seen2)
 
@@ -3172,7 +3185,7 @@ class TestTelegramSplittingSafeLimitAndEdgeCases(unittest.TestCase):
         ik.STORE_IDS = ["294"]
         if os.path.exists(ik.STATE_FILE):
             os.remove(ik.STATE_FILE)
-        ik.save_seen_uuids(set())
+        _save_seen(set())
 
     def tearDown(self):
         ik.STORE_IDS = self._orig_store_ids
@@ -3285,7 +3298,7 @@ class TestTelegramSplittingSafeLimitAndEdgeCases(unittest.TestCase):
 
             mock_send.assert_not_called()
             self.assertEqual(ret, 2)
-            seen = ik.load_seen_uuids()
+            seen = _load_seen()
             self.assertNotIn("u-impossible", seen)
 
     def test_multiple_offers_with_later_impossible_link_aborts_without_sending_any(self):
@@ -3328,7 +3341,7 @@ class TestTelegramSplittingSafeLimitAndEdgeCases(unittest.TestCase):
 
             mock_send.assert_not_called()
             self.assertEqual(ret, 2)
-            seen = ik.load_seen_uuids()
+            seen = _load_seen()
             self.assertNotIn("u1", seen)
             self.assertNotIn("u2", seen)
             self.assertNotIn("u3", seen)
@@ -3490,7 +3503,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
         ik.STORE_IDS = ["294"]
         if os.path.exists(ik.STATE_FILE):
             os.remove(ik.STATE_FILE)
-        ik.save_seen_uuids(set())   # nie-first-run
+        _save_seen(set())   # nie-first-run
 
     def tearDown(self):
         ik.STORE_IDS = self._orig_store_ids
@@ -3539,7 +3552,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
 
         self.assertEqual(result1, 2)   # blad (e-mail zawiodl)
         self.assertEqual(len(tg_calls), 1, "Telegram powinien dostarczyc w cyklu 1")
-        seen1 = ik.load_seen_uuids()
+        seen1 = _load_seen()
         self.assertNotIn("uuid-A", seen1, "UUID nie powinien byc w seen - e-mail jeszcze nie dostarczyl")
 
         # Sprawdz, ze pending zapisany
@@ -3585,7 +3598,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(email_calls), 1, "E-mail powinien dostarczyc w cyklu naprawy")
         self.assertEqual(len(tg_calls), 1, "Telegram nie powinien dostac duplikatu po naprawie e-maila")
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertIn("uuid-B", seen, "UUID powinien byc w seen po naprawie e-maila")
         state = ik.load_seen_state()
         self.assertNotIn("uuid-B", state["pending"], "UUID nie powinien byc w pending po przeniesieniu do seen")
@@ -3611,7 +3624,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(len(tg_calls), 1)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertIn("uuid-new", seen)
         self.assertIn("old-uuid-1", seen, "Stare UUID musza zostac zachowane")
         self.assertIn("old-uuid-2", seen, "Stare UUID musza zostac zachowane")
@@ -3654,7 +3667,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
 
         self.assertEqual(result2, 0)
         self.assertEqual(len(tg_calls), 1, "Telegram nie powinien dostac duplikatu po wylaczeniu e-maila")
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertIn("uuid-C", seen, "UUID powinien byc w seen gdy jedyny aktywny kanal dostarczyl")
 
     def test_disabling_already_delivered_channel_does_not_resend(self):
@@ -3682,7 +3695,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(len(email_calls), 1, "Email powinien dostarczyc po wylaczeniu Telegrama")
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertIn("uuid-D", seen)
 
     # --- Wymog 5: Znikniecie oferty z API oczyszcza pending ---
@@ -3742,27 +3755,6 @@ class TestPerChannelDeliveryState(unittest.TestCase):
         self.assertIn("email", state["pending"]["uuid-F"])
         self.assertNotIn("telegram", state["pending"]["uuid-F"])
         self.assertNotIn("uuid-F", state["seen"], "UUID nie powinien byc w seen - Telegram nie dostarczyl")
-
-    # --- Wymog 7: save_seen_uuids() nie gubi klucza 'pending' ---
-
-    def test_save_seen_uuids_preserves_pending_key(self):
-        """save_seen_uuids() (wolana przez zewnetrzny kod) nie usuwa istniejacego
-        klucza 'pending' z pliku stanu - klucz jest zachowywany atomowo."""
-        existing_state = {
-            "seen": ["s1", "s2"],
-            "pending": {"p1": ["email"], "p2": ["telegram"]}
-        }
-        with open(ik.STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(existing_state, f)
-
-        # Wywolanie save_seen_uuids z nowym zbiorom seen
-        ik.save_seen_uuids({"s1", "s2", "s3"})
-
-        state = ik.load_seen_state()
-        self.assertIn("s3", state["seen"], "Nowe UUID musi byc w seen")
-        self.assertIn("p1", state["pending"], "Klucz 'pending' musi byc zachowany")
-        self.assertIn("p2", state["pending"], "Klucz 'pending' musi byc zachowany")
-        self.assertEqual(state["pending"]["p1"], ["email"])
 
     # --- Testy _enabled_channels() ---
 
@@ -3853,7 +3845,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
              mock.patch.object(ik, "send_telegram"):
             result = ik.run_ikea_check_cycle()
         self.assertEqual(result, 0)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertIn("uuid-ok", seen)
 
     def test_all_channels_fail_returns_two_and_no_seen(self):
@@ -3866,7 +3858,7 @@ class TestPerChannelDeliveryState(unittest.TestCase):
              mock.patch.object(ik, "send_telegram", side_effect=RuntimeError("tg")):
             result = ik.run_ikea_check_cycle()
         self.assertEqual(result, 2)
-        seen = ik.load_seen_uuids()
+        seen = _load_seen()
         self.assertNotIn("uuid-fail", seen)
 
     def test_telegram_grouping_preserved_for_channel_offers(self):
