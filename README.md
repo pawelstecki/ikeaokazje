@@ -24,7 +24,9 @@ python3 -m pip install -r requirements.txt
 
 Jedyna zależność to `curl_cffi`, minimalna wymagana wersja `0.7.0`
 (potrzebna do impersonacji Chrome 124 - nie schodź poniżej tej wersji).
-Python 3.8+.
+Zalecany Python 3.10+ (testowany w CI na 3.10, 3.12 i 3.13): aktualny
+`curl_cffi` wymaga 3.10, a Python 3.8 i 3.9 nie mają już wsparcia
+(end-of-life).
 
 ## Konfiguracja
 
@@ -38,18 +40,23 @@ nano ~/.config/ikea-okazje.env
 `ikea_okazje.py` możesz spokojnie aktualizować z GitHuba (`git pull`) -
 ten plik `.env` żyje poza repo i nigdy nie jest nadpisywany.
 
-Najważniejsze pola (pełny opis i przykłady w `.env.example`):
+Pola `.env` (pełny opis i przykłady w `.env.example`):
 
 | Pole | Opis | Domyślnie |
 |---|---|---|
 | `SMTP_MODE` | `gmail`, `local587`, `exim` albo `disabled` | `gmail` |
-| `SMTP_USER`, `SMTP_PASS` | login/haslo SMTP - wymagane dla `gmail`/`local587`, nieużywane dla `exim` (brak autentykacji) | - |
+| `SMTP_USER`, `SMTP_PASS` | login/hasło SMTP - wymagane dla `gmail`/`local587`, nieużywane dla `exim` (brak autentykacji) | - |
 | `EMAIL_TO` | odbiorca - wymagany, gdy e-mail jest włączony. Jeśli nie podasz `EMAIL_TO`, w trybach `gmail`/`local587` skrypt użyje `SMTP_USER`; w trybie `exim` `EMAIL_TO` trzeba podać jawnie | - |
+| `SMTP_HOST` | tylko `local587`/`exim` - adres serwera SMTP (w `gmail` zawsze `smtp.gmail.com`) | `localhost` |
+| `EMAIL_FROM` | tylko `exim` - adres nadawcy (w `gmail`/`local587` nadawcą jest `SMTP_USER`) | `ikea-watch@localhost` |
+| `VERIFY_TLS` | tylko `gmail`/`local587` - `false` wyłącza weryfikację certyfikatu serwera SMTP (np. lokalny MTA z przeterminowanym certyfikatem) | `true` |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał powiadomień + komendy - oba naraz albo żaden | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
+| `STORE_URL_SLUGS` | nadpisanie/rozszerzenie wbudowanej mapy sklepów dla linków rezerwacji, format `ID:slug,ID:slug` (patrz niżej) | brak |
 | `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
 | `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
 | `MATCH_WHOLE_WORDS` | `true` - słowa kluczowe pasują tylko jako całe słowa/frazy (patrz "Wyszukiwanie i powiadomienia") | `false` |
+| `ALERT_EXISTING_ON_FIRST_RUN` | `true` - pierwsze uruchomienie wysyła alert o ofertach już widocznych (patrz "Wyszukiwanie i powiadomienia") | `false` |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
 | `CHECK_HOURS` | w jakich godzinach sprawdzać oferty, format `H-H` (np. `8-22`, `22-6`, `0-24`), czas lokalny serwera (patrz "Okno godzinowe") | bez ograniczeń |
@@ -81,9 +88,9 @@ który od tej pory jest źródłem prawdy. Dalej zarządzasz listami komendami
 Telegrama - to bezpieczniejsza opcja niż ręczna edycja pliku. Jeśli
 edytujesz go wprost, zrób najpierw kopię. Usunięcie tego pliku resetuje
 nie tylko sklepy/słowa/numery do wartości z `.env`, ale też stan backoffu,
-stan alertu o utracie/odzyskaniu dostępu i alertu o awarii monitora
-(patrz niżej) - traktuj to
-jako pełny reset, nie tylko zmianę listy wyszukiwania.
+stan alertu o utracie/odzyskaniu dostępu i alertu o awarii monitora oraz
+czas startu ostatniego sprawdzenia (limit `/sprawdz`) - patrz niżej.
+Traktuj to jako pełny reset, nie tylko zmianę listy wyszukiwania.
 
 Skrypt ma wbudowaną mapę wszystkich sklepów IKEA w Polsce (`KNOWN_STORES`
 w kodzie, dostępna w Telegramie pod `/sklepy`) - do `STORE_IDS` wystarczy
@@ -123,17 +130,22 @@ domowym), ale użyj **tych samych** we wszystkich trzech miejscach
 
 ### cron (RUN_MODE=cron, domyślny)
 
-Jedno przejście i wyjście, sprawdzanie ofert co interwał crona (poniżej:
-15 minut). Wyjątek: po blokadzie 403/429 odpalenia przed zapisanym
-terminem backoffu kończą się od razu (kod 0, wpis w logu, bez zapytania
-do IKEA) - patrz "Zachowanie przy HTTP 403/429":
+Jedno przejście i wyjście, sprawdzanie ofert przy każdym uruchomieniu
+z crona (w przykładzie poniżej co 30 minut). Wyjątek: po blokadzie
+403/429 odpalenia przed zapisanym terminem backoffu kończą się od razu
+(kod 0, wpis w logu, bez zapytania do IKEA) - patrz "Zachowanie przy
+HTTP 403/429".
+
+Przykład używa 30 minut, bo to narzędzie do rzadkiego, prywatnego
+sprawdzania (daemon domyślnie sprawdza co 45 min), a każde uruchomienie
+odpytuje wszystkie skonfigurowane sklepy.
 
 ```
 crontab -e
 ```
 
 ```
-*/15 * * * * /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py >> /home/TWOJ_UZYTKOWNIK/ikea_okazje.log 2>&1
+*/30 * * * * /usr/bin/flock -n /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py >> /home/TWOJ_UZYTKOWNIK/ikea_okazje.log 2>&1
 ```
 
 Prostsze, ale reakcja na komendy Telegrama i nowe oferty ograniczona do
@@ -324,13 +336,18 @@ nową wiadomość.
   backoffu, alertu dostępu i alertu o awarii monitora (opisane niżej)
   oraz czas startu ostatniego sprawdzenia (`"last_check_started_at"`,
   limit dla `/sprawdz`).
-- `~/.ikea_okazje_seen_offers.json` - identyfikatory już znanych ofert,
-  aby nie zgłaszać ich ponownie. Nowe oferty są dopisywane do tego pliku
-  wyłącznie wtedy, gdy wszystkie włączone kanały (e-mail, cała seria
-  wiadomości Telegrama) zakończą się pełnym sukcesem. W razie awarii
-  któregokolwiek kanału oferty nie są oznaczane jako znane i zostaną
-  ponowione w kolejnym cyklu (kanał, który wcześniej odebrał wiadomość,
-  może otrzymać duplikat; brak gwarancji exactly-once).
+- `~/.ikea_okazje_seen_offers.json` - stan dostawy ofert per kanał:
+  `seen` (oferty dostarczone wszystkimi włączonymi kanałami, nie są
+  zgłaszane ponownie) i `pending` (`{uuid: [kanały, które już
+  dostarczyły]}`). Gdy jeden kanał zawiedzie (np. SMTP z wygasłym
+  certyfikatem), sprawny kanał dostaje ofertę tylko raz, a kolejne cykle
+  ponawiają wysyłkę tylko do brakującego kanału. Oferta trafia do `seen`,
+  gdy dostarczą ją wszystkie aktualnie włączone kanały, więc wyłączenie
+  zawodzącego kanału kończy ponawianie. Kanał liczy się jako udany
+  dopiero po wysłaniu całej serii wiadomości; po błędzie w środku serii
+  Telegrama cała seria idzie ponownie, więc jej początek może przyjść
+  drugi raz (brak gwarancji exactly-once). Plik ze starszej wersji, bez
+  `pending`, działa bez zmian.
 - `~/.ikea_okazje_telegram_offset.json` - offset ostatnio przetworzonej
   wiadomości Telegrama.
 - `~/.ikea_okazje_last_matches.json` - dopasowania z ostatniego
@@ -339,12 +356,16 @@ nową wiadomość.
   udało się pobrać co najmniej jeden sklep. Można go bezpiecznie usunąć;
   błąd zapisu trafia tylko do logu i nie wpływa na powiadomienia ani na
   alert o awarii monitora.
+- `~/.ikea_okazje_last_raw.json` - surowa pierwsza strona odpowiedzi API
+  z ostatnio pobranego sklepu, do diagnozy (patrz "Diagnozowanie
+  problemów"). Można go bezpiecznie usunąć.
 
 Zmiana `STORE_IDS`/`SEARCH_TERMS`/`SEARCH_ARTICLE_NUMBERS` w `.env` **nie
 ma efektu**, jeśli `~/.ikea_okazje_dynamic.json` już istnieje - edytuj
 listy przez Telegrama (bezpieczniej) albo zrób kopię i edytuj plik wprost.
-Usunięcie pliku zasieje go na nowo z `.env`, ale zresetuje też backoff i
-alert dostępu - patrz "Konfiguracja" wyżej.
+Usunięcie pliku zasieje go na nowo z `.env`, ale zresetuje też stan
+backoffu, alertu dostępu i alertu o awarii monitora oraz
+`last_check_started_at` - patrz "Konfiguracja" wyżej.
 
 ## Zachowanie przy HTTP 403/429
 
@@ -428,9 +449,9 @@ pierwszym uruchomieniu, chyba że `ALERT_EXISTING_ON_FIRST_RUN=true`).
 **`osiagnieto limit MAX_PAGES`.** Sklep ma więcej stron ofert niż limit
 `MAX_PAGES` w kodzie - wyniki z dalszych stron są pomijane.
 
-
 **Usługa systemd wychodzi natychmiast ze statusem 0.** Sprawdź
-`RUN_MODE=daemon` w `~/.config/ikea-okazje.env` - patrz wyżej.
+`RUN_MODE=daemon` w `~/.config/ikea-okazje.env` - patrz "systemd
+(RUN_MODE=daemon)".
 
 **Zdublowane odpowiedzi na Telegramie.** Cron, systemd i/albo ręczne
 uruchomienie działają równocześnie - wybierz jeden mechanizm i sprawdź,
@@ -472,18 +493,6 @@ Standardowy `unittest`, bez sieci, bez `.env` użytkownika (testy izolują
 `HOME` we własnym tymczasowym katalogu). GitHub Actions
 (`.github/workflows/tests.yml`) uruchamia je przy każdym pushu i pull
 requeście na Pythonie 3.10, 3.12 i 3.13.
-
-## Stan dostawy per kanał
-
-Plik `~/.ikea_okazje_seen_offers.json` przechowuje teraz dwa klucze: `seen`
-(UUID-y w pełni dostarczone przez wszystkie aktywne kanały) i `pending` (UUID-y
-częściowo dostarczone — słownik `{uuid: [kanały, które już dostarczyły]}`).
-Dzięki temu gdy jeden kanał (np. SMTP z wygasłym certyfikatem) pada trwale,
-sprawny kanał (np. Telegram) dostarcza ofertę tylko raz — przy kolejnym cyklu
-nie dostaje duplikatu. UUID trafia do `seen` dopiero gdy wszystkie aktualnie
-włączone kanały go dostarczą. Wyłączenie kanału jest od razu respektowane —
-oferty w `pending` nie czekają wiecznie. Stare pliki bez klucza `pending`
-działają bez modyfikacji (migracja jest transparentna).
 
 ## Nieoficjalne API i licencja
 
