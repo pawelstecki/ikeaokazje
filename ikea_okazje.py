@@ -39,6 +39,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import threading
 from dataclasses import dataclass
@@ -74,6 +75,10 @@ STORE_JITTER_RANGE = (1.0, 3.0)
 # Domyslny interwal sprawdzania ofert (45 min) - rzadkie, prywatne
 # sprawdzanie. CHECK_INTERVAL_SECONDS z .env ma pierwszenstwo.
 DEFAULT_CHECK_INTERVAL_SECONDS = 2700
+# Dolna granica CHECK_INTERVAL_SECONDS; mniejsza wartosc z .env jest
+# podnoszona z ostrzezeniem (czeste odpytywanie prywatnego API).
+MIN_CHECK_INTERVAL_SECONDS = 300
+DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS = 15
 
 # Symetryczny jitter (+/- %) interwalu sprawdzania - rozbija sztywny rytm.
 CHECK_INTERVAL_JITTER_PERCENT = 25
@@ -232,14 +237,42 @@ def load_env_file(path: str) -> dict:
         )
 
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, value = line.split("=", 1)
-            value = value.strip().strip("'").strip('"')
-            values[key.strip()] = value
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export ") or key.startswith("export\t"):
+                key = key[len("export"):].strip()
+            values[key] = _parse_env_value(raw_value, path, line_number, key)
     return values
+
+
+def _parse_env_value(raw_value: str, path: str, line_number: int, key: str) -> str:
+    """Wartosc z linii .env. W cudzyslowie ('...' albo "...") brana doslownie
+    (moze zawierac '#' i spacje); bez cudzyslowu komentarz zaczyna '#' po
+    bialym znaku. Bledy nie pokazuja wartosci - to moze byc haslo."""
+    value = raw_value.strip()
+    if value[:1] in ("'", '"'):
+        quote = value[0]
+        end = value.find(quote, 1)
+        if end == -1:
+            raise RuntimeError(
+                f"Niezamkniety cudzyslow w {path}, linia {line_number} (klucz {key})."
+            )
+        rest = value[end + 1:].strip()
+        if rest and not rest.startswith("#"):
+            raise RuntimeError(
+                f"Nieoczekiwane znaki po cudzyslowie zamykajacym w {path}, "
+                f"linia {line_number} (klucz {key}). Dozwolony jest tylko "
+                "komentarz zaczynajacy sie od '#'."
+            )
+        return value[1:end]
+    comment = re.search(r"\s#", raw_value)
+    if comment:
+        return raw_value[:comment.start()].strip()
+    return value
 
 
 def parse_list(raw, default):
@@ -248,17 +281,80 @@ def parse_list(raw, default):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def parse_optional_number(raw):
+def _parse_config_number(raw, key: str):
+    """Liczba z .env (int, a gdy sie nie da - float) albo None dla pustej
+    wartosci. Tekst, ktory nie jest skonczona liczba, konczy start
+    RuntimeError, zamiast cicho wylaczyc filtr albo wlaczyc default."""
     if raw is None or raw.strip() == "":
         return None
-    raw = raw.strip()
+    text = raw.strip()
     try:
-        return int(raw)
+        return int(text)
     except ValueError:
-        try:
-            return float(raw)
-        except ValueError:
-            return None
+        pass
+    try:
+        value = float(text)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value):
+        raise RuntimeError(
+            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' nie jest liczba."
+        )
+    return value
+
+
+def parse_optional_non_negative_number(raw, key: str):
+    """Filtr liczbowy (MIN_DISCOUNT_PERCENT, MAX_PRICE): pusty -> None
+    (wylaczony), ujemny lub nie-liczba -> RuntimeError."""
+    value = _parse_config_number(raw, key)
+    if value is not None and value < 0:
+        raise RuntimeError(
+            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{raw.strip()}' - wartosc "
+            "nie moze byc ujemna."
+        )
+    return value
+
+
+def parse_positive_number(raw, key: str, default):
+    """Dodatnia liczba z .env; pusty -> default, <= 0 lub nie-liczba ->
+    RuntimeError."""
+    value = _parse_config_number(raw, key)
+    if value is None:
+        return default
+    if value <= 0:
+        raise RuntimeError(
+            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{raw.strip()}' - wartosc "
+            "musi byc wieksza od zera."
+        )
+    return value
+
+
+def parse_check_interval_seconds(raw):
+    """CHECK_INTERVAL_SECONDS: pusty -> DEFAULT_CHECK_INTERVAL_SECONDS.
+    Wartosc ponizej MIN_CHECK_INTERVAL_SECONDS jest podnoszona z
+    ostrzezeniem zamiast bledu, zeby istniejace instalacje dalej startowaly."""
+    value = parse_positive_number(raw, "CHECK_INTERVAL_SECONDS", DEFAULT_CHECK_INTERVAL_SECONDS)
+    if value < MIN_CHECK_INTERVAL_SECONDS:
+        log(
+            f"UWAGA: CHECK_INTERVAL_SECONDS={value} w {CONFIG_FILE} jest ponizej "
+            f"minimum {MIN_CHECK_INTERVAL_SECONDS}s - uzywam {MIN_CHECK_INTERVAL_SECONDS}s.",
+            to_stderr=True,
+        )
+        return MIN_CHECK_INTERVAL_SECONDS
+    return value
+
+
+def parse_run_mode(raw) -> str:
+    """Waliduje RUN_MODE (jak parse_smtp_mode()): pusty -> 'cron', literowka
+    konczy start RuntimeError zamiast cicho wlaczyc tryb cron."""
+    value = ("" if raw is None else raw).strip()
+    mode = value.lower() or "cron"
+    if mode not in ("cron", "daemon"):
+        raise RuntimeError(
+            f"Nieprawidlowe RUN_MODE w {CONFIG_FILE}: '{value}'. "
+            "Dozwolone wartosci: cron, daemon."
+        )
+    return mode
 
 
 def parse_bool(raw, default):
@@ -393,7 +489,7 @@ VERIFY_TLS = True
 
 RUN_MODE = "cron"
 CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL_SECONDS
-TELEGRAM_POLL_INTERVAL_SECONDS = 15
+TELEGRAM_POLL_INTERVAL_SECONDS = DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS
 
 STORE_URL_SLUGS: dict = {}
 
@@ -579,8 +675,10 @@ def initialize_runtime() -> None:
         parse_list(ENV.get("SEARCH_ARTICLE_NUMBERS"), [])
     )
 
-    MIN_DISCOUNT_PERCENT = parse_optional_number(ENV.get("MIN_DISCOUNT_PERCENT"))
-    MAX_PRICE = parse_optional_number(ENV.get("MAX_PRICE"))
+    MIN_DISCOUNT_PERCENT = parse_optional_non_negative_number(
+        ENV.get("MIN_DISCOUNT_PERCENT"), "MIN_DISCOUNT_PERCENT"
+    )
+    MAX_PRICE = parse_optional_non_negative_number(ENV.get("MAX_PRICE"), "MAX_PRICE")
     KEYWORDS_EXCLUDE = parse_list(ENV.get("KEYWORDS_EXCLUDE"), [])
 
     ALERT_EXISTING_ON_FIRST_RUN = parse_bool(ENV.get("ALERT_EXISTING_ON_FIRST_RUN"), False)
@@ -588,9 +686,13 @@ def initialize_runtime() -> None:
     SMTP_MODE = parse_smtp_mode(ENV.get("SMTP_MODE", "gmail"))
     VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
 
-    RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-    CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or CHECK_INTERVAL_SECONDS
-    TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
+    RUN_MODE = parse_run_mode(ENV.get("RUN_MODE"))
+    CHECK_INTERVAL_SECONDS = parse_check_interval_seconds(ENV.get("CHECK_INTERVAL_SECONDS"))
+    TELEGRAM_POLL_INTERVAL_SECONDS = parse_positive_number(
+        ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS"),
+        "TELEGRAM_POLL_INTERVAL_SECONDS",
+        DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS,
+    )
 
     # Ma pierwszenstwo nad KNOWN_STORES (nowe sklepy bez zmiany kodu).
     STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})

@@ -958,6 +958,303 @@ class TestModuleStartupNotificationConfig(unittest.TestCase):
         self.assertNotIn("SMTP_PASS", result.stderr)
 
 
+class TestEnvFileParser(unittest.TestCase):
+    """load_env_file(): przedrostek export, cudzyslowy, komentarze w linii,
+    bledy z numerem linii bez wypisywania wartosci."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ikea_okazje_env_parser_")
+        self.addCleanup(tmp.cleanup)
+        self._tmp_dir = tmp.name
+        self._path = os.path.join(self._tmp_dir, "test.env")
+
+    def _load(self, contents, mode=0o600):
+        with open(self._path, "w", encoding="utf-8") as f:
+            f.write(contents)
+        os.chmod(self._path, mode)
+        return ik.load_env_file(self._path)
+
+    def test_missing_file_returns_empty_dict(self):
+        self.assertEqual(ik.load_env_file(os.path.join(self._tmp_dir, "brak.env")), {})
+
+    def test_plain_values_and_full_line_comments(self):
+        values = self._load("# komentarz\n\nA=1\n  B = dwa  \nbez_znaku_rownosci\n")
+        self.assertEqual(values, {"A": "1", "B": "dwa"})
+
+    def test_export_prefix_is_ignored(self):
+        values = self._load("export SMTP_USER=ja@example.com\nexport\tB=2\nexportC=3\n")
+        self.assertEqual(values, {"SMTP_USER": "ja@example.com", "B": "2", "exportC": "3"})
+
+    def test_single_quoted_value_kept_verbatim(self):
+        values = self._load("SMTP_PASS=' ab #cd '\n")
+        self.assertEqual(values["SMTP_PASS"], " ab #cd ")
+
+    def test_double_quoted_value_kept_verbatim(self):
+        values = self._load('SMTP_PASS="x # y"\n')
+        self.assertEqual(values["SMTP_PASS"], "x # y")
+
+    def test_other_quote_type_inside_quotes_is_kept(self):
+        values = self._load("A=\"it's\"\nB='say \"hi\"'\n")
+        self.assertEqual(values, {"A": "it's", "B": 'say "hi"'})
+
+    def test_comment_after_closing_quote_is_allowed(self):
+        values = self._load("A='wartosc' # komentarz\nB=\"x\"#komentarz\n")
+        self.assertEqual(values, {"A": "wartosc", "B": "x"})
+
+    def test_empty_quoted_value(self):
+        values = self._load("TELEGRAM_BOT_TOKEN=''\nTELEGRAM_CHAT_ID=\"\"\n")
+        self.assertEqual(values, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""})
+
+    def test_text_after_closing_quote_raises_without_value(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load("A=1\nSMTP_PASS='tajne-haslo'reszta\n")
+        message = str(ctx.exception)
+        self.assertIn("linia 2", message)
+        self.assertIn(self._path, message)
+        self.assertNotIn("tajne-haslo", message)
+        self.assertNotIn("reszta", message)
+
+    def test_unterminated_quote_raises_with_line_number_without_value(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load("A=1\n\nSMTP_PASS='tajne-haslo\n")
+        message = str(ctx.exception)
+        self.assertIn("linia 3", message)
+        self.assertIn("SMTP_PASS", message)
+        self.assertIn(self._path, message)
+        self.assertNotIn("tajne-haslo", message)
+
+    def test_mismatched_quotes_are_unterminated(self):
+        # Stary parser zdejmowal ' i " niezaleznie, wiec 'abc" dawalo abc.
+        with self.assertRaises(RuntimeError):
+            self._load("A='abc\"\n")
+
+    def test_unquoted_inline_comment_after_whitespace_is_stripped(self):
+        values = self._load("MAX_PRICE=300 # zl\nB=x\t# tab\nC= # sam komentarz\n")
+        self.assertEqual(values, {"MAX_PRICE": "300", "B": "x", "C": ""})
+
+    def test_unquoted_hash_without_whitespace_is_part_of_value(self):
+        values = self._load("A=abc#def\nB=#abc\n")
+        self.assertEqual(values, {"A": "abc#def", "B": "#abc"})
+
+    def test_quotes_inside_unquoted_value_are_kept(self):
+        values = self._load("A=ab'cd'\n")
+        self.assertEqual(values["A"], "ab'cd'")
+
+    def test_equals_sign_inside_value_is_kept(self):
+        values = self._load("A='x=y'\nB=k=v\n")
+        self.assertEqual(values, {"A": "x=y", "B": "k=v"})
+
+    def test_permission_check_still_enforced(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load("A=1\n", mode=0o644)
+        self.assertIn("chmod 600", str(ctx.exception))
+
+
+class TestConfigValueValidation(unittest.TestCase):
+    """parse_run_mode() i parsery liczbowe - czyste funkcje, w procesie."""
+
+    def _assert_config_error(self, func, *args, key):
+        with self.assertRaises(RuntimeError) as ctx:
+            func(*args)
+        message = str(ctx.exception)
+        self.assertIn(key, message)
+        self.assertIn(ik.CONFIG_FILE, message)
+        return message
+
+    def test_run_mode_valid_values(self):
+        self.assertEqual(ik.parse_run_mode("cron"), "cron")
+        self.assertEqual(ik.parse_run_mode(" Daemon "), "daemon")
+        self.assertEqual(ik.parse_run_mode("CRON"), "cron")
+
+    def test_run_mode_missing_or_empty_defaults_to_cron(self):
+        self.assertEqual(ik.parse_run_mode(None), "cron")
+        self.assertEqual(ik.parse_run_mode(""), "cron")
+        self.assertEqual(ik.parse_run_mode("   "), "cron")
+
+    def test_run_mode_invalid_raises_with_allowed_values(self):
+        message = self._assert_config_error(ik.parse_run_mode, "deamon", key="RUN_MODE")
+        self.assertIn("cron, daemon", message)
+
+    def test_check_interval_missing_uses_default(self):
+        self.assertEqual(ik.parse_check_interval_seconds(None), ik.DEFAULT_CHECK_INTERVAL_SECONDS)
+        self.assertEqual(ik.parse_check_interval_seconds("  "), ik.DEFAULT_CHECK_INTERVAL_SECONDS)
+
+    def test_check_interval_valid_values(self):
+        self.assertEqual(ik.parse_check_interval_seconds("900"), 900)
+        self.assertEqual(ik.parse_check_interval_seconds("300"), 300)
+        self.assertEqual(ik.parse_check_interval_seconds("450.5"), 450.5)
+
+    def test_check_interval_below_minimum_is_clamped_with_warning(self):
+        self.assertEqual(ik.MIN_CHECK_INTERVAL_SECONDS, 300)
+        with mock.patch.object(ik, "log") as mock_log:
+            value = ik.parse_check_interval_seconds("60")
+        self.assertEqual(value, 300)
+        mock_log.assert_called_once()
+        self.assertIn("CHECK_INTERVAL_SECONDS", mock_log.call_args.args[0])
+        self.assertTrue(mock_log.call_args.kwargs.get("to_stderr"))
+
+    def test_check_interval_invalid_values_raise(self):
+        for raw in ("abc", "0", "-5", "inf", "nan", "15m"):
+            with self.subTest(raw=raw):
+                self._assert_config_error(
+                    ik.parse_check_interval_seconds, raw, key="CHECK_INTERVAL_SECONDS"
+                )
+
+    def test_telegram_poll_interval(self):
+        parse = ik.parse_positive_number
+        key = "TELEGRAM_POLL_INTERVAL_SECONDS"
+        self.assertEqual(parse(None, key, 15), 15)
+        self.assertEqual(parse("", key, 15), 15)
+        self.assertEqual(parse("5", key, 15), 5)
+        for raw in ("x", "0", "-1"):
+            with self.subTest(raw=raw):
+                self._assert_config_error(parse, raw, key, 15, key=key)
+
+    def test_optional_filters_missing_means_disabled(self):
+        self.assertIsNone(ik.parse_optional_non_negative_number(None, "MAX_PRICE"))
+        self.assertIsNone(ik.parse_optional_non_negative_number(" ", "MAX_PRICE"))
+
+    def test_optional_filters_valid_values(self):
+        parse = ik.parse_optional_non_negative_number
+        self.assertEqual(parse("30", "MIN_DISCOUNT_PERCENT"), 30)
+        self.assertEqual(parse("299.99", "MAX_PRICE"), 299.99)
+        self.assertEqual(parse("0", "MAX_PRICE"), 0)
+
+    def test_optional_filters_invalid_values_raise(self):
+        for key, raw in (
+            ("MAX_PRICE", "300zl"),
+            ("MAX_PRICE", "-1"),
+            ("MIN_DISCOUNT_PERCENT", "trzydziesci"),
+            ("MIN_DISCOUNT_PERCENT", "-5"),
+        ):
+            with self.subTest(key=key, raw=raw):
+                self._assert_config_error(
+                    ik.parse_optional_non_negative_number, raw, key, key=key
+                )
+
+
+class TestConfigValidationAtStartup(unittest.TestCase):
+    """Walidacja w initialize_runtime() - w osobnych procesach."""
+
+    BASE_ENV = "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+
+    def _init_and_check(self, env_contents, checks):
+        home_dir = _make_isolated_home(self.BASE_ENV + env_contents)
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n" + checks + "print('OK')\n",
+            home_dir,
+        )
+        return result
+
+    def test_invalid_run_mode_fails_at_startup(self):
+        result = _run_module_with_env(self.BASE_ENV + "RUN_MODE=deamon\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("RUN_MODE", result.stderr)
+        self.assertIn("ikea-okazje.env", result.stderr)
+
+    def test_run_mode_case_insensitive_at_startup(self):
+        result = self._init_and_check(
+            "RUN_MODE=Daemon # komentarz\n",
+            "assert ik.RUN_MODE == 'daemon', ik.RUN_MODE\n",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_short_check_interval_clamped_with_warning_on_stderr(self):
+        result = self._init_and_check(
+            "CHECK_INTERVAL_SECONDS=60\n",
+            "assert ik.CHECK_INTERVAL_SECONDS == 300, ik.CHECK_INTERVAL_SECONDS\n",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+        self.assertIn("CHECK_INTERVAL_SECONDS", result.stderr)
+        self.assertIn("300", result.stderr)
+
+    def test_invalid_check_interval_fails_at_startup(self):
+        result = _run_module_with_env(self.BASE_ENV + "CHECK_INTERVAL_SECONDS=0\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CHECK_INTERVAL_SECONDS", result.stderr)
+
+    def test_missing_check_interval_after_reinit_uses_default_not_previous_value(self):
+        home_dir = _make_isolated_home(self.BASE_ENV + "CHECK_INTERVAL_SECONDS=900\n")
+        config_path = os.path.join(home_dir, ".config", "ikea-okazje.env")
+        code = f"""
+import os
+import ikea_okazje as ik
+ik.initialize_runtime()
+assert ik.CHECK_INTERVAL_SECONDS == 900, ik.CHECK_INTERVAL_SECONDS
+with open({config_path!r}, "w", encoding="utf-8") as f:
+    f.write({self.BASE_ENV!r})
+os.chmod({config_path!r}, 0o600)
+ik.initialize_runtime()
+assert ik.CHECK_INTERVAL_SECONDS == ik.DEFAULT_CHECK_INTERVAL_SECONDS, ik.CHECK_INTERVAL_SECONDS
+print('OK')
+"""
+        result = _run_python_code(code, home_dir)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_telegram_poll_interval_default_and_invalid(self):
+        result = self._init_and_check(
+            "", "assert ik.TELEGRAM_POLL_INTERVAL_SECONDS == 15, ik.TELEGRAM_POLL_INTERVAL_SECONDS\n"
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        result = _run_module_with_env(self.BASE_ENV + "TELEGRAM_POLL_INTERVAL_SECONDS=-1\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TELEGRAM_POLL_INTERVAL_SECONDS", result.stderr)
+
+    def test_unparseable_filter_fails_instead_of_disabling(self):
+        result = _run_module_with_env(self.BASE_ENV + "MAX_PRICE=300zl\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MAX_PRICE", result.stderr)
+        self.assertIn("ikea-okazje.env", result.stderr)
+
+        result = _run_module_with_env(self.BASE_ENV + "MIN_DISCOUNT_PERCENT=-10\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MIN_DISCOUNT_PERCENT", result.stderr)
+
+    def test_filters_with_inline_comments_and_missing_filters(self):
+        result = self._init_and_check(
+            "MAX_PRICE=300 # zl\nMIN_DISCOUNT_PERCENT='30'\n",
+            "assert ik.MAX_PRICE == 300, ik.MAX_PRICE\n"
+            "assert ik.MIN_DISCOUNT_PERCENT == 30, ik.MIN_DISCOUNT_PERCENT\n",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+        result = self._init_and_check(
+            "MAX_PRICE=\n",
+            "assert ik.MAX_PRICE is None, ik.MAX_PRICE\n"
+            "assert ik.MIN_DISCOUNT_PERCENT is None, ik.MIN_DISCOUNT_PERCENT\n",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_quoted_password_with_hash_reaches_smtp_settings(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=gmail\nSMTP_USER=ja@example.com\n"
+            "export SMTP_PASS='ab #cd ' # haslo aplikacji\nSTORE_IDS=294\n"
+        )
+        result = _run_python_code(
+            "import ikea_okazje as ik\nik.initialize_runtime()\n"
+            "assert ik.SMTP_PASS == 'ab #cd ', repr(ik.SMTP_PASS)\nprint('OK')\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_unterminated_quote_error_does_not_print_secret(self):
+        result = _run_module_with_env(
+            "SMTP_MODE=gmail\nSMTP_USER=ja@example.com\nSMTP_PASS='tajne-haslo-123\n"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("linia 3", result.stderr)
+        self.assertNotIn("tajne-haslo-123", result.stderr)
+        self.assertNotIn("tajne-haslo-123", result.stdout)
+
+
 class TestSystemdRunModeWarning(unittest.TestCase):
     def setUp(self):
         self._orig_invocation_id = os.environ.pop("INVOCATION_ID", None)

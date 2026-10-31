@@ -48,10 +48,22 @@ Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | drugi kanał powiadomień + komendy - oba naraz albo żaden | wyłączone |
 | `STORE_IDS` | numery sklepów IKEA, po przecinku - tylko na pierwszym starcie | `294` (Wrocław) |
 | `SEARCH_TERMS`, `SEARCH_ARTICLE_NUMBERS` | szukane frazy / numery artykułu - tylko na pierwszym starcie | `Stall` / brak |
-| `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone | brak |
+| `MIN_DISCOUNT_PERCENT`, `MAX_PRICE`, `KEYWORDS_EXCLUDE` | filtry, domyślnie wyłączone; `MIN_DISCOUNT_PERCENT`/`MAX_PRICE` muszą być liczbą >= 0 | brak |
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
-| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty | `2700` (45 min) |
+| `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy | `15` |
+
+Nieprawidłowa wartość pola liczbowego albo `RUN_MODE` (literówka, tekst
+zamiast liczby, liczba ujemna, zero dla interwałów) kończy start skryptu
+błędem z nazwą pola i ścieżką pliku, zamiast cicho wyłączyć filtr albo
+wrócić do wartości domyślnej.
+
+Format pliku: `KLUCZ=wartość`, opcjonalnie z przedrostkiem `export `.
+Komentarz w linii zaczyna się od `#` poprzedzonego spacją
+(`MAX_PRICE=300 # zł` daje `300`, a `abc#def` zostaje bez zmian).
+Wartość zawierającą ` #` albo spacje na początku/końcu (np. hasło) wpisz
+w cudzysłowie (`SMTP_PASS='ab #cd'`) - treść w cudzysłowie jest brana
+dosłownie, a niezamknięty cudzysłów kończy start błędem z numerem linii.
 
 Wymagany jest **przynajmniej jeden w pełni skonfigurowany kanał
 powiadomień** - e-mail albo Telegram, może być tylko jeden z nich. Brak
