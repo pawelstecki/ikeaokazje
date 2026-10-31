@@ -107,8 +107,9 @@ domowym), ale użyj **tych samych** we wszystkich trzech miejscach
 ### cron (RUN_MODE=cron, domyślny)
 
 Jedno przejście i wyjście, sprawdzanie ofert co interwał crona (poniżej:
-15 minut) - to crontab, nie backoff, decyduje o częstotliwości sprawdzeń
-w tym trybie:
+15 minut). Wyjątek: po blokadzie 403/429 odpalenia przed zapisanym
+terminem backoffu kończą się od razu (kod 0, wpis w logu, bez zapytania
+do IKEA) - patrz "Zachowanie przy HTTP 403/429":
 
 ```
 crontab -e
@@ -233,9 +234,11 @@ alert dostępu - patrz "Konfiguracja" wyżej.
 Wszystkie sklepy są odpytywane przez **jeden, wspólny endpoint** API
 IKEA - blokada (403, Akamai) albo rate limit (429) dotyczy więc całego
 procesu, nie pojedynczego sklepu, i backoff jest liczony **globalnie**,
-nie per sklep. Backoff wpływa na harmonogram tylko w trybie `daemon` - w
-trybie `cron` częstotliwość sprawdzeń wyznacza wyłącznie wpis w
-crontabie. Przy aktualnych domyślnych ustawieniach lokalny odstęp między
+nie per sklep. Backoff obowiązuje w obu trybach: `daemon` planuje według
+niego następny cykl, a w trybie `cron` każde odpalenie przed zapisanym
+terminem obsługuje tylko komendy Telegrama, loguje, do kiedy trwa
+backoff, i kończy się kodem 0 bez zapytania do IKEA. Przy aktualnych
+domyślnych ustawieniach lokalny odstęp między
 próbami po blokadzie wynosi co najmniej 45 minut (`CHECK_INTERVAL_SECONDS`)
 i **nie wydłuża się** po kolejnych blokadach z rzędu - maksymalny odstęp
 (cap) wypada na tę samą wartość co pierwszy krok backoffu. Jednostronny

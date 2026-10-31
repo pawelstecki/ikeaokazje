@@ -399,6 +399,113 @@ class TestMainLifecycle(unittest.TestCase):
         self.assertEqual(calls, ["init", "telegram"])
 
 
+class TestCronRespectsPersistedBackoff(unittest.TestCase):
+    """Tryb cron: aktywny trwaly backoff po 403/429 konczy przebieg kodem 0
+    bez cyklu (bez zapytania do IKEA); komendy Telegrama dzialaja dalej."""
+
+    def setUp(self):
+        self._orig_state_dict = dict(ik.get_blocking_backoff_state().to_dict())
+        ik.set_blocking_backoff_state(ik.BackoffState())
+
+    def tearDown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_state_dict))
+
+    def _set_backoff(self, deadline_offset_seconds):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=2,
+            last_status_code=429,
+            next_allowed_check_at=time.time() + deadline_offset_seconds,
+        ))
+
+    def test_blocking_backoff_active_none_without_backoff(self):
+        self.assertIsNone(ik.blocking_backoff_active())
+
+    def test_blocking_backoff_active_none_when_deadline_passed(self):
+        self._set_backoff(-10)
+        self.assertIsNone(ik.blocking_backoff_active())
+
+    def test_blocking_backoff_active_returns_remaining_seconds(self):
+        ik.set_blocking_backoff_state(ik.BackoffState(
+            failure_count=1, last_status_code=403, next_allowed_check_at=1000.0,
+        ))
+        self.assertAlmostEqual(ik.blocking_backoff_active(now_wall_clock=400.0), 600.0)
+        self.assertIsNone(ik.blocking_backoff_active(now_wall_clock=1000.0))
+
+    def test_cron_skips_cycle_during_active_backoff(self):
+        self._set_backoff(1200)
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "fetch_store_offers") as mock_fetch, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "cron"), \
+             mock.patch.object(ik, "log") as mock_log:
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        mock_cycle.assert_not_called()
+        mock_fetch.assert_not_called()
+        message = " ".join(str(call.args[0]) for call in mock_log.call_args_list)
+        self.assertIn("#2", message)
+        self.assertIn("HTTP 429", message)
+        deadline = ik.get_blocking_backoff_state().next_allowed_check_at
+        self.assertIn(
+            ik.datetime.fromtimestamp(deadline).strftime("%Y-%m-%d %H:%M:%S"), message
+        )
+        self.assertRegex(message, r"jeszcze 1(19\d|200)s")
+
+    def test_cron_handles_telegram_commands_before_backoff_skip(self):
+        self._set_backoff(1200)
+        calls = []
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "handle_telegram_updates", side_effect=lambda: calls.append("telegram")), \
+             mock.patch.object(ik, "run_ikea_check_cycle", side_effect=lambda: calls.append("cycle")), \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", True), \
+             mock.patch.object(ik, "RUN_MODE", "cron"):
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["telegram"])
+
+    def test_cron_runs_cycle_after_backoff_deadline_passed(self):
+        self._set_backoff(-1)
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=0) as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "cron"):
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        mock_cycle.assert_called_once()
+
+    def test_cron_returns_cycle_exit_code_without_backoff(self):
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_ikea_check_cycle", return_value=3) as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "cron"):
+            result = ik.main()
+
+        self.assertEqual(result, 3)
+        mock_cycle.assert_called_once()
+
+    def test_daemon_path_unchanged_during_active_backoff(self):
+        self._set_backoff(1200)
+        with mock.patch.object(ik, "initialize_runtime"), \
+             mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+             mock.patch.object(ik, "run_daemon", return_value=0) as mock_daemon, \
+             mock.patch.object(ik, "run_ikea_check_cycle") as mock_cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik, "RUN_MODE", "daemon"):
+            result = ik.main()
+
+        self.assertEqual(result, 0)
+        mock_daemon.assert_called_once()
+        mock_cycle.assert_not_called()
+
+
 class TestGracefulShutdown(unittest.TestCase):
     """Testy dla zamkniecia daemona przez SHUTDOWN_EVENT - bez wysylania
     prawdziwych sygnalow OS do procesu testowego (co byloby niestabilne),
@@ -2162,6 +2269,12 @@ class TestCronModeTwoCycleConfirmationAcrossInvocations(unittest.TestCase):
         self.assertTrue(state_after_first["ikea_access_notification"]["pending_outage"])
         self.assertFalse(state_after_first["ikea_access_notification"]["outage_active"])
 
+        # Cron pomija odpalenia przed terminem backoffu, wiec symulujemy
+        # kolejne odpalenie crona juz PO uplywie zapisanego terminu.
+        state_after_first["blocking_backoff"]["next_allowed_check_at"] = time.time() - 1
+        with open(dynamic_state_path, "w", encoding="utf-8") as f:
+            json.dump(state_after_first, f)
+
         # Drugie, calkowicie NIEZALEZNE odpalenie (proces #2, "kolejny cron")
         # - potwierdza sekwencje i wysyla alert (notify_access_status() nie
         # jest tu mockowane globalnie - ale exim/SMTP polaczenie i tak nie
@@ -2181,6 +2294,44 @@ class TestCronModeTwoCycleConfirmationAcrossInvocations(unittest.TestCase):
         self.assertTrue(
             access_state_after_second["outage_active"] or access_state_after_second["pending_outage"]
         )
+
+    def test_second_cron_invocation_during_backoff_does_not_query_ikea(self):
+        home_dir = _make_isolated_home(
+            "SMTP_MODE=exim\nEMAIL_TO=test@example.com\nSTORE_IDS=294\n"
+            "SEARCH_TERMS=stall\n"
+        )
+        dynamic_state_path = os.path.join(home_dir, ".ikea_okazje_dynamic.json")
+
+        first = self._run_one_cron_invocation(home_dir)
+        self.assertEqual(first.returncode, 0, msg=first.stderr)
+        with open(dynamic_state_path, "r", encoding="utf-8") as f:
+            state_after_first = json.load(f)
+        self.assertGreater(state_after_first["blocking_backoff"]["next_allowed_check_at"], time.time())
+
+        code = (
+            "import unittest.mock as mock\n"
+            "import ikea_okazje as ik\n"
+            "with mock.patch.object(ik, 'fetch_store_offers') as mock_fetch, \\\n"
+            "     mock.patch.object(ik, 'notify_access_status') as mock_notify:\n"
+            "    exit_code = ik.main()\n"
+            "assert exit_code == 0, exit_code\n"
+            "assert not mock_fetch.called, mock_fetch.call_args_list\n"
+            "assert not mock_notify.called\n"
+            "print('OK')\n"
+        )
+        second = _run_python_code(code, home_dir)
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        self.assertIn("OK", second.stdout)
+        self.assertIn("pomijam sprawdzanie ofert", second.stdout)
+
+        with open(dynamic_state_path, "r", encoding="utf-8") as f:
+            state_after_second = json.load(f)
+        # Pominiete odpalenie nie liczy sie jako drugi zablokowany cykl.
+        self.assertEqual(
+            state_after_second["ikea_access_notification"],
+            state_after_first["ikea_access_notification"],
+        )
+        self.assertEqual(state_after_second["blocking_backoff"], state_after_first["blocking_backoff"])
 
     def test_cron_invocation_returns_immediately_without_looping(self):
         # Wymog: cron NIE petli/nie czeka na drugi cykl - main() w trybie

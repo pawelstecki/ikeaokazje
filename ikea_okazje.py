@@ -18,7 +18,8 @@ Komendy Telegrama (tylko z czatu TELEGRAM_CHAT_ID):
     /pomoc             - lista komend
 
 Tryby pracy (RUN_MODE):
-    "cron"   (domyslny) - jedno przejscie i wyjscie.
+    "cron"   (domyslny) - jedno przejscie i wyjscie; w trakcie backoffu
+               po 403/429 przejscie konczy sie bez zapytania do IKEA.
     "daemon" - petla w tle (np. systemd): Telegram co
                TELEGRAM_POLL_INTERVAL_SECONDS, oferty co
                CHECK_INTERVAL_SECONDS; lagodne zakonczenie po SIGTERM/SIGINT.
@@ -1790,9 +1791,9 @@ def handle_telegram_updates() -> None:
         save_telegram_offset(max_update_id + 1)
 
 
-# ---------------- JITTER I WYKLADNICZY BACKOFF (tylko tryb daemon) ----------------
-# Stan backoffu jest aktualizowany w kazdym cyklu (takze w cron), ale
-# czekanie wedlug niego stosuje tylko run_daemon().
+# ---------------- JITTER I WYKLADNICZY BACKOFF ----------------
+# Stan backoffu jest aktualizowany w kazdym cyklu. Daemon planuje wedlug
+# niego kolejne cykle; cron pomija odpalenia przed terminem (main()).
 
 
 def apply_jitter_percent(value: float, percent: float) -> float:
@@ -2127,6 +2128,26 @@ def seconds_until_next_allowed_check(state: BackoffState, now_wall_clock=None) -
     return max(0.0, remaining)
 
 
+def blocking_backoff_active(now_wall_clock=None) -> "float | None":
+    """Sekundy do konca trwalego backoffu po 403/429 albo None, gdy
+    zapytanie do IKEA jest juz dozwolone (brak backoffu lub termin minal)."""
+    remaining = seconds_until_next_allowed_check(get_blocking_backoff_state(), now_wall_clock)
+    if remaining is None or remaining <= 0:
+        return None
+    return remaining
+
+
+def log_cron_backoff_skip(remaining_seconds: float) -> None:
+    """Komunikat o pominieciu sprawdzenia w trybie cron z powodu backoffu."""
+    state = get_blocking_backoff_state()
+    until_txt = datetime.fromtimestamp(state.next_allowed_check_at).strftime("%Y-%m-%d %H:%M:%S")
+    log(
+        f"Aktywny backoff po blokadzie/rate limicie (porazka #{state.failure_count} "
+        f"z rzedu, ostatni HTTP {state.last_status_code}) - pomijam sprawdzanie "
+        f"ofert do {until_txt} (jeszcze {remaining_seconds:.0f}s), bez zapytania do IKEA."
+    )
+
+
 def run_daemon() -> int:
     """Petla trybu daemon: Telegram czesto, oferty IKEA rzadziej. Interwaly
     sa odliczane time.monotonic(), zeby skoki zegara (NTP) ich nie
@@ -2223,6 +2244,13 @@ def main() -> int:
 
     if RUN_MODE == "daemon":
         return run_daemon()
+
+    # Cron odpala sie wg crontaba, wiec termin backoffu trzeba sprawdzic
+    # tutaj - inaczej kazde odpalenie w trakcie blokady pytaloby IKEA.
+    remaining = blocking_backoff_active()
+    if remaining is not None:
+        log_cron_backoff_skip(remaining)
+        return 0
 
     return run_ikea_check_cycle()
 
