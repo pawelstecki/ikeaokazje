@@ -3,6 +3,7 @@
 Uruchomienie: python3 -m unittest tests/test_ikea_okazje.py
 """
 
+import io
 import json
 import os
 import re
@@ -3390,7 +3391,8 @@ class TestSendTelegramErrorHandling(unittest.TestCase):
         offers = [
             _make_offer(offer_uuid=str(i), offer_number=str(i)) for i in range(100)
         ]
-        with mock.patch.object(ik, "telegram_send_message") as mock_send:
+        with mock.patch.object(ik, "telegram_send_message") as mock_send, \
+             mock.patch.object(ik, "TELEGRAM_SERIES_DELAY_SECONDS", 0):
             ik.send_telegram(offers)
             self.assertGreater(mock_send.call_count, 0)
 
@@ -3410,7 +3412,8 @@ class TestSendTelegramErrorHandling(unittest.TestCase):
             if call_count["n"] == 2:
                 raise RuntimeError("Telegram failed")
 
-        with mock.patch.object(ik, "telegram_send_message", side_effect=fake_send):
+        with mock.patch.object(ik, "telegram_send_message", side_effect=fake_send), \
+             mock.patch.object(ik, "TELEGRAM_SERIES_DELAY_SECONDS", 0):
             with self.assertRaises(RuntimeError) as ctx:
                 ik.send_telegram(offers)
             self.assertIn("1/", str(ctx.exception))
@@ -3573,6 +3576,9 @@ class TestSeenOffersDeliverySemantics(unittest.TestCase):
         # oferty NIE sa zapisywane jako seen (Telegram nie zakonczyl serii).
         uuids = [f"uuid-split-{i}" for i in range(150)]
         product = self._fake_api_product(uuids)
+        delay_patcher = mock.patch.object(ik, "TELEGRAM_SERIES_DELAY_SECONDS", 0)
+        delay_patcher.start()
+        self.addCleanup(delay_patcher.stop)
 
         email_delivered = []
         call_count = {"n": 0}
@@ -5259,6 +5265,271 @@ class TestTelegramCommandParsing(unittest.TestCase):
         handle_command.assert_not_called()
         send.assert_not_called()
         save_offset.assert_called_once_with(101)
+
+
+_TEST_BOT_TOKEN = "123456:SEKRETNY-TOKEN"
+
+
+class _FakeTelegramResponse:
+    """Odpowiedz urlopen() jako context manager."""
+
+    def __init__(self, payload=None, raw=None):
+        self._body = raw if raw is not None else json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _telegram_ok(result=True):
+    return _FakeTelegramResponse({"ok": True, "result": result})
+
+
+def _telegram_http_error(code, description=None, retry_after=None, raw=None, method="sendMessage"):
+    """HTTPError jak z urllib - z URL zawierajacym token w .url i str()."""
+    if raw is None:
+        body = {"ok": False, "error_code": code}
+        if description is not None:
+            body["description"] = description
+        if retry_after is not None:
+            body["parameters"] = {"retry_after": retry_after}
+        raw = json.dumps(body).encode("utf-8")
+    url = f"https://api.telegram.org/bot{_TEST_BOT_TOKEN}/{method}"
+    return ik.urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(raw))
+
+
+class TestTelegramApiErrors(unittest.TestCase):
+    """telegram_send_message()/telegram_get_updates(): opis bledu od
+    Telegrama, 429 z jednym ponowieniem, 409, bledy sieci - bez URL i
+    tokenu w komunikacie. urlopen i SHUTDOWN_EVENT.wait sa zmockowane."""
+
+    def setUp(self):
+        for patcher in (
+            mock.patch.object(ik, "TELEGRAM_BOT_TOKEN", _TEST_BOT_TOKEN),
+            mock.patch.object(ik, "TELEGRAM_CHAT_ID", "4242"),
+            mock.patch.object(ik, "log"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        wait_patcher = mock.patch.object(ik.SHUTDOWN_EVENT, "wait", return_value=False)
+        self.wait = wait_patcher.start()
+        self.addCleanup(wait_patcher.stop)
+
+    def _urlopen(self, *effects):
+        patcher = mock.patch.object(ik.urllib.request, "urlopen", side_effect=list(effects))
+        urlopen = patcher.start()
+        self.addCleanup(patcher.stop)
+        return urlopen
+
+    def _assert_no_secret(self, text):
+        self.assertNotIn("SEKRETNY-TOKEN", text)
+        self.assertNotIn("api.telegram.org", text)
+        self.assertNotIn("https://", text)
+
+    def test_send_message_posts_json_with_token_in_url(self):
+        urlopen = self._urlopen(_telegram_ok())
+        ik.telegram_send_message("<b>hej</b>", chat_id=7)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, f"https://api.telegram.org/bot{_TEST_BOT_TOKEN}/sendMessage")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["chat_id"], 7)
+        self.assertEqual(payload["text"], "<b>hej</b>")
+        self.assertEqual(payload["parse_mode"], "HTML")
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], ik.REQUEST_TIMEOUT)
+
+    def test_bad_request_reports_code_and_description_without_url(self):
+        self._urlopen(_telegram_http_error(400, "Bad Request: can't parse entities"))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("<b>zle")
+        message = str(ctx.exception)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("Bad Request: can't parse entities", message)
+        self._assert_no_secret(message)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.wait.assert_not_called()
+
+    def test_error_without_json_body_reports_code(self):
+        self._urlopen(_telegram_http_error(502, raw=b"<html>Bad Gateway</html>"))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertIn("HTTP 502", str(ctx.exception))
+        self._assert_no_secret(str(ctx.exception))
+
+    def test_description_with_token_is_masked(self):
+        self._urlopen(_telegram_http_error(401, f"Unauthorized {_TEST_BOT_TOKEN}"))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertIn("HTTP 401", str(ctx.exception))
+        self._assert_no_secret(str(ctx.exception))
+
+    def test_network_error_without_url(self):
+        self._urlopen(ik.urllib.error.URLError(OSError(-2, "Name or service not known")))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        message = str(ctx.exception)
+        self.assertIn("Blad polaczenia z Telegram API", message)
+        self.assertIn("Name or service not known", message)
+        self._assert_no_secret(message)
+
+    def test_timeout_is_reported_as_network_error(self):
+        self._urlopen(TimeoutError("The read operation timed out"))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_ok_false_in_200_response_raises(self):
+        self._urlopen(_FakeTelegramResponse({"ok": False, "description": "dziwne"}))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertIn("dziwne", str(ctx.exception))
+
+    def test_429_waits_retry_after_and_retries_once(self):
+        urlopen = self._urlopen(
+            _telegram_http_error(429, "Too Many Requests: retry after 7", retry_after=7),
+            _telegram_ok(),
+        )
+        ik.telegram_send_message("x")
+        self.assertEqual(urlopen.call_count, 2)
+        self.wait.assert_called_once_with(7.0)
+        first = json.loads(urlopen.call_args_list[0].args[0].data.decode("utf-8"))
+        second = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
+        self.assertEqual(first, second)
+
+    def test_429_without_retry_after_waits_default(self):
+        self._urlopen(_telegram_http_error(429, "Too Many Requests"), _telegram_ok())
+        ik.telegram_send_message("x")
+        self.wait.assert_called_once_with(ik.TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS)
+
+    def test_429_wait_is_capped(self):
+        self._urlopen(_telegram_http_error(429, "Too Many Requests", retry_after=600), _telegram_ok())
+        ik.telegram_send_message("x")
+        self.wait.assert_called_once_with(ik.TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS)
+
+    def test_second_429_raises_after_single_retry(self):
+        urlopen = self._urlopen(
+            _telegram_http_error(429, "Too Many Requests: retry after 3", retry_after=3),
+            _telegram_http_error(429, "Too Many Requests: retry after 3", retry_after=3),
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertEqual(urlopen.call_count, 2)
+        self.wait.assert_called_once_with(3.0)
+        self.assertIn("HTTP 429", str(ctx.exception))
+        self.assertIn("Too Many Requests", str(ctx.exception))
+        self._assert_no_secret(str(ctx.exception))
+
+    def test_429_not_retried_when_shutdown_requested_during_wait(self):
+        self.wait.return_value = True
+        urlopen = self._urlopen(_telegram_http_error(429, "Too Many Requests", retry_after=3))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_send_message("x")
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_get_updates_returns_result_list(self):
+        updates = [{"update_id": 5, "message": {"text": "/status"}}]
+        urlopen = self._urlopen(_telegram_ok(updates))
+        self.assertEqual(ik.telegram_get_updates(5), updates)
+        request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/getUpdates"))
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["offset"], 5)
+
+    def test_get_updates_error_has_description_without_url(self):
+        self._urlopen(_telegram_http_error(401, "Unauthorized", method="getUpdates"))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_get_updates(0)
+        message = str(ctx.exception)
+        self.assertIn("HTTP 401", message)
+        self.assertIn("Unauthorized", message)
+        self._assert_no_secret(message)
+
+    def test_get_updates_409_hints_second_instance_or_webhook(self):
+        self._urlopen(_telegram_http_error(
+            409,
+            "Conflict: terminated by other getUpdates request; make sure that "
+            "only one bot instance is running",
+            method="getUpdates",
+        ))
+        with self.assertRaises(RuntimeError) as ctx:
+            ik.telegram_get_updates(0)
+        message = str(ctx.exception)
+        self.assertIn("HTTP 409", message)
+        self.assertIn("Conflict", message)
+        self.assertIn("druga instancja", message)
+        self.assertIn("webhook", message)
+        self._assert_no_secret(message)
+
+    def test_get_updates_429_is_not_retried(self):
+        urlopen = self._urlopen(_telegram_http_error(429, "Too Many Requests", retry_after=3, method="getUpdates"))
+        with self.assertRaises(RuntimeError):
+            ik.telegram_get_updates(0)
+        self.assertEqual(urlopen.call_count, 1)
+        self.wait.assert_not_called()
+
+
+class TestTelegramSeriesPacing(unittest.TestCase):
+    """send_telegram(): przerwa TELEGRAM_SERIES_DELAY_SECONDS miedzy
+    wiadomosciami serii (przez SHUTDOWN_EVENT.wait), bez przerwy przed
+    pierwsza i po ostatniej."""
+
+    def _series_offers(self):
+        offers = [
+            _make_offer(offer_uuid=str(i), offer_number=str(i), description="długi " * 100)
+            for i in range(150)
+        ]
+        groups = ik.group_offers_for_notification(offers)
+        count = len(ik.split_telegram_messages(groups))
+        self.assertGreaterEqual(count, 3)
+        return offers, count
+
+    def _run(self, offers, send_side_effect=None):
+        events = []
+
+        def fake_send(text, **kwargs):
+            events.append("send")
+            if send_side_effect:
+                send_side_effect(len([e for e in events if e == "send"]))
+
+        def fake_wait(timeout):
+            events.append(("wait", timeout))
+            return False
+
+        with mock.patch.object(ik, "telegram_send_message", side_effect=fake_send), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=fake_wait):
+            ik.send_telegram(offers)
+        return events
+
+    def test_delay_between_messages_only(self):
+        offers, count = self._series_offers()
+        events = self._run(offers)
+        expected = ["send"]
+        for _ in range(count - 1):
+            expected += [("wait", ik.TELEGRAM_SERIES_DELAY_SECONDS), "send"]
+        self.assertEqual(events, expected)
+        self.assertEqual(ik.TELEGRAM_SERIES_DELAY_SECONDS, 1.0)
+
+    def test_single_message_has_no_delay(self):
+        self.assertEqual(self._run([_make_offer()]), ["send"])
+
+    def test_failure_mid_series_keeps_progress_report(self):
+        offers, count = self._series_offers()
+
+        def fail_second(send_number):
+            if send_number == 2:
+                raise RuntimeError("Telegram API (sendMessage) zwrocilo HTTP 400: Bad Request")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(offers, send_side_effect=fail_second)
+        message = str(ctx.exception)
+        self.assertIn(f"wyslano 1/{count}", message)
+        self.assertIn("#2", message)
+        self.assertIn("HTTP 400", message)
 
 
 if __name__ == "__main__":

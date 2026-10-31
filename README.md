@@ -203,7 +203,10 @@ nazwa, sklep, cena, stan), powiadomienie zawiera jeden wspólny opis
 i listę osobnych linków do rezerwacji każdego egzemplarza. Jeśli łączna
 treść powiadomienia Telegrama przekracza limit API, alert jest
 automatycznie dzielony na wiele wiadomości — żaden egzemplarz nie zostaje
-pominięty. Wiadomości e-mail używają analogicznego grupowania.
+pominięty. Kolejne wiadomości takiej serii idą co 1 s (limit Telegrama).
+Gdy Telegram mimo to odpowie HTTP 429 (za dużo wiadomości), skrypt czeka
+wskazany przez niego czas (najwyżej 60 s) i ponawia wiadomość raz.
+Wiadomości e-mail używają analogicznego grupowania.
 
 ### Komendy Telegrama
 
@@ -342,7 +345,15 @@ skrypt nie próbuje tego obchodzić, tylko odczekuje backoff/`Retry-After`.
 to błąd API niezależny od tego ustawienia.
 
 **Telegram nie wysyła / brak `chat_id`.** Napisz najpierw do bota -
-Telegram wymaga, żeby rozmowę zaczynał człowiek.
+Telegram wymaga, żeby rozmowę zaczynał człowiek. Błąd w logu zawiera kod
+HTTP i opis od Telegrama (np. `HTTP 400: Bad Request: chat not found`),
+bez tokenu bota.
+
+**`Telegram API (getUpdates) zwrocilo HTTP 409`.** Telegram oddaje
+komendy tylko jednemu odbiorcy. Zwykle działa druga kopia skryptu z tym
+samym botem (cron i systemd naraz, ręczne uruchomienie bez `flock`, inny
+serwer) albo bot ma ustawiony webhook - usuń go, otwierając
+`https://api.telegram.org/bot<TOKEN>/deleteWebhook`.
 
 **Komendy Telegrama nie działają.** Sprawdź, czy piszesz z konta o
 `chat_id` z `.env`. W trybie `cron` komenda zadziała przy następnym

@@ -1599,26 +1599,132 @@ def split_telegram_messages(groups: list) -> list:
     return messages
 
 
-def telegram_send_message(text: str, chat_id=None) -> None:
-    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+# HTTP 429 z Bot API: jedno ponowienie po retry_after (brak -> 5 s), ale
+# nie dluzej niz 60 s, zeby nie wstrzymywac cyklu.
+TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
+TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS = 60
+# Przerwa miedzy wiadomosciami jednej serii (Telegram limituje ok. 1
+# wiadomosc/s na czat).
+TELEGRAM_SERIES_DELAY_SECONDS = 1.0
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": target_chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }).encode("utf-8")
 
+class TelegramApiError(RuntimeError):
+    """Blad Bot API. Tresc nigdy nie zawiera URL ani tokenu bota."""
+
+    def __init__(self, message: str, status_code: "int | None" = None,
+                 retry_after: "float | None" = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _hide_telegram_token(text) -> str:
+    """Maskuje token bota, gdyby wrocil w tresci bledu."""
+    text = str(text)
+    if TELEGRAM_BOT_TOKEN:
+        text = text.replace(TELEGRAM_BOT_TOKEN, "[ukryte]")
+    return text
+
+
+def _telegram_error_details(body: bytes) -> tuple:
+    """(description, retry_after) z JSON bledu Bot API; brakujace albo
+    niepoprawne pola -> None."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    description = data.get("description")
+    if not isinstance(description, str) or not description.strip():
+        description = None
+    retry_after = None
+    parameters = data.get("parameters")
+    if isinstance(parameters, dict):
+        value = parameters.get("retry_after")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0
+        ):
+            retry_after = float(value)
+    return description, retry_after
+
+
+def telegram_api_call(method: str, payload: dict, timeout: float):
+    """POST JSON do metody Bot API, zwraca pole 'result'. Bledy jako
+    TelegramApiError z kodem HTTP i opisem od Telegrama. URL zawiera token,
+    wiec str() i .url wyjatkow urllib nie trafiaja do komunikatu."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     req = urllib.request.Request(
         url,
-        data=payload,
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"Telegram API zwrocilo HTTP {resp.status}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = exc.read()
+        except Exception:
+            error_body = b""
+        description, retry_after = _telegram_error_details(error_body)
+        message = f"Telegram API ({method}) zwrocilo HTTP {exc.code}"
+        if description:
+            message += f": {_hide_telegram_token(description)}"
+        raise TelegramApiError(message, exc.code, retry_after) from None
+    except (urllib.error.URLError, OSError) as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        reason_text = str(reason) or type(reason).__name__
+        raise TelegramApiError(
+            f"Blad polaczenia z Telegram API ({method}): {_hide_telegram_token(reason_text)}"
+        ) from None
+
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise TelegramApiError(
+            f"Telegram API ({method}) zwrocilo odpowiedz, ktora nie jest JSON."
+        ) from None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        description = data.get("description") if isinstance(data, dict) else None
+        raise TelegramApiError(
+            f"Telegram API ({method}) zwrocilo blad: "
+            f"{_hide_telegram_token(description or 'brak opisu')}"
+        )
+    return data.get("result")
+
+
+def telegram_send_message(text: str, chat_id=None) -> None:
+    """Wysyla wiadomosc HTML. Po HTTP 429 czeka retry_after i ponawia raz;
+    gdy w trakcie czekania przyjdzie SIGTERM, konczy bledem bez ponowienia."""
+    payload = {
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    try:
+        telegram_api_call("sendMessage", payload, REQUEST_TIMEOUT)
+        return
+    except TelegramApiError as exc:
+        if exc.status_code != 429:
+            raise
+        rate_limit_error = exc
+
+    delay = min(
+        rate_limit_error.retry_after or TELEGRAM_RATE_LIMIT_DEFAULT_WAIT_SECONDS,
+        TELEGRAM_RATE_LIMIT_MAX_WAIT_SECONDS,
+    )
+    log(f"Telegram: limit wysylania (HTTP 429) - ponawiam za {delay:.0f}s.", to_stderr=True)
+    if SHUTDOWN_EVENT.wait(delay):
+        raise TelegramApiError(
+            f"{rate_limit_error} (zamykanie procesu - bez ponowienia)", 429
+        )
+    telegram_api_call("sendMessage", payload, REQUEST_TIMEOUT)
 
 
 def send_telegram(new_offers) -> None:
@@ -1630,7 +1736,11 @@ def send_telegram(new_offers) -> None:
         return
 
     sent_count = 0
-    for msg in messages:
+    for index, msg in enumerate(messages):
+        if index > 0:
+            # Po SIGTERM wait() wraca od razu - reszta serii idzie bez
+            # przerwy, zeby cykl skonczyl sie szybko.
+            SHUTDOWN_EVENT.wait(TELEGRAM_SERIES_DELAY_SECONDS)
         try:
             telegram_send_message(msg)
             sent_count += 1
@@ -1919,17 +2029,21 @@ def save_telegram_offset(offset: int) -> None:
 
 
 def telegram_get_updates(offset: int) -> list:
-    params = urllib.parse.urlencode({"offset": offset, "timeout": 0})
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?{params}"
     try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Blad polaczenia z Telegram API: {exc}")
-
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram getUpdates zwrocilo blad: {data}")
-    return data.get("result", [])
+        result = telegram_api_call(
+            "getUpdates", {"offset": offset, "timeout": 0}, REQUEST_TIMEOUT
+        )
+    except TelegramApiError as exc:
+        if exc.status_code == 409:
+            # Telegram oddaje aktualizacje tylko jednemu odbiorcy.
+            raise TelegramApiError(
+                f"{exc}. Prawdopodobnie dziala druga instancja skryptu z tym "
+                "samym botem (cron, systemd albo reczne uruchomienie) albo bot "
+                "ma ustawiony webhook - patrz README.",
+                409,
+            ) from None
+        raise
+    return result if isinstance(result, list) else []
 
 
 def format_status_message() -> str:
