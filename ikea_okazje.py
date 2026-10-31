@@ -212,9 +212,11 @@ KNOWN_STORES = {
 
 
 def log(message: str, to_stderr: bool = False) -> None:
+    # flush: pod systemd stdout to pipe z buforowaniem blokowym, bez tego
+    # wpisy trafiaja do journalctl z duzym opoznieniem.
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
-    print(line, file=sys.stderr if to_stderr else sys.stdout)
+    print(line, file=sys.stderr if to_stderr else sys.stdout, flush=True)
 
 
 def load_env_file(path: str) -> dict:

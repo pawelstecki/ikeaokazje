@@ -892,6 +892,37 @@ class TestSystemdRunModeWarning(unittest.TestCase):
             ik.RUN_MODE = orig_run_mode
 
 
+class TestLogFlushing(unittest.TestCase):
+    """log() musi wypychac wpis od razu - pod systemd stdout to pipe z
+    buforowaniem blokowym. os._exit() pomija flush przy wyjsciu, wiec wpis
+    widac w podprocesie tylko wtedy, gdy log() sam go wypchnal."""
+
+    def test_stdout_line_visible_without_interpreter_flush(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code(
+            "import os\nimport ikea_okazje as ik\nik.log('linia-stdout')\nos._exit(0)\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("linia-stdout", result.stdout)
+
+    def test_stderr_line_visible_without_interpreter_flush(self):
+        home_dir = _make_isolated_home(env_file_contents=None)
+        result = _run_python_code(
+            "import os\nimport ikea_okazje as ik\n"
+            "ik.log('linia-stderr', to_stderr=True)\nos._exit(0)\n",
+            home_dir,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("linia-stderr", result.stderr)
+
+    def test_log_passes_flush_true_to_print(self):
+        for to_stderr in (False, True):
+            with mock.patch("builtins.print") as mock_print:
+                ik.log("x", to_stderr=to_stderr)
+            self.assertTrue(mock_print.call_args.kwargs.get("flush"))
+
+
 class TestHtmlEscaping(unittest.TestCase):
     def test_escape_html_basic(self):
         self.assertEqual(ik.escape_html("<b>stall</b>"), "&lt;b&gt;stall&lt;/b&gt;")
