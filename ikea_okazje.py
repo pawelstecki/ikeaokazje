@@ -2,45 +2,34 @@
 """
 ikea_okazje.py
 
-Male narzedzie, ktore sprawdza dzial "Okazje na okraglo" (second-hand /
-buy-from-ikea) w wybranych sklepach IKEA i wysyla powiadomienie (e-mail
-i/albo Telegram), kiedy pojawi sie produkt, ktorego szukasz.
+Sprawdza dzial "Okazje na okraglo" (second-hand / buy-from-ikea) w
+wybranych sklepach IKEA i wysyla powiadomienie (e-mail i/lub Telegram),
+gdy pojawi sie szukany produkt.
 
-Jesli Telegram jest skonfigurowany, mozesz zarzadzac lista szukanych
-slow, numerow artykulu i monitorowanych sklepow komendami w czacie z
-botem:
-    /dodaj <slowo>        - dodaj slowo kluczowe
-    /usun <slowo>         - usun slowo kluczowe
-    /numer <nr>           - dodaj numer artykulu
-    /usunnumer <nr>        - usun numer artykulu
-    /sklepy               - pokaz aktywne i dostepne sklepy
-    /dodajsklep <ID>       - dodaj sklep do monitoringu
-    /usunsklep <ID>        - usun sklep z monitoringu
-    /status               - pokaz aktualnie monitorowane slowa/numery/sklepy
-    /pomoc                - lista komend
+Komendy Telegrama (tylko z czatu TELEGRAM_CHAT_ID):
+    /dodaj <slowo>     - dodaj slowo kluczowe
+    /usun <slowo>      - usun slowo kluczowe
+    /numer <nr>        - dodaj numer artykulu
+    /usunnumer <nr>    - usun numer artykulu
+    /sklepy            - pokaz aktywne i dostepne sklepy
+    /dodajsklep <ID>   - dodaj sklep do monitoringu
+    /usunsklep <ID>    - usun sklep z monitoringu
+    /status            - pokaz monitorowane slowa/numery/sklepy
+    /pomoc             - lista komend
 
-Dwa tryby pracy (RUN_MODE w .env):
-    "cron"   (domyslny) - jedno przejscie i wyjscie, do uzycia z crona.
-    "daemon" - dziala w petli w tle (np. jako usluga systemd), sprawdza
-               komendy Telegrama czesto (TELEGRAM_POLL_INTERVAL_SECONDS),
-               a oferty IKEA rzadziej (CHECK_INTERVAL_SECONDS). Konczy sie
-               lagodnie po SIGTERM (systemctl stop/restart) albo SIGINT
-               (Ctrl+C) - patrz run_daemon().
+Tryby pracy (RUN_MODE):
+    "cron"   (domyslny) - jedno przejscie i wyjscie.
+    "daemon" - petla w tle (np. systemd): Telegram co
+               TELEGRAM_POLL_INTERVAL_SECONDS, oferty co
+               CHECK_INTERVAL_SECONDS; lagodne zakonczenie po SIGTERM/SIGINT.
 
-WAZNE: wszystkie ustawienia, ktore chcesz zmieniac (sklepy, szukane
-produkty, filtry, sposob wysylki maila, Telegram, tryb pracy) sa w pliku
-~/.config/ikea-okazje.env, NIE w tym skrypcie. Dzieki temu aktualizacja
-skryptu (np. z GitHuba) nigdy nie nadpisze Twoich osobistych ustawien -
-edytuj plik .env, nie ten kod. Zobacz .env.example.
+Konfiguracja uzytkownika jest w ~/.config/ikea-okazje.env (patrz
+.env.example), nie w kodzie - aktualizacja skryptu jej nie nadpisze.
 
-WAZNE (dla testow/importu jako biblioteka): samo `import ikea_okazje`
-NIE czyta .env, NIE waliduje konfiguracji i NIE dotyka zadnych plikow
-stanu - definiuje tylko funkcje, stale i harmless defaulty. Faktyczny
-start aplikacji (wczytanie .env, walidacja, dynamiczny stan) dzieje sie
-w initialize_runtime(), wywolywanej jako pierwszy krok main().
+Import modulu nie ma efektow ubocznych (nie czyta .env, nie dotyka plikow
+stanu); start aplikacji robi initialize_runtime(), wolana z main().
 
-Wymagania:
-    pip install curl_cffi
+Wymagania: pip install curl_cffi
 """
 
 from __future__ import annotations
@@ -74,69 +63,34 @@ MAX_PAGES = 20      # zabezpieczenie przed niekonczaca sie paginacja
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
-# 403/429 NIE sa tutaj - to sygnaly blokady/rate limitu (patrz
-# BLOCKING_STATUS_CODES nizej), ktore mają wywolac natychmiastowe
-# ograniczenie ruchu (BlockedByServerError + backoff w run_daemon()), a NIE
-# kolejne, ciche retry w tej samej sekundzie. Tylko przejsciowe bledy
-# serwera (5xx) sa tu retry'owane wewnatrz jednego zapytania o strone.
+# W obrebie jednego zapytania ponawiamy tylko przejsciowe 5xx. 403/429 to
+# blokada/rate limit: bez ponawiania w miejscu, od razu BlockedByServerError
+# i globalny backoff.
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 BLOCKING_STATUS_CODES = {403, 429}
 STORE_JITTER_RANGE = (1.0, 3.0)
 
-# Domyslny bazowy interwal sprawdzania ofert w trybie daemon (sekundy) -
-# 2700s (45 minut), odpowiada celowi tego narzedzia: rzadkie, prywatne
-# sprawdzanie, a nie agresywne odpytywanie. Uzywany TYLKO, jesli
-# CHECK_INTERVAL_SECONDS nie jest jawnie ustawiony w .env (patrz
-# initialize_runtime()) - istniejace instalacje z wlasnym ustawieniem (np.
-# starym 900s/15 min albo poprzednim domyslnym 3600s/1h) nie sa tym
-# dotkniete, .env ma zawsze pierwszenstwo.
+# Domyslny interwal sprawdzania ofert (45 min) - rzadkie, prywatne
+# sprawdzanie. CHECK_INTERVAL_SECONDS z .env ma pierwszenstwo.
 DEFAULT_CHECK_INTERVAL_SECONDS = 2700
 
-# Jitter wokol CHECK_INTERVAL_SECONDS przy kazdym rzeczywistym sleep/wait w
-# petli daemon (patrz compute_jittered_interval() i run_daemon()) - procent
-# wartosci bazowej, stosowany w OBIE strony (np. 25 = przedzial [-25%, +25%]).
-# Celem jest rozbicie sztywnego, metronomicznego rytmu sprawdzania ofert
-# przy rzadkim, prywatnym monitoringu - NIE zwiekszenie czestotliwosci
-# (jitter nigdy nie skraca efektywnego interwalu ponizej tego zakresu).
+# Symetryczny jitter (+/- %) interwalu sprawdzania - rozbija sztywny rytm.
 CHECK_INTERVAL_JITTER_PERCENT = 25
 
-# Wykladniczy backoff PO CYKLU zakonczonym HTTP 403/429 - GLOBALNY dla
-# calego procesu/monitora (NIE per store_id, patrz BackoffState i
-# update_blocking_backoff_state() nizej): IKEA jest odpytywana przez jeden,
-# wspolny endpoint/API dla wszystkich sklepow, wiec 403/429 oznacza blokade
-# calego klienta wobec TEGO serwera, niezaleznie od tego, ktory store_id
-# akurat probowal - wybor innego sklepu w kolejnym cyklu nie omija tej
-# blokady. Stan backoffu jest TRWALE zapisywany w DYNAMIC_STATE_FILE (klucz
-# "blocking_backoff"), wiec restart procesu/uslugi systemd w trakcie
-# aktywnej blokady NIE resetuje juz wyliczonego harmonogramu - patrz
-# README, "Trwaly backoff po 403/429".
-#
-# BACKOFF_BASE_SECONDS to DOLNA granica pierwszego kroku backoffu - patrz
-# effective_backoff_base_seconds(), ktora zwraca WIEKSZA z tej wartosci i
-# CHECK_INTERVAL_SECONDS. Dzieki temu PIERWSZA proba po wykryciu blokady
-# nigdy nie nastapi WCZESNIEJ niz normalny, skonfigurowany interwal
-# sprawdzania ofert (wymog: backoff ma zmniejszac, nie zwiekszac ruch po
-# odmowie dostepu). BACKOFF_CAP_SECONDS to DOLNA granica capu backoffu -
-# patrz effective_backoff_cap_seconds(), ktora zwraca WIEKSZA z tej
-# wartosci i efektywnej bazy, zeby cap nigdy nie wypadl NIZEJ niz pierwszy
-# krok (np. przy bardzo dlugim CHECK_INTERVAL_SECONDS w .env).
-#
-# BACKOFF_JITTER_PERCENT jest stosowany WYLACZNIE w gore (patrz
-# apply_backoff_jitter()) - w odroznieniu od CHECK_INTERVAL_JITTER_PERCENT
-# (symetryczny +/-, dla normalnego, nieblokowanego interwalu), jitter
-# backoffu NIE MOZE skrocic finalnego czasu oczekiwania (lokalny backoff
-# scalony z Retry-After, patrz compute_next_allowed_check_delay()) - tylko
-# ewentualnie go wydluzyc.
+# Wykladniczy backoff po cyklu z 403/429. Jest GLOBALNY, nie per sklep:
+# wszystkie sklepy ida przez jeden endpoint, wiec blokada dotyczy calego
+# klienta. Stan jest trwaly (DYNAMIC_STATE_FILE, "blocking_backoff"), wiec
+# restart nie resetuje harmonogramu.
+# - pierwszy krok = max(CHECK_INTERVAL_SECONDS, BACKOFF_BASE_SECONDS), zeby
+#   backoff nigdy nie zwiekszal ruchu wzgledem normalnego interwalu;
+# - cap = max(pierwszy krok, BACKOFF_CAP_SECONDS);
+# - jitter backoffu tylko w gore - nie skraca max(backoff, Retry-After).
 BACKOFF_BASE_SECONDS = 60.0
 BACKOFF_CAP_SECONDS = 1800.0
 BACKOFF_JITTER_PERCENT = 20
 
-# Naglowki HTTP niezalezne od wybranego profilu klienta - patrz
-# CLIENT_PROFILES/build_headers_for_profile() nizej dla user-agent i
-# sec-ch-ua, ktore MUSZA zgadzac sie z profilem impersonacji curl_cffi w
-# ramach jednego cyklu (ta sama "przegladarka" we wszystkich naglowkach i
-# w fingerprint TLS/JA3) - to jest wylacznie o wewnetrznej spojnosci
-# parametrow klienta, nie o obchodzeniu jakichkolwiek zabezpieczen.
+# Naglowki niezalezne od profilu klienta. user-agent i sec-ch-ua dochodza z
+# BrowserProfile, zeby zgadzaly sie z impersonacja TLS curl_cffi.
 BASE_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "pl-PL,pl;q=0.8",
@@ -151,13 +105,7 @@ BASE_HEADERS = {
     "sec-gpc": "1",
 }
 
-# Profil klienta (impersonate curl_cffi + zgodny User-Agent/sec-ch-ua) -
-# model oparty o obiekt (BrowserProfile), nie o luzny slownik, zeby pola
-# byly niezmienne (frozen dataclass) i zeby dostep do nich (profile.impersonate,
-# profile.user_agent, profile.sec_ch_ua) byl czytelny i bezpieczny (literowka w
-# nazwie pola jest bledem w czasie definicji/testow, nie cichym KeyError/None
-# w czasie dzialania). Odpowiednik BrowserProfile z poprzedniego,
-# oddzielnego modulu anti_detection.py - scalony tutaj, patrz README.
+# Niezmienny profil klienta: impersonate curl_cffi + zgodne User-Agent/sec-ch-ua.
 @dataclass(frozen=True)
 class BrowserProfile:
     impersonate: str
@@ -165,12 +113,8 @@ class BrowserProfile:
     sec_ch_ua: str
 
 
-# Ograniczone do chrome120/123/124 - to jedyne wersje Chrome, ktorych
-# impersonacja jest wspierana we WSZYSTKICH wersjach curl_cffi od minimalnej
-# wymaganej w requirements.txt (curl_cffi>=0.7.0). Nie dodawaj tu nowszych
-# profili (np. chrome131/133a/136) bez jednoczesnego podniesienia dolnej
-# granicy w requirements.txt - patrz README. Wybor profilu na cykl robi
-# choose_client_profile(), naglowki dla wybranego profilu build_headers_for_profile().
+# Tylko profile wspierane przez kazda wersje curl_cffi od minimalnej z
+# requirements.txt (>=0.7.0). Nowszy profil wymaga podniesienia tej granicy.
 CLIENT_PROFILES: tuple[BrowserProfile, ...] = (
     BrowserProfile(
         impersonate="chrome120",
@@ -198,35 +142,14 @@ CLIENT_PROFILES: tuple[BrowserProfile, ...] = (
     ),
 )
 
-# Profil klienta HTTP/TLS wybrany dla AKTUALNEGO cyklu monitoringu (patrz
-# choose_client_profile()) - ustawiany raz na poczatku run_ikea_check_cycle(),
-# NIE między pojedynczymi zapytaniami do API w tym samym cyklu, zeby
-# wszystkie zapytania (wszystkie strony, wszystkie sklepy) w ramach jednego
-# przebiegu uzywaly tego samego, spojnego zestawu naglowkow i fingerprintu
-# TLS/JA3. None przed pierwszym wywolaniem choose_client_profile().
+# Profil wybrany na biezacy cykl (run_ikea_check_cycle()) - wszystkie
+# zapytania cyklu uzywaja tych samych naglowkow i fingerprintu TLS.
 CURRENT_CLIENT_PROFILE: "BrowserProfile | None" = None
 
 
-# Stan GLOBALNEGO backoffu po HTTP 403/429 (blokada/rate limit wspolnego
-# endpointu/API IKEA - patrz komentarz przy BACKOFF_BASE_SECONDS powyzej) -
-# model oparty o obiekt (BackoffState), zamiast luznych globali procesu
-# (poprzednio CONSECUTIVE_BLOCKED_CYCLES/LAST_BLOCKED_STATUS_CODE), zeby caly
-# stan mial jedna, spojna reprezentacje, ktora da sie:
-#   (a) trywialnie zserializowac do/z DYNAMIC_STATE_FILE (patrz to_dict()/
-#       from_dict() nizej i klucz "blocking_backoff" w load_dynamic_state()),
-#       co jest wymagane, zeby restart procesu/uslugi systemd w trakcie
-#       aktywnej blokady NIE zerowal juz wyliczonego harmonogramu;
-#   (b) testowac bez dotykania globalnych zmiennych modulu.
-#
-# next_allowed_check_at to czas SCIENNY (epoch, time.time()) kolejnej
-# dozwolonej proby - NIE time.monotonic(), bo monotonic() nie przetrwa
-# restartu procesu (jego "zero" jest arbitralne per-proces). Runtime
-# (run_daemon()) odczytuje ta wartosc WYLACZNIE do przeliczenia jej na
-# pozostały czas oczekiwania w chwili startu/aktualizacji stanu - a
-# samo odliczanie interwalu w petli daemona i tak korzysta z
-# time.monotonic() (patrz seconds_until_next_allowed_check() i run_daemon()),
-# zeby skoki zegara systemowego/NTP nie zmienialy dlugosci juz
-# zaplanowanego oczekiwania.
+# Trwaly stan globalnego backoffu po 403/429 (klucz "blocking_backoff").
+# next_allowed_check_at to czas scienny (time.time()), bo musi przetrwac
+# restart procesu; petla daemona odlicza czas zegarem monotonicznym.
 @dataclass
 class BackoffState:
     failure_count: int = 0
@@ -244,9 +167,7 @@ class BackoffState:
 
     @classmethod
     def from_dict(cls, data) -> "BackoffState":
-        """Odtwarza BackoffState z dict wczytanego z JSON. Odporne na
-        brakujace/None pola (np. stary plik stanu bez tego klucza wcale,
-        patrz default_blocking_backoff_state_dict()/load_dynamic_state())."""
+        """Odtwarza stan z JSON; odporne na brakujace lub niepoprawne pola."""
         if not isinstance(data, dict):
             return cls()
         try:
@@ -270,13 +191,9 @@ TELEGRAM_OFFSET_FILE = os.path.expanduser("~/.ikea_okazje_telegram_offset.json")
 SMTP_TIMEOUT = 30
 REQUEST_TIMEOUT = 15
 
-# Pelna, potwierdzona mapa sklepow IKEA w Polsce: storeId -> nazwa + slug
-# uzywany w adresie strony "Okazje na Okraglo online". Sluzy jako wbudowana
-# baza wiedzy, z ktorej korzystaja komendy /sklepy, /dodajsklep, /usunsklep
-# oraz generator linkow rezerwacji (build_offer_reservation_link), gdy dany
-# storeId nie ma wlasnego wpisu w STORE_URL_SLUGS z .env. Wszystkie "name"
-# zaczynaja sie od "IKEA " dla wewnetrznej konsystencji mapy - store_display_name()
-# usuwa ten przedrostek przy wyswietlaniu (zbedny, tylko wydluza wiadomosci).
+# Sklepy IKEA w Polsce: storeId -> nazwa + slug strony "Okazje na Okraglo".
+# Uzywane przez komendy sklepow i linki rezerwacji (gdy STORE_URL_SLUGS z
+# .env nie ma wpisu). store_display_name() obcina przedrostek "IKEA ".
 KNOWN_STORES = {
     "1224": {"name": "IKEA Bielsko-Biala", "slug": "bielsko+biala"},
     "429": {"name": "IKEA Bydgoszcz", "slug": "bydgoszcz"},
@@ -348,12 +265,8 @@ def parse_bool(raw, default):
 
 
 def parse_store_url_slugs(raw: str, default: dict) -> dict:
-    """Parsuje STORE_URL_SLUGS z .env.
-
-    Format: STORE_ID:slug-sklepu,STORE_ID:slug-drugiego-sklepu
-    Zwraca slownik {store_id_str: slug_str}.
-    Ignoruje niepoprawne/puste wpisy.
-    """
+    """Parsuje STORE_URL_SLUGS ("ID:slug,ID:slug") do {store_id: slug}.
+    Niepoprawne wpisy sa pomijane; gdy nie ma zadnego poprawnego - default."""
     if not raw or not raw.strip():
         return default
     result = {}
@@ -372,18 +285,14 @@ def parse_store_url_slugs(raw: str, default: dict) -> dict:
 
 
 def normalize_article_number(value) -> str:
-    """Normalizuje numer artykulu IKEA do samych cyfr, np. '905.574.19',
-    '905 574 19' oraz int 90557419 staja sie '90557419'. Numery artykulu
-    moga trafiac do skryptu z .env, dynamicznego stanu, komend Telegrama
-    albo z API IKEA (jako int albo str, czasem z separatorami) - ta funkcja
-    pozwala je porownywac niezaleznie od formatu wejsciowego."""
+    """Zostawia same cyfry ('905.574.19', '905 574 19', 90557419 ->
+    '90557419'), zeby porownywac numery z .env, Telegrama i API."""
     return "".join(char for char in str(value) if char.isdigit())
 
 
 def normalize_article_numbers(values) -> list:
-    """Normalizuje liste numerow artykulu (patrz normalize_article_number)
-    i usuwa duplikaty, zachowujac kolejnosc pierwszego wystapienia. Wpisy,
-    ktore po normalizacji nie zawieraja zadnej cyfry, sa ignorowane."""
+    """Normalizuje liste numerow; usuwa duplikaty (zachowujac kolejnosc) i
+    wpisy bez cyfr."""
     result = []
     for value in values:
         normalized = normalize_article_number(value)
@@ -393,12 +302,9 @@ def normalize_article_numbers(values) -> list:
 
 
 def parse_smtp_mode(raw) -> str:
-    """Normalizuje i waliduje SMTP_MODE. Literowka albo niepoprawna wartosc
-    (np. 'smtp') NIE jest tolerowana i nie ma wpadac przypadkiem w galaz
-    trybu 'exim' - konczy dzialanie skryptu czytelnym RuntimeError.
-
-    'disabled' wylacza wysylke e-mail calkowicie (np. gdy uzywasz tylko
-    Telegrama) - patrz validate_notification_config()."""
+    """Waliduje SMTP_MODE. Nieznana wartosc (np. literowka) konczy start
+    RuntimeError, zamiast cicho wpasc w ktorys tryb. 'disabled' wylacza
+    e-mail."""
     value = ("" if raw is None else raw).strip()
     mode = value.lower()
     if mode not in ("gmail", "local587", "exim", "disabled"):
@@ -418,17 +324,10 @@ def validate_notification_config(
     telegram_bot_token,
     telegram_chat_id,
 ) -> None:
-    """Jedyne miejsce, ktore decyduje, czy jest skonfigurowany przynajmniej
-    jeden KOMPLETNY, faktycznie uzywalny kanal powiadomien - zamiast
-    czekac, az pojawi sie dopasowana oferta i wysylka maila/Telegrama
-    zawiedzie w trakcie dzialania skryptu. Poszczegolne galezie SMTP_MODE
-    w kodzie (gmail/local587/exim) NIE robia juz tej walidacji osobno -
-    ta funkcja dostaje efektywne wartosci (po fallbackach) i sprawdza je
-    kompletnie.
-
-    use_smtp_auth musi odpowiadac dokladnie temu, co faktycznie robi
-    send_email() (zmienna USE_AUTH) - tylko gdy send_email() naprawde
-    woluje server.login(), SMTP_USER/SMTP_PASS sa wymagane."""
+    """Przy starcie wymaga co najmniej jednego kompletnego kanalu
+    powiadomien (zamiast bledu przy pierwszej wysylce) i odrzuca
+    niekompletny wlaczony e-mail lub polowiczny Telegram. Dostaje wartosci
+    efektywne (po fallbackach); use_smtp_auth musi odpowiadac USE_AUTH."""
     has_token = bool(telegram_bot_token)
     has_chat_id = bool(telegram_chat_id)
 
@@ -453,9 +352,6 @@ def validate_notification_config(
             )
         return
 
-    # SMTP_MODE to 'gmail', 'local587' albo 'exim' - e-mail jest wlaczony,
-    # wiec musi byc KOMPLETNY (nie ma sensu czekac, az proba wysylki
-    # zawiedzie przy pierwszej dopasowanej ofercie).
     missing = []
     if use_smtp_auth:
         if not smtp_user:
@@ -476,12 +372,7 @@ def validate_notification_config(
 
 
 # ---------------- USTAWIENIA UZYTKOWNIKA (z ~/.config/ikea-okazje.env) ----------------
-# Wszystkie zmienne w tej sekcji sa TYLKO harmless defaultami na poziomie
-# modulu - samo `import ikea_okazje` NIE czyta .env, NIE waliduje
-# konfiguracji i NIE dotyka zadnych plikow stanu. Prawdziwe wartosci
-# (na podstawie ~/.config/ikea-okazje.env) sa wczytywane i przypisywane do
-# tych samych globalnych nazw wylacznie przez initialize_runtime() - patrz
-# nizej. main() wywoluje initialize_runtime() jako pierwszy krok.
+# Nieszkodliwe defaulty; prawdziwe wartosci przypisuje initialize_runtime().
 ENV: dict = {}
 
 BASE_STORE_IDS = ["294"]
@@ -524,11 +415,7 @@ NORMALIZED_TERMS: list = []
 NORMALIZED_EXCLUDE: list = []
 # ----------------------------------------------------------------------------------------
 
-# Prosty prymityw zamkniecia dla trybu daemon (patrz run_daemon()). Samo
-# stworzenie obiektu threading.Event() przy imporcie jest nieszkodliwe -
-# nie dotyka systemu plikow, sieci ani sygnalow; handlery SIGTERM/SIGINT sa
-# instalowane wylacznie w run_daemon() (install_shutdown_signal_handlers()),
-# nigdy przy imporcie modulu.
+# Sygnal zamkniecia trybu daemon; handlery sygnalow instaluje dopiero run_daemon().
 SHUTDOWN_EVENT = threading.Event()
 
 
@@ -544,39 +431,17 @@ def normalize_text(s: str) -> str:
 # ---------------- DYNAMICZNA LISTA (modyfikowana komendami z Telegrama) ----------------
 
 def default_access_notification_state() -> dict:
-    """Domyslny, "pusty" stan bloku 'ikea_access_notification' (patrz
-    load_dynamic_state()/get_access_notification_state() nizej) - brak
-    aktywnej utraty dostepu, brak zapamietanego ostatniego kodu HTTP
-    blokady, brak oczekujacej (niepotwierdzonej) sekwencji. Uzywany do
-    zasiania nowego pliku stanu i jako fallback dla starszych plikow
-    stanu, ktore jeszcze nie mialy tych kluczy.
-
-    pending_outage=True oznacza, ze RAZ (jeden pelny cykl) wszystkie
-    skonfigurowane sklepy zawiodly wylacznie z powodu HTTP 403/429, ale
-    alert JESZCZE NIE zostal wyslany - czeka na potwierdzenie drugim,
-    NASTEPNYM z rzedu, rowniez w pelni zablokowanym cyklem (patrz
-    handle_access_notification_state() - polityka "dwoch kolejnych
-    cykli", wprowadzona, zeby pojedyncza, przejsciowa blokada 403/429 nie
-    generowala pary halasliwych powiadomien utrata/odzyskanie dostepu)."""
+    """Pusty stan bloku 'ikea_access_notification'. pending_outage=True:
+    jeden w pelni zablokowany cykl (403/429 na wszystkich sklepach) bez
+    alertu, czeka na potwierdzenie kolejnym takim cyklem."""
     return {"outage_active": False, "last_status_code": None, "pending_outage": False}
 
 
 def migrate_access_notification_state(raw) -> dict:
-    """Uzupelnia brakujace pola w bloku 'ikea_access_notification' wczytanym
-    z dysku - bez utraty juz obecnych wartosci. Obsluguje w szczegolnosci:
-
-    - stary plik (przed wprowadzeniem polityki "dwoch kolejnych cykli"),
-      ktory mial TYLKO outage_active/last_status_code, bez pending_outage
-      - dopisuje pending_outage=False;
-    - kompletnie brakujacy/niepoprawny wpis - zwraca domyslny, "pusty"
-      stan (patrz default_access_notification_state()).
-
-    WAZNE: outage_active=True odczytane ze starego pliku NIE jest
-    reinterpretowane jako pierwsza, niepotwierdzona porazka - uzytkownik
-    zostal juz raz zaalarmowany przed tym refaktorem, wiec pending_outage
-    jest tu zawsze False (nie ma czego potwierdzac, alert juz wyslany;
-    kontynuacja z outage_active=True po prostu czeka na pierwszy pelny
-    sukces, tak jak wczesniej - patrz handle_access_notification_state())."""
+    """Uzupelnia brakujace pola bloku 'ikea_access_notification' z dysku,
+    zachowujac istniejace; niepoprawny wpis -> pusty stan. Brak
+    pending_outage -> False (outage_active=True znaczy, ze alert juz
+    wyslano, wiec nie ma czego potwierdzac)."""
     if not isinstance(raw, dict):
         return default_access_notification_state()
     return {
@@ -587,27 +452,16 @@ def migrate_access_notification_state(raw) -> dict:
 
 
 def default_blocking_backoff_state_dict() -> dict:
-    """Domyslny, "pusty" stan bloku 'blocking_backoff' (patrz
-    BackoffState/get_blocking_backoff_state() nizej) - brak aktywnego
-    backoffu po 403/429. Uzywany do zasiania nowego pliku stanu i jako
-    fallback dla starszych plikow stanu (bez tego klucza) - patrz
-    load_dynamic_state(). Odrebny od 'ikea_access_notification' powyzej:
-    ten blok trzyma harmonogram GLOBALNEGO backoffu calego procesu/API
-    (ile sekund czekac przed kolejna proba), nie stan alertu o
-    utracie/odzyskaniu dostepu wysylanego uzytkownikowi."""
+    """Pusty stan bloku 'blocking_backoff' (harmonogram globalnego backoffu,
+    niezalezny od stanu alertu 'ikea_access_notification')."""
     return BackoffState().to_dict()
 
 
 def load_dynamic_state() -> dict:
-    """Pierwsze uzycie: zasiewa stan z SEARCH_TERMS/SEARCH_ARTICLE_NUMBERS/
-    STORE_IDS z .env. Kolejne uzycia: czyta juz tylko z tego pliku - .env po
-    pierwszym razie nie jest juz zrodlem prawdy dla tych list (zmieniaj je
-    odtad komendami w Telegramie albo edytujac ten plik). Jesli plik juz
-    istnieje, ale nie ma jeszcze klucza "store_ids", "ikea_access_notification"
-    albo "blocking_backoff" (starsza wersja stanu), dopisujemy brakujace
-    klucze (z .env albo z domyslnego, "pustego" stanu) i zapisujemy z
-    powrotem na dysk - stare pliki stanu bez tych blokow nadal dzialaja bez
-    wyjatku (migracja "w miejscu", bez utraty danych juz obecnych w pliku)."""
+    """Wczytuje dynamiczny stan (slowa, numery, sklepy, alert, backoff).
+    Pierwsze uruchomienie zasiewa go z .env; potem zrodlem prawdy jest plik
+    (zmieniany komendami Telegrama). Brakujace klucze starszych plikow sa
+    uzupelniane i zapisywane w miejscu, bez utraty danych."""
     if os.path.exists(DYNAMIC_STATE_FILE):
         with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -651,26 +505,16 @@ def load_dynamic_state() -> dict:
 
 
 def get_access_notification_state() -> dict:
-    """Zwraca aktualny stan bloku 'ikea_access_notification' z DYNAMIC_STATE
-    (patrz load_dynamic_state()) - z fallbackiem na domyslny, "pusty" stan,
-    gdyby z jakiegos powodu brakowalo tego klucza w pamieci."""
+    """Blok 'ikea_access_notification' z DYNAMIC_STATE (albo pusty stan)."""
     return DYNAMIC_STATE.get("ikea_access_notification") or default_access_notification_state()
 
 
 def set_access_notification_state(
     outage_active: bool, last_status_code, pending_outage: bool = False
 ) -> None:
-    """Aktualizuje i trwale zapisuje (na dysk, w DYNAMIC_STATE_FILE) stan
-    bloku 'ikea_access_notification' - patrz
-    handle_access_notification_state(). Zapis na dysk (a nie tylko w
-    pamieci) jest tym, co gwarantuje, ze restart procesu/uslugi systemd w
-    trakcie trwajacej blokady 403/429 nie spowoduje ponownego alertu (ani
-    nie zapomni o juz zaobserwowanej, pierwszej niepotwierdzonej porazce -
-    patrz pending_outage w default_access_notification_state()).
-
-    pending_outage=True i outage_active=True nigdy nie wspolistnieja - gdy
-    alert jest juz aktywny (wyslany), nie ma juz nic do "potwierdzenia"
-    (patrz handle_access_notification_state())."""
+    """Zapisuje stan alertu na dysk, zeby restart w trakcie blokady nie
+    powtorzyl alertu ani nie zgubil niepotwierdzonej porazki. Wolajacy
+    nigdy nie ustawia jednoczesnie pending_outage i outage_active."""
     DYNAMIC_STATE["ikea_access_notification"] = {
         "outage_active": outage_active,
         "last_status_code": last_status_code,
@@ -680,22 +524,12 @@ def set_access_notification_state(
 
 
 def get_blocking_backoff_state() -> BackoffState:
-    """Zwraca aktualny, TRWALY stan globalnego backoffu (klucz
-    'blocking_backoff' w DYNAMIC_STATE, patrz load_dynamic_state()) jako
-    BackoffState - odrebny od 'ikea_access_notification'
-    (get_access_notification_state()): ten stan opisuje harmonogram
-    kolejnej dozwolonej proby zapytania do API IKEA (wylacznie), nie stan
-    powiadomienia uzytkownika o utracie/odzyskaniu dostepu."""
+    """Trwaly stan globalnego backoffu ('blocking_backoff') jako BackoffState."""
     return BackoffState.from_dict(DYNAMIC_STATE.get("blocking_backoff"))
 
 
 def set_blocking_backoff_state(state: BackoffState) -> None:
-    """Aktualizuje i trwale zapisuje (na dysk, w DYNAMIC_STATE_FILE) stan
-    globalnego backoffu - patrz update_blocking_backoff_state(). Zapis na
-    dysk (a nie tylko w pamieci procesu) jest tym, co gwarantuje, ze
-    restart procesu/uslugi systemd w trakcie aktywnej blokady 403/429 NIE
-    resetuje juz wyliczonego harmonogramu (next_allowed_check_at) - patrz
-    README, "Trwaly backoff po 403/429"."""
+    """Zapisuje stan backoffu na dysk, zeby restart nie resetowal harmonogramu."""
     DYNAMIC_STATE["blocking_backoff"] = state.to_dict()
     save_dynamic_state(DYNAMIC_STATE)
 
@@ -717,23 +551,10 @@ def refresh_normalized_terms() -> None:
 
 
 def initialize_runtime() -> None:
-    """Jedyne miejsce, ktore faktycznie 'startuje' aplikacje: czyta .env,
-    parsuje i waliduje SMTP_MODE, wyprowadza ustawienia SMTP/Telegrama,
-    waliduje kanaly powiadomien, wczytuje (albo tworzy) dynamiczny stan
-    monitoringu i przygotowuje znormalizowane pochodne (NORMALIZED_TERMS/
-    NORMALIZED_EXCLUDE). Samo `import ikea_okazje` NIE robi nic z tego -
-    modul definiuje tylko funkcje i harmless defaulty (patrz sekcja
-    "USTAWIENIA UZYTKOWNIKA" wyzej).
-
-    main() wywoluje te funkcje jako pierwszy krok, przed sprawdzeniem
-    komend Telegrama, cyklem cron albo startem daemona. Testy moga
-    wywolywac ja explicit, z wlasnym izolowanym HOME/.env.
-
-    Bezpieczna do wielokrotnego wywolania w tym samym procesie (np. w
-    testach) - kazde wywolanie w calosci przebudowuje globalne zmienne
-    od zera z aktualnego ENV, bez doklejania sie do wartosci z
-    poprzedniej inicjalizacji (np. SEARCH_TERMS nie rosnie przy kazdym
-    kolejnym initialize_runtime())."""
+    """Start aplikacji: czyta .env, waliduje konfiguracje i kanaly
+    powiadomien, wczytuje dynamiczny stan i ustawia globalne ustawienia.
+    Wolana przez main() przed czymkolwiek innym; testy moga ja wolac z
+    wlasnym HOME. Kazde wywolanie buduje globale od zera (bez doklejania)."""
     global ENV
     global BASE_STORE_IDS, BASE_SEARCH_TERMS, BASE_SEARCH_ARTICLE_NUMBERS
     global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
@@ -748,10 +569,7 @@ def initialize_runtime() -> None:
 
     ENV = load_env_file(CONFIG_FILE)
 
-    # BASE_STORE_IDS/BASE_SEARCH_TERMS/BASE_SEARCH_ARTICLE_NUMBERS sluza
-    # wylacznie do zasiania dynamicznego stanu (patrz load_dynamic_state()
-    # nizej) - po pierwszym uruchomieniu zrodlem prawdy jest
-    # ~/.ikea_okazje_dynamic.json, a nie .env.
+    # BASE_* tylko zasiewaja dynamiczny stan przy pierwszym uruchomieniu.
     BASE_STORE_IDS = parse_list(ENV.get("STORE_IDS"), ["294"])
     BASE_SEARCH_TERMS = parse_list(ENV.get("SEARCH_TERMS"), ["Stall"])
     BASE_SEARCH_ARTICLE_NUMBERS = normalize_article_numbers(
@@ -767,26 +585,14 @@ def initialize_runtime() -> None:
     SMTP_MODE = parse_smtp_mode(ENV.get("SMTP_MODE", "gmail"))
     VERIFY_TLS = parse_bool(ENV.get("VERIFY_TLS"), True)
 
-    # "cron" (domyslny, jedno przejscie) albo "daemon" (petla w tle, np. systemd)
     RUN_MODE = ENV.get("RUN_MODE", "cron").strip().lower()
-    # Domyslnie 2700s (45 minut) - odpowiada celowi tego narzedzia (rzadkie,
-    # prywatne sprawdzanie). Jesli CHECK_INTERVAL_SECONDS jest jawnie
-    # ustawiony w .env (nawet na wartosc inna, np. stare 900s/15 min albo
-    # poprzednie domyslne 3600s/1h), ta wartosc ma pierwszenstwo -
-    # zachowanie wstecznie kompatybilne, istniejace instalacje nie
-    # zmieniaja sie bez zmiany w .env.
     CHECK_INTERVAL_SECONDS = parse_optional_number(ENV.get("CHECK_INTERVAL_SECONDS")) or CHECK_INTERVAL_SECONDS
     TELEGRAM_POLL_INTERVAL_SECONDS = parse_optional_number(ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS")) or 15
 
-    # Mapowanie storeId -> slug sklepu uzywany w adresach "Okazje na Okraglo".
-    # Ma pierwszenstwo nad wbudowana mapa KNOWN_STORES (pozwala obsluzyc
-    # nowe sklepy albo zmiane routingu IKEA bez aktualizacji kodu). Jesli
-    # puste/brak w .env, uzywana jest wylacznie KNOWN_STORES.
+    # Ma pierwszenstwo nad KNOWN_STORES (nowe sklepy bez zmiany kodu).
     STORE_URL_SLUGS = parse_store_url_slugs(ENV.get("STORE_URL_SLUGS", ""), {})
 
     if SMTP_MODE == "gmail":
-        # Kompletnosc SMTP_USER/SMTP_PASS/EMAIL_TO jest sprawdzana pozniej,
-        # w jednym miejscu, w validate_notification_config() - nie tutaj.
         SMTP_HOST = "smtp.gmail.com"
         SMTP_PORT = 587
         SMTP_USER = ENV.get("SMTP_USER") or os.environ.get("SMTP_USER")
@@ -801,16 +607,14 @@ def initialize_runtime() -> None:
         EMAIL_FROM = SMTP_USER
         USE_AUTH = True
     elif SMTP_MODE == "exim":
-        # exim jest w tym skrypcie z definicji niezautentykowany
-        # (przekazanie dalej do lokalnego MTA) - SMTP_USER/SMTP_PASS sa dla
-        # niego celowo nieuzywane, patrz USE_AUTH=False i send_email().
+        # Przekazanie do lokalnego MTA, celowo bez uwierzytelniania.
         SMTP_HOST = ENV.get("SMTP_HOST", "localhost")
         SMTP_PORT = 25
         SMTP_USER = None
         SMTP_PASS = None
         EMAIL_FROM = ENV.get("EMAIL_FROM", "ikea-watch@localhost")
         USE_AUTH = False
-    else:  # "disabled" - e-mail wylaczony calkowicie, patrz validate_notification_config()
+    else:  # "disabled"
         SMTP_HOST = None
         SMTP_PORT = None
         SMTP_USER = None
@@ -819,17 +623,11 @@ def initialize_runtime() -> None:
         USE_AUTH = False
 
     EMAIL_ENABLED = SMTP_MODE != "disabled"
-    # EMAIL_TO moze spadac (fallback) na EMAIL_FROM (np. SMTP_USER dla
-    # gmail/local587, gdzie to naprawde jest ta sama, prawdziwa skrzynka) -
-    # to jest istniejace, dokumentowane zachowanie.
+    # Brak EMAIL_TO -> EMAIL_FROM (dla gmail/local587 to ta sama skrzynka).
     explicit_email_to = ENV.get("EMAIL_TO") or os.environ.get("EMAIL_TO")
     EMAIL_TO = explicit_email_to or EMAIL_FROM
 
-    # Do walidacji kompletnosci uzywamy innego efektywnego adresu dla
-    # 'exim': EMAIL_FROM dla 'exim' domyslnie spada na placeholder
-    # ('ikea-watch@localhost'), ktory NIE jest prawdziwym adresem odbiorcy -
-    # w tym trybie EMAIL_TO musi byc jawnie ustawiony w .env, zamiast cicho
-    # spadac na ten placeholder.
+    # Dla exim EMAIL_FROM bywa placeholderem, wiec EMAIL_TO musi byc jawny.
     email_to_for_validation = explicit_email_to if SMTP_MODE == "exim" else EMAIL_TO
 
     TELEGRAM_BOT_TOKEN = ENV.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -855,10 +653,7 @@ def initialize_runtime() -> None:
 
 
 def store_display_name(store_id) -> str:
-    """Zwraca czytelna nazwe sklepu z KNOWN_STORES (bez zbednego przedrostka
-    "IKEA " - skraca to wiadomosci e-mail/Telegram), albo "Sklep <ID>",
-    jesli ID nie jest w wbudowanej mapie (np. rowny wpis dodany recznie
-    przez STORE_IDS w .env)."""
+    """Nazwa z KNOWN_STORES bez przedrostka "IKEA " albo "Sklep <ID>"."""
     info = KNOWN_STORES.get(str(store_id))
     if not info:
         return f"Sklep {store_id}"
@@ -871,19 +666,12 @@ def store_display_name(store_id) -> str:
 # ---------------- SPOJNY PROFIL KLIENTA (impersonate + naglowki) ----------------
 
 def choose_client_profile() -> BrowserProfile:
-    """Losuje jeden profil z CLIENT_PROFILES. Wywolywane co najwyzej raz na
-    cykl monitoringu (patrz run_ikea_check_cycle() - ustawia
-    CURRENT_CLIENT_PROFILE na poczatku cyklu), NIGDY miedzy pojedynczymi
-    zapytaniami w tej samej sekwencji (wszystkie strony wszystkich sklepow w
-    jednym przebiegu uzywaja tego samego profilu - patrz get_active_client_profile())."""
+    """Losuje profil klienta; wolane raz na cykl, nigdy miedzy zapytaniami."""
     return random.choice(CLIENT_PROFILES)
 
 
 def get_active_client_profile() -> BrowserProfile:
-    """Zwraca profil klienta aktywny dla aktualnego cyklu (CURRENT_CLIENT_PROFILE).
-    Jesli nic go jeszcze nie ustawilo (np. wywolanie fetch_* poza
-    run_ikea_check_cycle(), tak jak w niektorych testach), losuje i
-    zapamietuje jeden - fetch_page_with_retry() nigdy nie dostaje None."""
+    """Profil biezacego cyklu; wywolane poza cyklem losuje i zapamietuje."""
     global CURRENT_CLIENT_PROFILE
     if CURRENT_CLIENT_PROFILE is None:
         CURRENT_CLIENT_PROFILE = choose_client_profile()
@@ -891,11 +679,7 @@ def get_active_client_profile() -> BrowserProfile:
 
 
 def build_headers_for_profile(profile: BrowserProfile) -> dict:
-    """Buduje kompletny slownik naglowkow HTTP dla danego profilu klienta -
-    BASE_HEADERS (wspolne, niezalezne od przegladarki) plus user-agent i
-    sec-ch-ua zgodne z tym konkretnym profilem (patrz CLIENT_PROFILES).
-    Wylacznie o wewnetrznej spojnosci naglowkow z fingerprintem TLS/JA3
-    wybranym przez impersonate= - nie o obchodzeniu zabezpieczen."""
+    """BASE_HEADERS + user-agent/sec-ch-ua zgodne z profilem (i jego TLS)."""
     headers = dict(BASE_HEADERS)
     headers["user-agent"] = profile.user_agent
     headers["sec-ch-ua"] = profile.sec_ch_ua
@@ -913,20 +697,10 @@ def dump_raw(data) -> None:
 
 
 class BlockedByServerError(RuntimeError):
-    """Sygnalizuje, ze IKEA odrzucila zapytanie kodem z BLOCKING_STATUS_CODES
-    (403/429 - blokada Akamai/rate limit), w odroznieniu od przejsciowego
-    bledu serwera (5xx, patrz RETRYABLE_STATUS_CODES). NIE jest retry'owany
-    wewnatrz fetch_page_with_retry() - wychodzi natychmiast na wierch, zeby
-    run_ikea_check_cycle()/run_daemon() mogly zareagowac zmniejszeniem
-    czestotliwosci (backoff, patrz BackoffState/compute_next_allowed_check_delay()), a
-    nie "przepychaniem" kolejnych prob w tej samej sekundzie.
-
-    retry_after_seconds (opcjonalny) to wartosc naglowka HTTP Retry-After z
-    odpowiedzi serwera, jesli byla obecna i poprawna (patrz
-    parse_retry_after_header()) - None, jesli naglowka nie bylo albo byl
-    nieparsowalny/ujemny. To jest WYLACZNIE odczytana wartosc podana przez
-    serwer, nie lokalnie wyliczony backoff - patrz
-    compute_next_allowed_check_delay(), ktora wybiera dluzszy z obu."""
+    """HTTP 403/429 (blokada/rate limit). Nie jest ponawiany w
+    fetch_page_with_retry(), tylko konczy pobieranie, a cykl reaguje
+    globalnym backoffem. retry_after_seconds to sparsowany naglowek
+    Retry-After od serwera (None, gdy brak lub niepoprawny)."""
 
     def __init__(self, status_code: int, message: str, retry_after_seconds: "float | None" = None):
         super().__init__(message)
@@ -935,20 +709,16 @@ class BlockedByServerError(RuntimeError):
 
 
 def parse_retry_after_header(raw_value) -> "float | None":
-    """Parsuje naglowek HTTP Retry-After (patrz RFC 9110 sec. 10.2.3):
-    albo liczba sekund (np. "120"), albo data HTTP (np.
-    "Wed, 21 Oct 2026 07:28:00 GMT"). Kazda bledna, pusta, ujemna albo
-    nieobslugiwana wartosc jest traktowana jako BRAK naglowka (zwraca None)
-    - NIGDY nie rzuca wyjatku, bo blad parsowania tego opcjonalnego
-    naglowka nie powinien przerywac obslugi 403/429 (patrz
-    fetch_page_with_retry())."""
+    """Parsuje Retry-After (RFC 9110): sekundy albo data HTTP. Wartosc
+    bledna, pusta, ujemna lub przeszla -> None. Nigdy nie rzuca, zeby nie
+    przerwac obslugi 403/429."""
     if raw_value is None:
         return None
     value = str(raw_value).strip()
     if not value:
         return None
 
-    # Format 1: liczba sekund (calkowita albo, wyjatkowo, z przecinkiem).
+    # Format 1: liczba sekund.
     try:
         seconds = float(value)
     except ValueError:
@@ -958,7 +728,7 @@ def parse_retry_after_header(raw_value) -> "float | None":
             return seconds
         return None
 
-    # Format 2: data HTTP (RFC 1123/2822) - "Retry-After: <http-date>".
+    # Format 2: data HTTP.
     try:
         target_dt = parsedate_to_datetime(value)
     except (TypeError, ValueError):
@@ -1000,14 +770,7 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code in BLOCKING_STATUS_CODES:
-                # Blokada/rate limit - NIE retry'ujemy w miejscu (patrz
-                # BlockedByServerError powyzej), to ma wyjsc jako sygnal do
-                # ograniczenia aktywnosci cyklu/daemona, nie do ponawiania
-                # zapytan. Odczytujemy tez opcjonalny naglowek Retry-After
-                # (patrz parse_retry_after_header()) - serwer moze nim
-                # podac wlasny, wiazacy termin kolejnej dozwolonej proby,
-                # ktory update_blocking_backoff_state() porowna z lokalnie
-                # wyliczonym backoffem i wybierze dluzszy z obu.
+                # Bez ponawiania w miejscu (patrz BlockedByServerError).
                 retry_after = parse_retry_after_header(resp.headers.get("retry-after"))
                 raise BlockedByServerError(
                     resp.status_code,
@@ -1068,14 +831,9 @@ def fetch_store_offers(store_id: str) -> list:
 
 
 def fetch_all_offers() -> tuple:
-    """Pobiera oferty ze wszystkich STORE_IDS. Blad pobrania jednego sklepu
-    nie przerywa calego cyklu - jest logowany i zapamietywany w
-    store_errors, a pobieranie kontynuowane dla pozostalych sklepow.
-    Zwraca (all_content, store_errors), gdzie store_errors to slownik
-    {store_id: wyjatek} dla sklepow, ktore nie udalo sie pobrac - wartosc
-    to oryginalny obiekt wyjatku (nie tekst), zeby wolajacy mogl rozpoznac
-    BlockedByServerError (HTTP 403/429) i zareagowac backoffem, patrz
-    update_blocking_backoff_state()."""
+    """Pobiera oferty ze wszystkich STORE_IDS; blad jednego sklepu nie
+    przerywa cyklu. Zwraca (content, store_errors), gdzie store_errors to
+    {store_id: wyjatek} - oryginalne wyjatki, zeby rozpoznac 403/429."""
     all_content = []
     store_errors = {}
     for i, store_id in enumerate(STORE_IDS):
@@ -1108,8 +866,7 @@ def product_excluded(product: dict) -> bool:
 
 
 def resolve_store_slug(store_id) -> str | None:
-    """Zwraca slug sklepu dla linku rezerwacji. STORE_URL_SLUGS z .env ma
-    pierwszenstwo nad wbudowana mapa KNOWN_STORES."""
+    """Slug sklepu dla linku rezerwacji; STORE_URL_SLUGS ma pierwszenstwo."""
     slug = STORE_URL_SLUGS.get(str(store_id))
     if slug:
         return slug
@@ -1118,17 +875,9 @@ def resolve_store_slug(store_id) -> str | None:
 
 
 def build_offer_reservation_link(store_id, offer_number) -> str | None:
-    """Buduje bezposredni link do konkretnej oferty w dziale 'Okazje na Okraglo'.
-
-    Format: https://www.ikea.com/pl/pl/second-hand/buy-from-ikea/#/<slug>/<offerNumber>
-
-    Znak "+" (separator spacji w slugach typu "bielsko+biala") jest celowo
-    pozostawiony niezakodowany (safe="+") - polskie znaki (np. "l" w
-    "wroclaw") sa nadal URL-encoded normalnie.
-
-    Zwraca None, jesli brakuje offer_number lub mapowania storeId -> slug -
-    zamiast generowac mylacy link do zwyklego katalogu produktow IKEA.
-    """
+    """Link do oferty: .../second-hand/buy-from-ikea/#/<slug>/<offerNumber>.
+    "+" (separator spacji w slugu) zostaje niezakodowany, polskie znaki sa
+    kodowane. Bez offer_number lub sluga -> None (zamiast mylacego linku)."""
     if not offer_number:
         return None
     slug = resolve_store_slug(store_id)
@@ -1193,11 +942,8 @@ def flatten_matching_offers(content: list) -> list:
 
 
 def _offer_group_key(o: dict) -> tuple:
-    """Klucz grupowania ofert na potrzeby powiadomien - dwie oferty trafiaja
-    do tej samej grupy WYLACZNIE gdy WSZYSTKIE pola wspolne (wyswietlane w
-    naglowku grupy) sa identyczne. Porownywanie jest deterministyczne (==),
-    bez fuzzy matchingu. article_numbers jest sortowane i zamrazane, zeby
-    kolejnosc z API nie powodowala roznych kluczy dla tego samego produktu."""
+    """Oferty sa w jednej grupie tylko przy identycznych wszystkich polach
+    wspolnych. article_numbers sortowane, bo kolejnosc z API bywa rozna."""
     an = tuple(sorted(o.get("article_numbers") or []))
     return (
         o.get("title"),
@@ -1217,16 +963,9 @@ def _offer_group_key(o: dict) -> tuple:
 
 
 def group_offers_for_notification(offers: list) -> list:
-    """Grupuje oferty o identycznych wspolnych polach na potrzeby tresci
-    powiadomienia. Zachowuje kolejnosc pierwszego wystapienia grupy i
-    kolejnosc ofert w obrebie grupy (stabilna, z API/flatten).
-
-    Zwraca liste slownikow, kazdy z kluczami:
-      - "shared": dict ze wspolnymi polami (title, description, ...)
-      - "items": list[dict] z offer_uuid, offer_number, reservation_link
-
-    Nie zmienia semantyki offer_uuid ani pliku seen_offers - grupowanie
-    jest WYLACZNIE na potrzeby formatowania wiadomosci."""
+    """Grupuje oferty (tylko na potrzeby tresci powiadomienia), zachowujac
+    kolejnosc. Zwraca liste {"shared": {wspolne pola}, "items": [{offer_uuid,
+    offer_number, reservation_link}, ...]}."""
     groups: dict = {}
     for o in offers:
         key = _offer_group_key(o)
@@ -1258,10 +997,9 @@ def group_offers_for_notification(offers: list) -> list:
 
 
 def load_seen_state() -> dict:
-    """Wczytuje pelny stan plikow ofert: klucz 'seen' (zbior UUID w pelni
-    dostarczonych) i 'pending' (slownik uuid -> lista kanalow, ktore juz
-    dostarczyly). Stary plik bez klucza 'pending' zwraca pusty slownik
-    dla pending - wstecznie kompatybilne.\""""
+    """Stan dostawy ofert per kanal: 'seen' (UUID dostarczone wszystkimi
+    aktywnymi kanalami) i 'pending' ({uuid: [kanaly, ktore juz
+    dostarczyly]}). Stary plik bez 'pending' -> pusty slownik."""
     if not os.path.exists(STATE_FILE):
         return {"seen": set(), "pending": {}}
     with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -1276,12 +1014,12 @@ def load_seen_state() -> dict:
 
 
 def save_seen_state(seen: set, pending: dict) -> None:
-    """Atomowo zapisuje pelny stan: klucz 'seen' i 'pending'.\""""
+    """Atomowo zapisuje 'seen' i 'pending'."""
     _write_seen_state(seen, pending)
 
 
 def _write_seen_state(seen: set, pending: dict) -> None:
-    """Wspolny, atomowy zapis stanu ofert na dysk.\""""
+    """Atomowy zapis (plik .tmp + os.replace); pusty pending jest pomijany."""
     tmp_path = STATE_FILE + ".tmp"
     payload = {"seen": sorted(seen)}
     if pending:
@@ -1333,14 +1071,8 @@ def format_offer_group_email(group: dict) -> str:
 
 
 def deliver_email_message(subject: str, body: str) -> None:
-    """Buduje i wysyla jedna wiadomosc e-mail (naglowki From/To + tresc
-    tekstowa) przez aktualnie skonfigurowany SMTP - wspolna, niska warstwa
-    dostawy uzywana zarowno przez send_email() (powiadomienia o nowych
-    ofertach) jak i notify_access_status() (jednorazowe alerty o
-    utracie/odzyskaniu dostepu, patrz handle_access_notification_state()).
-    Nie zmienia istniejacego zachowania SMTP (host/port/TLS/auth) - to
-    tylko wydzielenie identycznego kodu dostawy, ktory wczesniej istnial
-    wylacznie wewnatrz send_email()."""
+    """Wysyla jedna wiadomosc tekstowa przez skonfigurowany SMTP (wspolne dla
+    powiadomien o ofertach i alertow o dostepie)."""
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
@@ -1390,10 +1122,8 @@ def escape_html_attr(text: str) -> str:
 
 
 def _safe_truncate_html(raw_text: str, max_escaped_len: int) -> str:
-    """Skraca surowy tekst tak, aby po escape_html() jego dlugosc (z ew. znakiem '…')
-    nie przekraczala max_escaped_len. Skracanie odbywa sie na surowym tekscie PRZED
-    escapowaniem, wiec niemozliwe jest przeciecie encji (&amp;, &lt;, &gt;)
-    ani tagow HTML."""
+    """Skraca surowy tekst tak, by po escape_html() (z '…') miescil sie w
+    max_escaped_len. Ciecie przed escapowaniem nie przetnie encji ani tagu."""
     if not raw_text or max_escaped_len <= 0:
         return ""
 
@@ -1442,20 +1172,15 @@ def _format_meta_line_telegram(shared: dict) -> str:
 
 
 def _minimal_group_header_telegram(shared: dict) -> str:
-    """Zwraca minimalny dopuszczalny naglowek grupy (z tytulem zredukowanym do '…' i bez opisu),
-    uzywany do sprawdzenia, czy jakakolwiek pojedyncza oferta moze sie w ogole zmiescic w wiadomosci."""
+    """Najkrotszy mozliwy naglowek (tytul '…', bez opisu) - do sprawdzenia,
+    czy pojedyncza oferta w ogole zmiesci sie w wiadomosci."""
     meta_line = _format_meta_line_telegram(shared)
     return f"<b>…</b>\n{meta_line}"
 
 
 def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
-    """Formatuje naglowek grupy ofert dla Telegrama (wspolne pola produktu).
-    Uzywany jako naglowek (lub naglowek kontynuacji) przy podziale grupy na
-    wiadomosci w split_telegram_messages().
-
-    Jesli max_len jest podane i pelny naglowek przekracza ten limit, funkcja
-    bezpiecznie skróci opis (lub w razie potrzeby tytul) PRZED escapowaniem HTML,
-    tak aby gotowy naglowek miescil sie w max_len."""
+    """Naglowek grupy dla Telegrama. Przy max_len skraca najpierw opis, a
+    tytul dopiero w ostatecznosci - zawsze przed escapowaniem HTML."""
     raw_title = str(shared.get("title") or "")
     raw_desc = str(shared.get("description") or "")
     meta_line = _format_meta_line_telegram(shared)
@@ -1471,7 +1196,7 @@ def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
     if max_len is None or len(full_header) <= max_len:
         return full_header
 
-    # Nagłówek jest zbyt długi - skracamy najpierw opis, zachowując pełny tytuł
+    # Za dlugi: skracamy opis, zachowujac pelny tytul.
     prefix = f"<b>{safe_title}</b>"
     if raw_desc:
         overhead = len(prefix) + len(" — \n") + len(meta_line)
@@ -1483,8 +1208,7 @@ def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
                 if len(candidate) <= max_len:
                     return candidate
 
-    # Jeśli opis nie mieści się lub po skróceniu nadal przekracza max_len,
-    # odrzucamy opis i sprawdzamy sam tytuł z meta_line:
+    # Opis sie nie miesci: bez opisu, z (ewentualnie skroconym) tytulem.
     overhead = len("<b></b>\n") + len(meta_line)
     avail_title = max_len - overhead
     if avail_title >= 1:
@@ -1493,7 +1217,6 @@ def _format_group_header_telegram(shared: dict, max_len: int = None) -> str:
         if len(candidate) <= max_len:
             return candidate
 
-    # W skrajnym przypadku:
     short_title = _safe_truncate_html(raw_title, max(1, avail_title))
     return f"<b>{short_title}</b>\n{meta_line}"
 
@@ -1509,42 +1232,28 @@ def _format_offer_item_telegram(item: dict) -> str:
         return f"• oferta {offer_number_txt} — link niedostępny"
 
 
-# Telegram API limit to 4096 znakow. Uzywamy bezpiecznego marginesu.
+# Limit Telegram API to 4096 znakow; uzywamy bezpiecznego marginesu.
 TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
 TELEGRAM_SAFE_LIMIT = 4000
 
 
 def split_telegram_messages(groups: list) -> list:
-    """Dzieli liste grup ofert na wiele wiadomosci Telegrama, z
-    gwarancja, ze:
-    - zadna wiadomosc nie przekracza TELEGRAM_SAFE_LIMIT znakow
-    - nie dzielimy wewnatrz tagu HTML / encji / wiersza z linkiem
-    - kazda oferta (numer + link) pojawia sie w dokladnie jednej wiadomosci
-    - priorytetem jest zachowanie pelnej nazwy produktu oraz wspolnych danych
-      grupy (sklep, cena, stan); tytul nie jest skracany tylko po to, aby
-      upchnac wszystkie linki w jednej wiadomosci. Jesli pelny naglowek wraz
-      ze wszystkimi egzemplarzami nie miesci sie w jednej wiadomosci, egzemplarze
-      sa dzielone na kilka wiadomosci z powtorzonym czytelnym naglowkiem.
-    - opis produktu moze byc skrocony, jesli jest dlugi, ale pelny tytul jest
-      zachowywany, o ile miesci sie z pojedyncza oferta. Tytul skracany jest
-      wylacznie w skrajnym przypadku, gdy nawet z pojedyncza oferta przekracza
-      limit (zachowujac mozliwie dlugi poczatek tytulu z '…').
-    - teksty tytulu lub opisu sa skracane wylacznie przed escapowaniem HTML,
-      tak aby nigdy nie uszkodzic tagu HTML ani encji
-    - kazdy numer oferty i pelny link do rezerwacji sa zawsze zachowywane;
-      jesli jakikolwiek wiersz z linkiem nie moze sie zmiescic nawet z minimalnym
-      naglowkiem, zglaszany jest jawny blad przed rozpoczeciem wysylania
-    - kazda zwrocona wiadomosc spelnia niezmiennik dlugosci <= TELEGRAM_SAFE_LIMIT
-
-    Zwraca liste gotowych stringow HTML (kazdy <= TELEGRAM_SAFE_LIMIT)."""
+    """Dzieli grupy ofert na gotowe wiadomosci HTML Telegrama. Gwarancje:
+    - zadna wiadomosc nie przekracza TELEGRAM_SAFE_LIMIT;
+    - kazda oferta (numer + pelny link) jest w dokladnie jednej wiadomosci,
+      podzial nigdy nie tnie tagu, encji ani wiersza oferty;
+    - pelny tytul ma priorytet: za duza grupa jest dzielona na kilka
+      wiadomosci z powtorzonym naglowkiem "(cd.)"; najpierw skracany jest
+      opis, tytul tylko w ostatecznosci, zawsze przed escapowaniem HTML;
+    - wiersz oferty, ktory nie zmiesci sie nawet z minimalnym naglowkiem,
+      powoduje ValueError, zanim cokolwiek zostanie wyslane."""
     if not groups:
         return []
 
     banner = "<b>IKEA Okazje - nowa oferta</b>"
     separator = "\n\n"
 
-    # Krok 1: Weryfikacja wstepna - czy kazda pojedyncza pozycja moze w ogole
-    # zmiescic sie w wiadomosci Telegrama z minimalnym naglowkiem grupy.
+    # Walidacja wstepna: kazda oferta musi sie zmiescic z minimalnym naglowkiem.
     for group in groups:
         shared = group["shared"]
         min_hdr = _minimal_group_header_telegram(shared)
@@ -1581,7 +1290,7 @@ def split_telegram_messages(groups: list) -> list:
         full_hdr = _format_group_header_telegram(shared)
         full_hdr_len = len(full_hdr)
 
-        # Proba 1: Czy cala grupa moze dolaczyc do biezacej wiadomosci (current_parts) z pelnym naglowkiem?
+        # Proba 1: cala grupa z pelnym naglowkiem doklejona do biezacej wiadomosci.
         avail_space_in_current = TELEGRAM_SAFE_LIMIT - current_len - len(separator)
         if items_overhead + full_hdr_len <= avail_space_in_current:
             if len(items) == 1:
@@ -1594,14 +1303,13 @@ def split_telegram_messages(groups: list) -> list:
                 current_len += len(separator) + len(full_group_block)
                 continue
 
-        # Proba 2: Grupa nie miesci sie w biezacej wiadomosci z pelnym naglowkiem.
-        # Jesli w current_parts sa juz wczesniejsze grupy, zamykamy biezaca wiadomosc.
+        # Proba 2: nie miesci sie - zamykamy biezaca wiadomosc (jesli niepusta).
         if len(current_parts) > 1:
             messages.append("\n\n".join(current_parts))
             current_parts = [banner]
             current_len = len(banner)
 
-        # Proba 3: Czy cala grupa zmiesci sie w nowej, pustej wiadomosci z pelnym naglowkiem?
+        # Proba 3: cala grupa z pelnym naglowkiem w nowej wiadomosci.
         avail_space_fresh = TELEGRAM_SAFE_LIMIT - len(banner) - len(separator)
         if items_overhead + full_hdr_len <= avail_space_fresh:
             if len(items) == 1:
@@ -1614,8 +1322,7 @@ def split_telegram_messages(groups: list) -> list:
                 current_len = len(banner) + len(separator) + len(full_group_block)
                 continue
 
-        # Proba 4: Grupa jest zbyt duza, aby zmiescic sie w jednej wiadomosci z pelnym naglowkiem -
-        # dzielimy jej pozycje na wiele wiadomosci.
+        # Proba 4: grupa za duza na jedna wiadomosc - dzielimy jej oferty.
         if len(current_parts) > 1:
             messages.append("\n\n".join(current_parts))
             current_parts = [banner]
@@ -1658,11 +1365,10 @@ def split_telegram_messages(groups: list) -> list:
         current_parts = [banner]
         current_len = len(banner)
 
-    # Zamknij ostatnia wiadomosc, jesli zawiera tresc
     if len(current_parts) > 1:
         messages.append("\n\n".join(current_parts))
 
-    # Krok koncowy: Niezmiennik dlugosci - kazda wygenerowana wiadomosc musi byc <= TELEGRAM_SAFE_LIMIT
+    # Niezmiennik dlugosci - ostatnia linia obrony przed wyslaniem.
     for idx, msg in enumerate(messages, 1):
         if len(msg) > TELEGRAM_SAFE_LIMIT:
             raise ValueError(
@@ -1696,11 +1402,8 @@ def telegram_send_message(text: str, chat_id=None) -> None:
 
 
 def send_telegram(new_offers) -> None:
-    """Wysyla powiadomienie o nowych ofertach przez Telegrama. Grupuje oferty,
-    dzieli na wiele wiadomosci i wysyla kazda z nich. Przed wyslaniem pierwszej
-    czesci przygotowuje i weryfikuje cala serie wiadomosci. Jesli ktorakolwiek
-    wiadomosc przekracza dopuszczalny limit lub nie moze zostac poprawnie
-    zbudowana, zglasza blad PRZED wyslaniem jakiejkolwiek wiadomosci."""
+    """Wysyla oferty Telegramem. Cala seria jest budowana i walidowana
+    (split_telegram_messages()) przed wyslaniem pierwszej wiadomosci."""
     groups = group_offers_for_notification(new_offers)
     messages = split_telegram_messages(groups)
     if not messages:
@@ -1719,12 +1422,8 @@ def send_telegram(new_offers) -> None:
 
 
 # ---------------- POWIADOMIENIA O UTRACIE/ODZYSKANIU DOSTEPU (403/429) ----------------
-# Minimalny, dodatkowy mechanizm stanu (patrz ikea_access_notification w
-# load_dynamic_state()) - odrebny od powiadomien o nowych ofertach, bo dotyczy
-# stanu DOSTEPU do API IKEA jako calosci (pelny cykl bez zadnych danych z
-# powodu HTTP 403/429), nie konkretnych ofert. Uzywa jednak tych samych,
-# aktualnie skonfigurowanych kanalow (e-mail/Telegram) - patrz
-# notify_access_status() nizej.
+# Alert o dostepie do API jako calosci (nie o ofertach). Stan w bloku
+# 'ikea_access_notification', kanaly te same co dla ofert.
 
 ACCESS_OUTAGE_EMAIL_SUBJECT = "IKEA Okazje: brak dostepu (HTTP 403/429)"
 ACCESS_OUTAGE_MESSAGE = (
@@ -1743,13 +1442,9 @@ ACCESS_RECOVERY_TELEGRAM_MESSAGE = "✅ " + ACCESS_RECOVERY_MESSAGE
 
 
 def notify_access_status(email_subject: str, email_body: str, telegram_text: str) -> list:
-    """Wysyla krotki komunikat o stanie dostepu (utrata/odzyskanie) przez
-    te same, aktualnie skonfigurowane i wlaczone kanaly
-    (EMAIL_ENABLED/TELEGRAM_ENABLED), zaden nowy kanal powiadomien.
-    Zwraca liste bledow dostawy (po jednym napisie na kanal), zeby
-    wolajacy (handle_access_notification_state()) mogl zastosowac
-    identyczna logike "czy to byla calkowita porazka dostawy" jak dla
-    powiadomien o nowych ofertach."""
+    """Wysyla komunikat o dostepie wszystkimi wlaczonymi kanalami. Zwraca
+    liste bledow (po jednym na kanal), zeby wolajacy rozpoznal calkowita
+    porazke dostawy."""
     errors = []
 
     if EMAIL_ENABLED:
@@ -1768,69 +1463,27 @@ def notify_access_status(email_subject: str, email_body: str, telegram_text: str
 
 
 def handle_access_notification_state(all_stores_blocked: bool, blocked_status_code) -> None:
-    """Aktualizuje stan powiadomien o dostepie (ikea_access_notification w
-    DYNAMIC_STATE, patrz get_access_notification_state()/
-    set_access_notification_state()) na podstawie wyniku JEDNEGO,
-    KWALIFIKUJACEGO SIE (pelny sukces albo pelna blokada 403/429 na
-    WSZYSTKICH skonfigurowanych sklepach) cyklu sprawdzenia ofert
-    (run_ikea_check_cycle()) - cykle czesciowe/mieszane NIE wywoluja tej
-    funkcji w ogole (patrz reset_pending_outage_after_partial_cycle()
-    nizej dla ich odrebnej obslugi).
+    """Aktualizuje stan alertu o dostepie po cyklu kwalifikujacym sie: pelna
+    blokada 403/429 wszystkich sklepow albo pelny sukces. Cykle czesciowe
+    obsluguje reset_pending_outage_after_partial_cycle().
 
-    Polityka "DWOCH KOLEJNYCH cykli" (przeciw halasowi z pojedynczej,
-    przejsciowej blokady 403/429 - patrz zadanie/README): pierwszy w
-    pelni zablokowany cykl NIE wysyla jeszcze alertu, tylko oznacza
-    "oczekujaca" (niepotwierdzona) utrate dostepu (pending_outage=True).
-    Alert idzie na zewnatrz wylacznie po DRUGIM, NASTEPNYM z rzedu, w
-    pelni zablokowanym cyklu - to znaczy po drugiej faktycznej kontroli
-    IKEA wykonanej wtedy, kiedy zezwoli na nia istniejacy harmonogram
-    (globalny backoff/next_allowed_check_at/Retry-After - patrz
-    BackoffState/run_daemon()), NIE po ustalonym, sztywnym czasie. Ta
-    funkcja nigdy sama nie planuje/wywoluje kolejnego zapytania do API -
-    tylko reaguje na wynik cyklu, ktory juz sie odbyl.
-
-    - all_stores_blocked=True (pelna blokada 403/429 na wszystkich
-      sklepach w tym cyklu):
-        - outage_active juz True -> alert byl juz wyslany, nic nie robi
-          (brak duplikatow).
-        - pending_outage jeszcze False -> to jest PIERWSZY kwalifikujacy
-          cykl z rzedu: zapisuje pending_outage=True (trwale, na dysk) i
-          wychodzi BEZ wysylania jakiegokolwiek powiadomienia.
-        - pending_outage juz True -> to jest DRUGI kwalifikujacy cykl z
-          rzedu (potwierdzenie): wysyla DOKLADNIE JEDNO powiadomienie
-          (notify_access_status()) i zapisuje outage_active=True,
-          pending_outage=False.
-    - all_stores_blocked=False (pelny sukces - wywolywane tylko gdy
-      full_cycle_fetched_successfully() bylo True dla tego cyklu):
-        - pending_outage byl True (pierwszy kwalifikujacy cykl NIE zostal
-          jeszcze potwierdzony drugim) -> pelny sukces PRZED alertem:
-          czysci pending_outage (i cala reszte stanu) do "pustego" stanu,
-          BEZ wysylania jakiegokolwiek powiadomienia (ani utraty, ani
-          odzyskania) - monitor po prostu wraca do normalnej pracy.
-        - outage_active byl False (i pending_outage rowniez False) -> nic
-          do zresetowania, nic nie robi.
-        - outage_active byl True (alert o utracie faktycznie wyslany
-          wczesniej) -> wysyla DOKLADNIE JEDNO powiadomienie o
-          odzyskaniu i resetuje caly stan.
-
-    Jesli sama dostawa powiadomienia (utraty ALBO odzyskania) calkowicie
-    zawiedzie (wszystkie aktywne kanaly zwrocily blad), stan NIE jest
-    oznaczany jako wyslany/zresetowany - kolejny KWALIFIKUJACY cykl z tym
-    samym wynikiem sprobuje wyslac powiadomienie ponownie, zamiast cicho
-    "zgubic" alert (pending_outage/outage_active zostaja takie, jakie
-    byly PRZED ta proba dostawy)."""
+    Alert o utracie wymaga DWOCH kolejnych w pelni zablokowanych cykli
+    (pierwszy tylko ustawia pending_outage), zeby pojedyncza przejsciowa
+    blokada nie dawala pary alertow. Odstep miedzy cyklami wynika z
+    istniejacego harmonogramu (backoff/Retry-After) - ta funkcja niczego
+    nie planuje. Pelny sukces: przy pending_outage czysci stan po cichu,
+    przy outage_active wysyla jeden alert o odzyskaniu. Gdy dostawa alertu
+    zawiedzie na wszystkich kanalach, stan sie nie zmienia i nastepny
+    kwalifikujacy cykl sprobuje ponownie."""
     state = get_access_notification_state()
     active_channels = (1 if EMAIL_ENABLED else 0) + (1 if TELEGRAM_ENABLED else 0)
 
     if all_stores_blocked:
         if state.get("outage_active"):
-            return  # alert juz wyslany - brak duplikatow, patrz opis wyzej
+            return  # alert juz wyslany
 
         if not state.get("pending_outage"):
-            # Pierwszy kwalifikujacy cykl z rzedu - oznacz jako oczekujacy
-            # (niepotwierdzony) i NIE wysylaj jeszcze zadnego alertu. Zapis
-            # jest trwaly (na dysk), wiec restart procesu/systemd PRZED
-            # drugim cyklem nie "zapomni" o tej pierwszej porazce.
+            # Pierwszy taki cykl: tylko trwale oznaczamy, bez alertu.
             set_access_notification_state(False, blocked_status_code, pending_outage=True)
             log(
                 "Pierwszy w pelni zablokowany cykl (HTTP 403/429 na wszystkich "
@@ -1841,19 +1494,14 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
             )
             return
 
-        # pending_outage byl juz True -> to jest DRUGI kwalifikujacy cykl z
-        # rzedu - potwierdzenie, wysylamy alert.
+        # Drugi kolejny taki cykl - potwierdzenie, wysylamy alert.
         errors = notify_access_status(
             ACCESS_OUTAGE_EMAIL_SUBJECT, ACCESS_OUTAGE_MESSAGE, ACCESS_OUTAGE_TELEGRAM_MESSAGE
         )
         for err in errors:
             log(f"Blad wysylki alertu o utracie dostepu ({err})", to_stderr=True)
         if errors and len(errors) == active_channels:
-            # Calkowita porazka dostawy (wszystkie aktywne kanaly) - nie
-            # oznaczaj alertu jako wyslany; pending_outage zostaje True,
-            # wiec kolejny kwalifikujacy cykl sprobuje ponownie (patrz
-            # docstring) - bez ponownego przechodzenia przez caly
-            # dwucyklowy proces potwierdzania od zera.
+            # pending_outage zostaje - nastepny cykl ponowi wysylke.
             return
 
         set_access_notification_state(True, blocked_status_code, pending_outage=False)
@@ -1863,12 +1511,7 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
         )
     else:
         if state.get("pending_outage"):
-            # Pelny sukces PRZED wyslaniem alertu (pierwszy kwalifikujacy
-            # cykl nie zostal potwierdzony drugim) - czysc oczekujacy stan
-            # calkowicie w cichosci, bez powiadomienia o utracie ANI o
-            # odzyskaniu (nie bylo jeszcze niczego, z czego "odzyskiwac" w
-            # rozumieniu uzytkownika). Monitor po prostu kontynuuje
-            # normalna prace.
+            # Sukces przed potwierdzeniem - alertu nie bylo, czyscimy po cichu.
             set_access_notification_state(False, None, pending_outage=False)
             log(
                 "Pelny sukces po oczekujacej (niepotwierdzonej) utracie "
@@ -1878,7 +1521,7 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
             return
 
         if not state.get("outage_active"):
-            return  # dostep nie byl uznany za utracony - nic do resetowania
+            return  # nie bylo utraty dostepu
 
         errors = notify_access_status(
             ACCESS_RECOVERY_EMAIL_SUBJECT, ACCESS_RECOVERY_MESSAGE, ACCESS_RECOVERY_TELEGRAM_MESSAGE
@@ -1893,36 +1536,12 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
 
 
 def reset_pending_outage_after_partial_cycle() -> None:
-    """Cykl CZESCIOWY/MIESZANY (ani pelna blokada 403/429 na wszystkich
-    sklepach - patrz all_stores_blocked_by_403_429(), ani pelny sukces -
-    patrz full_cycle_fetched_successfully()) - np. jeden sklep OK i jeden
-    na 403, albo 403 na jednym sklepie i timeout/5xx/blad parsowania na
-    drugim. Taki cykl NIE jest druga kwalifikujaca sie porazka z rzedu w
-    rozumieniu zadania (wymog: "kazdy sklep musi zawiesc WYLACZNIE z
-    powodu HTTP 403/429").
-
-    Przyjeta, bezpieczna polityka (patrz zadanie, wymog 5): jesli byla
-    aktywna OCZEKUJACA (niepotwierdzona) sekwencja (pending_outage=True),
-    ten cykl ZERUJE ja - kolejna, PRZYSZLA pelna blokada 403/429 zaczyna
-    nowa, dwucyklowa sekwencje potwierdzania od nowa, zamiast "doliczyc"
-    sie do przerwanej sekwencji. Razem z pending_outage czyscimy tez
-    last_status_code TEGO bloku (ikea_access_notification) do None - byl
-    on zapamietany wylacznie na potrzeby jeszcze niepotwierdzonej
-    sekwencji (patrz handle_access_notification_state()), wiec po jej
-    zerowaniu nie ma juz zadnego znaczenia i nie powinien zostawac w
-    trwalym stanie jako "widmowy" kod 403/429. UWAGA: to jest WYLACZNIE
-    last_status_code bloku 'ikea_access_notification' - NIE dotyka to w
-    ogole odrebnego last_status_code w BackoffState/'blocking_backoff'
-    (patrz get_blocking_backoff_state()/update_blocking_backoff_state()),
-    ktory opisuje ostatni kod blokady dla GLOBALNEGO backoffu i jest
-    aktualizowany wylacznie przez update_blocking_backoff_state() -
-    ta funkcja go w zaden sposob nie modyfikuje. Nie dotyka juz WYSLANEGO
-    alertu (outage_active) - jesli byl aktywny, zostaje aktywny do
-    pierwszego PELNEGO sukcesu (patrz full_cycle_fetched_successfully()),
-    zgodnie z istniejacym wymogiem, ze odzyskanie wymaga pelnego sukcesu
-    (a wtedy jego last_status_code jest i tak zerowany osobno, w
-    handle_access_notification_state()). Cykl bez oczekujacej sekwencji
-    nie robi nic (nie ma czego zerowac, brak zapisu na dysk)."""
+    """Cykl czesciowy/mieszany (np. jeden sklep OK, drugi 403; albo 403 i
+    5xx) nie jest ani kwalifikujaca sie porazka, ani pelnym sukcesem.
+    Zeruje tylko niepotwierdzona sekwencje (pending_outage i jej
+    last_status_code) - kolejna pelna blokada zaczyna potwierdzanie od
+    nowa. Wyslany alert (outage_active) zostaje do pelnego sukcesu; blok
+    'blocking_backoff' nie jest tu ruszany."""
     state = get_access_notification_state()
     if not state.get("pending_outage"):
         return
@@ -2170,30 +1789,14 @@ def handle_telegram_updates() -> None:
 
 
 # ---------------- JITTER I WYKLADNICZY BACKOFF (tylko tryb daemon) ----------------
-# Stan globalnego backoffu (patrz BackoffState powyzej) zyje TRWALE w
-# DYNAMIC_STATE (klucz "blocking_backoff", patrz get_blocking_backoff_state()/
-# set_blocking_backoff_state()), nie w osobnych globalach modulu - dzieki
-# temu restart procesu/uslugi systemd w trakcie aktywnej blokady 403/429
-# nie zeruje juz wyliczonego harmonogramu next_allowed_check_at. Aktualizowany
-# przez update_blocking_backoff_state() (wywolywane z run_ikea_check_cycle()
-# niezaleznie od RUN_MODE), ale faktyczny backoff (dluzsze oczekiwanie przed
-# kolejna proba) stosuje WYLACZNIE run_daemon() - w trybie cron stan jest
-# wiec aktualizowany i zapisywany, ale nie ma zadnego wplywu na
-# zachowanie/kod wyjscia tego jednego przebiegu (patrz main()).
+# Stan backoffu jest aktualizowany w kazdym cyklu (takze w cron), ale
+# czekanie wedlug niego stosuje tylko run_daemon().
 
 
 def apply_jitter_percent(value: float, percent: float) -> float:
-    """Stosuje losowy jitter +/-percent% do danej wartosci (np. sekund
-    oczekiwania) - wynik jest losowany rownomiernie w przedziale
-    [value*(1-percent/100), value*(1+percent/100)] i nigdy nie jest
-    ujemny. percent <= 0 wylacza jitter (zwraca value bez zmian).
-
-    UWAGA: to jest jitter SYMETRYCZNY (moze zarowno wydluzyc, jak i
-    SKROCIC wartosc) - uzywany WYLACZNIE dla normalnego, nieblokowanego
-    interwalu sprawdzania ofert (patrz compute_jittered_interval()). Dla
-    backoffu po 403/429 uzywany jest apply_backoff_jitter() nizej, ktory
-    jitteruje TYLKO w gore, zeby nigdy nie skrocic backoffu ponizej
-    wyliczonego minimum."""
+    """Symetryczny jitter +/-percent%, wynik nigdy ujemny; percent <= 0
+    wylacza. Tylko dla normalnego interwalu - backoff uzywa
+    apply_backoff_jitter(), ktory nie skraca."""
     if percent <= 0:
         return value
     jitter_fraction = random.uniform(-percent, percent) / 100.0
@@ -2201,45 +1804,24 @@ def apply_jitter_percent(value: float, percent: float) -> float:
 
 
 def compute_jittered_interval() -> float:
-    """Bazowy interwal sprawdzania ofert (CHECK_INTERVAL_SECONDS) +/- jitter
-    (CHECK_INTERVAL_JITTER_PERCENT) - patrz komentarze przy tych stalych.
-    Wywolywane WYLACZNIE z run_daemon(), przy kazdym planowaniu kolejnego
-    sprawdzenia ofert (bez aktywnego backoffu) - celem jest rozbicie
-    sztywnego, metronomicznego rytmu przy rzadkim, prywatnym monitoringu.
-    Ten jitter MOZE losowo skrocic wartosc bazowa (do -25% domyslnie), ale
-    nie ma to znaczenia dla polityki backoffu nizej - te dwa jittery sa
-    niezalezne i nie sa ze soba mieszane w jednym wyliczeniu."""
+    """CHECK_INTERVAL_SECONDS z symetrycznym jitterem (gdy brak backoffu)."""
     return apply_jitter_percent(CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_JITTER_PERCENT)
 
 
 def effective_backoff_base_seconds() -> float:
-    """Pierwszy krok backoffu NIE MOZE byc krotszy od normalnego,
-    skonfigurowanego interwalu sprawdzania ofert (CHECK_INTERVAL_SECONDS) -
-    inaczej 403/429 paradoksalnie ZWIEKSZALOBY czestotliwosc zapytan tuz po
-    tym, jak serwer odmowil dostepu. Zwraca WIEKSZA z CHECK_INTERVAL_SECONDS
-    i BACKOFF_BASE_SECONDS (BACKOFF_BASE_SECONDS jest wiec tylko DOLNYM
-    limitem na wypadek nietypowo malego CHECK_INTERVAL_SECONDS w .env)."""
+    """Pierwszy krok backoffu, nigdy krotszy niz CHECK_INTERVAL_SECONDS -
+    inaczej 403/429 zwiekszaloby czestotliwosc zapytan."""
     return max(CHECK_INTERVAL_SECONDS, BACKOFF_BASE_SECONDS)
 
 
 def effective_backoff_cap_seconds() -> float:
-    """Cap backoffu musi byc >= efektywnej bazy (effective_backoff_base_seconds())
-    - inaczej dla duzego CHECK_INTERVAL_SECONDS w .env cap (BACKOFF_CAP_SECONDS)
-    moglby wypasc NIZEJ niz sam pierwszy krok backoffu, co przeczyloby idei
-    "backoff nie przyspiesza ruchu"."""
+    """Cap backoffu, nigdy nizszy niz pierwszy krok (przy duzym interwale)."""
     return max(effective_backoff_base_seconds(), BACKOFF_CAP_SECONDS)
 
 
 def apply_backoff_jitter(value: float, percent: float = BACKOFF_JITTER_PERCENT) -> float:
-    """Jitter backoffu - w odroznieniu od apply_jitter_percent() (symetryczny,
-    uzywany dla normalnego interwalu), ten jitter losuje WYLACZNIE w gore:
-    wynik jest w przedziale [value, value*(1+percent/100)]. Backoff po
-    403/429 (a tym bardziej scalony z Retry-After, patrz
-    compute_next_allowed_check_delay()) nigdy nie powinien zejsc PONIZEJ
-    wyliczonego minimum - jitter moze go tylko dodatkowo wydluzyc, nigdy
-    skrocic (wymog zadania: "jitter nie moze skrocic finalnego okresu
-    ponizej minimalnego okresu wynikajacego z polityki backoffu i
-    Retry-After")."""
+    """Jitter tylko w gore: wynik w [value, value*(1+percent/100)], wiec nie
+    skraca wyliczonego minimum (backoff/Retry-After)."""
     if percent <= 0:
         return value
     extra_fraction = random.uniform(0, percent) / 100.0
@@ -2247,17 +1829,8 @@ def apply_backoff_jitter(value: float, percent: float = BACKOFF_JITTER_PERCENT) 
 
 
 def compute_local_backoff_delay(failure_count: int) -> float:
-    """Wykladniczy, lokalnie wyliczony backoff (BEZ uwzglednienia
-    Retry-After - patrz compute_next_allowed_check_delay() dla finalnej
-    wartosci) po `failure_count` kolejnych cyklach zakonczonych HTTP
-    403/429 z rzedu:
-
-        base = effective_backoff_base_seconds()  # >= CHECK_INTERVAL_SECONDS
-        delay = min(base * 2^(failure_count-1), effective_backoff_cap_seconds())
-
-    failure_count <= 0 oznacza brak aktywnego backoffu - zwraca 0.0. Jitter
-    (apply_backoff_jitter(), tylko w gore) jest stosowany PO tym
-    wyliczeniu, patrz wywolanie w compute_next_allowed_check_delay()."""
+    """min(baza * 2^(failure_count-1), cap), bez Retry-After i jittera;
+    failure_count <= 0 -> 0.0."""
     if failure_count <= 0:
         return 0.0
     base = effective_backoff_base_seconds()
@@ -2267,15 +1840,9 @@ def compute_local_backoff_delay(failure_count: int) -> float:
 
 
 def compute_next_allowed_check_delay(failure_count: int, retry_after_seconds=None) -> float:
-    """Finalny czas oczekiwania przed kolejna proba po `failure_count`
-    kolejnych blokadach 403/429 z rzedu - WIEKSZA z:
-      (a) lokalnie wyliczonego, wykladniczego backoffu (patrz
-          compute_local_backoff_delay(), juz >= CHECK_INTERVAL_SECONDS), i
-      (b) `retry_after_seconds` podanego przez serwer (naglowek Retry-After,
-          patrz parse_retry_after_header()), jesli nie None.
-    Jitter (apply_backoff_jitter(), tylko w gore) jest stosowany NA KONIEC,
-    na juz wybranej, dluzszej z tych dwoch wartosci - wiec finalny wynik
-    nigdy nie jest krotszy niz max(lokalny backoff, Retry-After)."""
+    """Opoznienie po failure_count kolejnych blokadach: max(lokalny backoff,
+    Retry-After), na koniec jitter w gore - wiec nigdy krocej niz ktorakolwiek
+    z tych wartosci."""
     local_delay = compute_local_backoff_delay(failure_count)
     if retry_after_seconds is not None and retry_after_seconds > local_delay:
         base_delay = retry_after_seconds
@@ -2287,14 +1854,9 @@ def compute_next_allowed_check_delay(failure_count: int, retry_after_seconds=Non
 
 
 def all_stores_blocked_by_403_429(store_errors: dict) -> bool:
-    """Definicja 'utraty dostepu' z zadania: caly cykl (przynajmniej jeden
-    sklep w STORE_IDS) nie pobral danych z ZADNEGO sklepu, WYLACZNIE z
-    powodu HTTP 403/429 (BlockedByServerError - patrz BLOCKING_STATUS_CODES).
-    Zwraca False, jesli STORE_IDS jest puste, jesli chocby jeden sklep sie
-    powiodl, albo jesli chocby jeden z bledow to nie BlockedByServerError
-    (np. zwykly blad pojedynczego sklepu, timeout, HTTP 5xx, blad
-    parsowania) - te przypadki NIE sa 'utrata dostepu' w rozumieniu
-    handle_access_notification_state()."""
+    """Utrata dostepu: STORE_IDS niepuste i kazdy sklep zawiodl wylacznie
+    przez 403/429. Inny blad (5xx, timeout, parsowanie) lub chocby jeden
+    sukces -> False."""
     if not STORE_IDS or not store_errors:
         return False
     if len(store_errors) < len(STORE_IDS):
@@ -2303,32 +1865,14 @@ def all_stores_blocked_by_403_429(store_errors: dict) -> bool:
 
 
 def full_cycle_fetched_successfully(store_errors: dict) -> bool:
-    """Zwierciadlana definicja 'odzyskania dostepu' z zadania: PELNY cykl
-    pobral dane poprawnie ze WSZYSTKICH skonfigurowanych sklepow (zero
-    bledow jakiegokolwiek typu) - patrz handle_access_notification_state().
-    Cykl z jakimkolwiek bledem sklepu (nawet nie-blokujacym, np. 5xx albo
-    timeout jednego sklepu) NIE jest tu traktowany jako 'odzyskanie dostepu'
-    - nie zeruje aktywnego stanu alertu, ale rowniez nie generuje nowego
-    alertu o utracie dostepu (patrz all_stores_blocked_by_403_429() -
-    wymaga, zeby WSZYSTKIE bledy byly 403/429)."""
+    """Odzyskanie dostepu wymaga pelnego sukcesu: zadnego bledu sklepu."""
     return not store_errors
 
 
 def update_blocking_backoff_state(store_errors: dict) -> BackoffState:
-    """Aktualizuje i TRWALE ZAPISUJE (na dysk, patrz set_blocking_backoff_state())
-    globalny stan backoffu (BackoffState, klucz "blocking_backoff" w
-    DYNAMIC_STATE) na podstawie bledow zebranych w jednym cyklu (patrz
-    fetch_all_offers()) - store_errors mapuje storeId na oryginalny
-    wyjatek (nie tekst), zeby dalo sie rozpoznac BlockedByServerError
-    (HTTP 403/429), jego status_code i opcjonalny retry_after_seconds
-    (patrz parse_retry_after_header()).
-
-    Cykl bez zadnego bledu blokujacego resetuje stan do "brak backoffu",
-    NAWET jesli inne (nieblokujace) bledy sklepow wystapily - to jest
-    "pierwsze udane pobranie" w rozumieniu zadania: brak sygnalu
-    blokady/rate limitu w tym cyklu. Zwraca zapisany BackoffState (przydatne
-    dla wywolujacego/testow, zeby nie trzeba bylo od razu wczytywac go
-    ponownie z DYNAMIC_STATE)."""
+    """Aktualizuje i zapisuje globalny backoff na podstawie bledow cyklu.
+    Blokada 403/429 zwieksza failure_count; cykl bez blokady (nawet z innymi
+    bledami) resetuje stan. Zwraca zapisany BackoffState."""
     state = get_blocking_backoff_state()
 
     blocked_errors = [
@@ -2337,10 +1881,7 @@ def update_blocking_backoff_state(store_errors: dict) -> BackoffState:
 
     if blocked_errors:
         blocked_codes = sorted({exc.status_code for exc in blocked_errors})
-        # Retry-After: uzywamy NAJWIEKSZEJ poprawnej wartosci zwroconej w
-        # tym cyklu (kilka sklepow moze dostac 403/429 z roznymi/zadnymi
-        # Retry-After w tym samym przebiegu) - konserwatywnie, zeby nie
-        # zaniedbac dluzszego z podanych terminow.
+        # Najdluzszy Retry-After z cyklu (sklepy moga dostac rozne).
         retry_after_candidates = [
             exc.retry_after_seconds for exc in blocked_errors
             if exc.retry_after_seconds is not None
@@ -2380,9 +1921,7 @@ def update_blocking_backoff_state(store_errors: dict) -> BackoffState:
 
 
 def _enabled_channels() -> list:
-    """Zwraca posortowana liste nazw aktualnie wlaczonych kanalow
-    powiadomien ('email', 'telegram'). Kolejnosc jest deterministyczna -
-    uzywana do porownywania zbiorow dostarczonych kanalow z pending.\""""
+    """Wlaczone kanaly ('email', 'telegram') w stalej kolejnosci."""
     channels = []
     if EMAIL_ENABLED:
         channels.append("email")
@@ -2392,18 +1931,14 @@ def _enabled_channels() -> list:
 
 
 def run_ikea_check_cycle() -> int:
-    """Jeden cykl sprawdzenia ofert z dostawą per kanał.
+    """Jeden cykl: pobranie ofert, backoff i alert o dostepie, dostawa per
+    kanal. 'pending' w STATE_FILE pamieta, ktore kanaly juz dostarczyly
+    oferte, wiec ponowienie idzie tylko do brakujacych; do 'seen' oferta
+    trafia po dostarczeniu wszystkimi aktywnymi kanalami.
 
-    Klucz 'pending' w pliku stanu (STATE_FILE) przechowuje slownik
-    {uuid: [kanaly, ktore juz dostarczyly]} - umozliwia ponowienie
-    wylacznie do kanalow, ktore jeszcze nie otrzymaly danej oferty.
-
-    Semantyka kodu wyjscia:
-      0 - sukces lub brak nowych ofert
-      1 - blad pobierania wszystkich sklepow
-      2 - przynajmniej jeden kanal zawiodl (ale postep sprawnych zapisany)
-      3 - blad zapisu pliku stanu po sukcesie dostawy
-    """
+    Kod wyjscia: 0 - sukces/brak nowych ofert; 1 - zaden sklep nie pobrany
+    albo blad odczytu stanu; 2 - ktorys kanal zawiodl (postep zapisany);
+    3 - blad zapisu pliku stanu."""
     if not SEARCH_TERMS and not SEARCH_ARTICLE_NUMBERS:
         log(
             "Brak aktywnych slow kluczowych i numerow artykulow - "
@@ -2411,10 +1946,7 @@ def run_ikea_check_cycle() -> int:
         )
         return 0
 
-    # Jeden spojny profil klienta (impersonate + user-agent/sec-ch-ua) na
-    # caly ten cykl - wszystkie zapytania do API IKEA w tym przebiegu
-    # (wszystkie strony, wszystkie sklepy) uzyja tego samego profilu, patrz
-    # get_active_client_profile()/CLIENT_PROFILES.
+    # Jeden profil klienta na caly cykl (wszystkie strony i sklepy).
     global CURRENT_CLIENT_PROFILE
     CURRENT_CLIENT_PROFILE = choose_client_profile()
 
@@ -2424,34 +1956,12 @@ def run_ikea_check_cycle() -> int:
         log(f"Blad zapytania do API: {exc}", to_stderr=True)
         return 1
 
-    # Aktualizuje i trwale zapisuje globalny stan backoffu (BackoffState) -
-    # reset przy braku bledow blokujacych 403/429 w tym cyklu (w tym przy
-    # PELNYM sukcesie, store_errors == {}), narastanie przy kolejnej
-    # blokadzie - patrz update_blocking_backoff_state().
     update_blocking_backoff_state(store_errors)
 
-    # Alert o utracie/odzyskaniu dostepu (HTTP 403/429 na CALYM cyklu) -
-    # patrz all_stores_blocked_by_403_429()/full_cycle_fetched_successfully()/
-    # handle_access_notification_state(). Niezalezne od globalnego stanu
-    # backoffu powyzej (ktory dotyczy WYLACZNIE trybu daemon) - ten alert
-    # dziala tak samo w trybie cron i daemon, bo
-    # stan jest trwale zapisywany w DYNAMIC_STATE_FILE. Cykl z bledem
-    # niebedacym utrata dostepu ANI pelnym sukcesem (np. 1 sklep na 5xx,
-    # pozostale OK) celowo NIE wywoluje handle_access_notification_state() w
-    # zadna strone - to nie jest ani nowa utrata dostepu (patrz
-    # all_stores_blocked_by_403_429()), ani "pelny cykl pobrany poprawnie"
-    # wymagany do zresetowania alertu (patrz zadanie: wymog 9).
+    # Alert o dostepie dziala w cron i daemon (stan jest trwaly).
     if not STORE_IDS:
-        # Brak skonfigurowanych sklepow (np. po /usunsklep na ostatnim
-        # aktywnym sklepie, patrz format_stores_message()) - fetch_all_offers()
-        # nie odpytuje wtedy zadnego API (petla po pustym STORE_IDS), a
-        # store_errors jest wiec zawsze pustym slownikiem. To NIE jest
-        # pelny sukces w rozumieniu zadania (wymog 6: taki przebieg nie
-        # moze liczyc sie jako potwierdzenie odzyskania dostepu ani jako
-        # kwalifikujaca sie porazka) - pomijamy caly dispatch, zamiast
-        # przypadkowo zresetowac/potwierdzic pending_outage albo
-        # outage_active na podstawie przebiegu, ktory w ogole nie
-        # sprawdzil IKEA.
+        # Nic nie sprawdzono - taki przebieg nie moze ani potwierdzic, ani
+        # wyczyscic stanu alertu.
         pass
     elif all_stores_blocked_by_403_429(store_errors):
         blocked_status_code = sorted({
@@ -2462,12 +1972,6 @@ def run_ikea_check_cycle() -> int:
     elif full_cycle_fetched_successfully(store_errors):
         handle_access_notification_state(False, None)
     else:
-        # Cykl czesciowy/mieszany (patrz
-        # reset_pending_outage_after_partial_cycle()) - nie jest ani nowa
-        # kwalifikujaca sie porazka, ani "pelny cykl pobrany poprawnie"
-        # wymagany do zresetowania/potwierdzenia alertu (patrz zadanie:
-        # wymog 5/9). Zeruje jedynie OCZEKUJACA (niepotwierdzona)
-        # sekwencje, jesli byla aktywna - nie dotyka juz wyslanego alertu.
         reset_pending_outage_after_partial_cycle()
 
     if store_errors and len(store_errors) >= len(STORE_IDS):
@@ -2510,27 +2014,19 @@ def run_ikea_check_cycle() -> int:
         )
         return 0
 
-    # Krok 1: Usun z pending UUID-y, ktorych nie ma juz w aktualnych wynikach API
-    # (wymog 5: znikniecie oferty z API oczyszcza pending - oferta nie zostanie
-    # doreczona nigdy, wiec nie blokuje pending na zawsze).
-    #
-    # WAZNE: pruning jest bezpieczny TYLKO gdy mamy kompletne dane ze WSZYSTKICH
-    # monitorowanych sklepow (store_errors pusty). Przy czesciowym pobieraniu
-    # (chocby jeden sklep zawiodl) UUID z niedostepnego sklepu nie bedzie w
-    # current_uuids - jego usuniecie z pending byloby bledne (oferta mogla
-    # dalej istniec w API sklepu, ktory tym razem nie odpowiedzial). Przy
-    # czesciowym cyklu pomijamy wiec pruning w calosci.
+    # Oferty znikniete z API wypadaja z pending - tylko przy komplecie
+    # danych ze wszystkich sklepow; przy czesciowym cyklu oferta
+    # niedostepnego sklepu moze nadal istniec.
     if not store_errors:
         pending = {uuid: ch for uuid, ch in pending.items() if uuid in current_uuids}
 
-    # Aktualnie wlaczone kanaly - tylko one licza sie przy decyzji o promocji
-    # do seen (wymog 7: zmiana konfiguracji kanalow nie zostawia ofert w pending).
+    # Licza sie tylko aktualnie wlaczone kanaly, wiec wylaczenie kanalu nie
+    # zostawia ofert w pending na zawsze.
     active_channels = _enabled_channels()
     active_channels_set = set(active_channels)
 
 
-    # Krok 2: Wyznacz oferty, ktore PRZYNAJMNIEJ JEDEN aktywny kanal jeszcze
-    # nie dostarczyl (nie sa w seen i nie sa w pelni dostarczone przez pending).
+    # Oferty, ktorych co najmniej jeden aktywny kanal jeszcze nie dostarczyl.
     new_offers = []
     for o in matching_offers:
         uuid = o.get("offer_uuid")
@@ -2539,17 +2035,14 @@ def run_ikea_check_cycle() -> int:
         if uuid in seen_uuids:
             continue
         delivered_so_far = set(pending.get(uuid, []))
-        # Uwzgledniamy tylko aktywne kanaly - wyłaczone sa ignorowane (wymog 7)
         remaining = active_channels_set - delivered_so_far
         if remaining:
             new_offers.append(o)
 
     any_channel_failed = False
     if new_offers:
-        # Dostawa per kanal: wysylamy do kazdego aktywnego kanalu tylko oferty,
-        # ktorych ten kanal jeszcze nie dostarczyl.
+        # Kazdy kanal dostaje tylko oferty, ktorych jeszcze nie dostarczyl.
         for channel in active_channels:
-            # Oferty, ktore ten kanal jeszcze nie odebral
             channel_offers = [
                 o for o in new_offers
                 if channel not in set(pending.get(o["offer_uuid"], []))
@@ -2569,20 +2062,19 @@ def run_ikea_check_cycle() -> int:
                 any_channel_failed = True
 
             if channel_error is None:
-                # Kanal dostarczyl - zapisz postep w pending
                 for o in channel_offers:
                     uuid = o["offer_uuid"]
                     already = pending.get(uuid, [])
                     if channel not in already:
                         pending[uuid] = sorted(set(already) | {channel})
 
-    # Krok 3: Promote UUID-y, dla ktorych WSZYSTKIE aktywne kanaly dostarczyly
-    # (nawet jesli new_offers bylo puste, bo np. wylaczono kanal, ktory wczesniej zawodzil)
+    # Promocja do seen, gdy dostarczyly wszystkie aktywne kanaly - takze bez
+    # nowych ofert (np. po wylaczeniu kanalu, ktory zawodzil).
     if active_channels_set:
         newly_seen = set()
         for uuid, delivered_channels in list(pending.items()):
-            # Wymog 3: Nie promujemy w ciemno UUID z pending nalezacego do sklepu, ktory
-            # wlasnie padl (czesciowy cykl) - czekamy na jego pelny powrot, aby byc pewnym.
+            # Przy czesciowym cyklu nie promujemy ofert niewidocznych w tym
+            # cyklu - ich sklep mogl wlasnie nie odpowiedziec.
             if store_errors and uuid not in current_uuids:
                 continue
 
@@ -2599,8 +2091,7 @@ def run_ikea_check_cycle() -> int:
         return 3
 
     if any_channel_failed:
-        # Zwracamy kod 2, ale postep sprawnych kanalow jest juz utrwalony
-        return 2
+        return 2  # postep sprawnych kanalow jest juz zapisany
 
     if new_offers:
         log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
@@ -2611,44 +2102,22 @@ def run_ikea_check_cycle() -> int:
 
 
 def request_shutdown(signum=None, frame=None) -> None:
-    """Handler sygnalu (SIGTERM/SIGINT) - ustawia SHUTDOWN_EVENT. Petla w
-    run_daemon() sprawdza ten event i konczy sie po zakonczeniu aktualnego
-    przebiegu, bez uruchamiania kolejnego cyklu Telegrama/IKEA. Parametry
-    signum/frame sa akceptowane, bo tak wyglada standardowy sygnatura
-    handlera signal.signal(), ale nie sa uzywane."""
+    """Handler SIGTERM/SIGINT: ustawia SHUTDOWN_EVENT, petla daemona konczy
+    sie po biezacym przebiegu."""
     SHUTDOWN_EVENT.set()
 
 
 def install_shutdown_signal_handlers() -> None:
-    """Instaluje handlery SIGTERM (systemd stop/restart) i SIGINT (Ctrl+C
-    przy pracy w terminalu) na SHUTDOWN_EVENT. Wywolywane wylacznie z
-    run_daemon() - NIE przy imporcie modulu i NIE w trybie cron, ktory
-    konczy sie po jednym przebiegu i nie potrzebuje takiego handlera."""
+    """Instaluje handlery SIGTERM/SIGINT - tylko z run_daemon(), nigdy przy imporcie."""
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
 
 
 def seconds_until_next_allowed_check(state: BackoffState, now_wall_clock=None) -> "float | None":
-    """Przelicza TRWALY, zapisany na dysk next_allowed_check_at (czas
-    scienny, epoch - patrz BackoffState) na liczbe sekund pozostalych OD
-    TERAZ do tej chwili - do jednorazowego uzycia przy starcie
-    run_daemon(), zeby zaplanowac czas do pierwszego sprawdzenia po
-    (ewentualnym) restarcie procesu w trakcie aktywnego backoffu.
-
-    Zwraca None, jesli brak aktywnego backoffu (next_allowed_check_at is
-    None) - wywolujacy powinien w tym przypadku zaplanowac normalny,
-    jittered interwal. Zwraca 0.0 (kontrola od razu), jesli zapisany
-    termin jest juz w przeszlosci - to jest zamierzone: jesli od
-    next_allowed_check_at minelo juz dużo czasu (np. usluga byla
-    zatrzymana dluzej niz trwal backoff), daemon nie ma sensu czekac
-    dodatkowo, tylko sprawdza od razu.
-
-    UWAGA: to jest JEDYNE miejsce w runtime, gdzie liczy sie roznica
-    dwoch odczytow time.time() - wylacznie do jednorazowego przeliczenia
-    trwałego stanu na zegar monotoniczny przy starcie/aktualizacji stanu.
-    Samo odliczanie interwalu W PETLI daemona (petla `while` nizej) uzywa
-    WYLACZNIE time.monotonic(), zeby skoki zegara systemowego/NTP nie
-    zmienialy dlugosci juz zaplanowanego oczekiwania."""
+    """Sekundy od teraz do zapisanego next_allowed_check_at (czas scienny).
+    None - brak aktywnego backoffu; 0.0 - termin juz minal (np. dlugi
+    postoj uslugi), sprawdzamy od razu. Jedyne miejsce liczace roznice
+    time.time(); petla daemona odlicza dalej zegarem monotonicznym."""
     if state.next_allowed_check_at is None:
         return None
     now_wall_clock = time.time() if now_wall_clock is None else now_wall_clock
@@ -2657,23 +2126,11 @@ def seconds_until_next_allowed_check(state: BackoffState, now_wall_clock=None) -
 
 
 def run_daemon() -> int:
-    """Petla na potrzeby usterk systemd - Telegram sprawdzany czesto,
-    oferty IKEA rzadziej. Reaguje na SIGTERM (systemd stop/restart) i
-    SIGINT (Ctrl+C) - po otrzymaniu jednego z nich petla nie planuje
-    kolejnego sprawdzenia Telegrama/IKEA, loguje jedno, jasne
-    podsumowanie i wraca ze statusem 0 (graceful shutdown), bez
-    modyfikowania plikow stanu poza tym, co juz zrobil ostatni
-    zakonczony cykl.
-
-    Odliczanie interwalu miedzy sprawdzeniami ofert korzysta WYLACZNIE z
-    time.monotonic() (patrz next_ikea_check_monotonic nizej) - nie
-    time.time() - zeby ewentualny skok zegara systemowego (np. korekta
-    NTP) w trakcie dzialania procesu nie przyspieszyl ani nie opoznil
-    kolejnej kontroli. Jedynym miejscem, gdzie w ogole liczy sie roznica
-    dwoch odczytow time.time(), jest JEDNORAZOWE przeliczenie TRWALEGO
-    next_allowed_check_at (zapisanego jako czas scienny, bo
-    time.monotonic() nie przetrwa restartu procesu) na sekundy startowe
-    przy starcie tej funkcji - patrz seconds_until_next_allowed_check()."""
+    """Petla trybu daemon: Telegram czesto, oferty IKEA rzadziej. Interwaly
+    sa odliczane time.monotonic(), zeby skoki zegara (NTP) ich nie
+    zmienialy; trwaly termin backoffu (czas scienny) jest przeliczany na
+    sekundy przy starcie i po kazdym cyklu. Po SIGTERM/SIGINT konczy sie
+    bez nowego cyklu i zwraca 0."""
     install_shutdown_signal_handlers()
     log(
         f"Start w trybie daemon (IKEA co ~{CHECK_INTERVAL_SECONDS}s "
@@ -2681,13 +2138,7 @@ def run_daemon() -> int:
         f"{TELEGRAM_POLL_INTERVAL_SECONDS}s)."
     )
 
-    # Po (ewentualnym) restarcie procesu/uslugi systemd respektujemy
-    # zapisany, trwaly termin nastepnej dozwolonej proby (next_allowed_check_at)
-    # - jesli backoff byl aktywny w chwili zatrzymania procesu, restart NIE
-    # zeruje tego harmonogramu (wymog zadania: "restart procesu lub uslugi
-    # systemd nie moze resetowac aktywnego backoffu"). Jesli zapisany
-    # termin jest juz w przeszlosci (minelo duzo czasu), kontrola wykonuje
-    # sie od razu (delay=0.0) - patrz seconds_until_next_allowed_check().
+    # Restart nie resetuje aktywnego backoffu - respektujemy zapisany termin.
     persisted_state = get_blocking_backoff_state()
     persisted_delay = seconds_until_next_allowed_check(persisted_state)
     if persisted_delay is not None:
@@ -2701,12 +2152,7 @@ def run_daemon() -> int:
     else:
         next_check_interval = compute_jittered_interval()
 
-    # last_ikea_check_monotonic=None oznacza "jeszcze nie sprawdzalismy w
-    # tym procesie" - PIERWSZE sprawdzenie w petli nizej odbywa sie zawsze
-    # po uplywie next_check_interval od startu tej funkcji (z jitterem albo,
-    # jesli byl aktywny trwaly backoff, po persisted_delay), NIE natychmiast -
-    # to jest istniejace, zamierzone zachowanie (pierwsze sprawdzenie w
-    # trybie daemon nie jest natychmiastowe), zachowane tutaj.
+    # Pierwsze sprawdzenie ofert dopiero po next_check_interval, nie od razu.
     last_ikea_check_monotonic = time.monotonic()
 
     while not SHUTDOWN_EVENT.is_set():
@@ -2721,20 +2167,12 @@ def run_daemon() -> int:
 
         if time.monotonic() - last_ikea_check_monotonic >= next_check_interval:
             run_ikea_check_cycle()
-            # Znacznik czasu ostatniego sprawdzenia jest ustawiany PO
-            # zakonczeniu cyklu (nie przed nim) - czas trwania samego
-            # pobierania (sieciowe zapytania, retry, jitter miedzy sklepami)
-            # nie ma wiec szansy "skrocic" kolejny interwal.
+            # Znacznik po cyklu, zeby czas pobierania nie skracal interwalu.
             last_ikea_check_monotonic = time.monotonic()
 
             backoff_state = get_blocking_backoff_state()
             if backoff_state.failure_count > 0:
-                # Backoff: konserwatywne, coraz rzadsze proby po kolejnych
-                # 403/429 z rzedu - stan (w tym next_allowed_check_at) jest
-                # juz trwale zapisany przez update_blocking_backoff_state()
-                # (wywolane wewnatrz run_ikea_check_cycle()). Przeliczamy go
-                # tu tylko na pozostajacy czas oczekiwania wzgledem
-                # zegara monotonicznego uzywanego przez ta petle.
+                # Termin zapisal juz cykl; przeliczamy go na zegar tej petli.
                 next_check_interval = seconds_until_next_allowed_check(backoff_state) or 0.0
                 log(
                     f"Backoff aktywny (porazka #{backoff_state.failure_count} z rzedu, "
@@ -2745,9 +2183,7 @@ def run_daemon() -> int:
                 next_check_interval = compute_jittered_interval()
                 log(f"Nastepne sprawdzenie ofert za {next_check_interval:.0f}s.")
 
-        # event.wait(timeout) budzi sie natychmiast po ustawieniu
-        # SHUTDOWN_EVENT, w przeciwienstwie do time.sleep(timeout), ktore
-        # zawsze czekaloby caly TELEGRAM_POLL_INTERVAL_SECONDS.
+        # wait() budzi sie od razu po ustawieniu SHUTDOWN_EVENT (sleep() nie).
         SHUTDOWN_EVENT.wait(TELEGRAM_POLL_INTERVAL_SECONDS)
 
     log("Zatrzymywanie (SIGTERM/SIGINT) - koncze petle daemona bez uruchamiania nowego cyklu.")
@@ -2755,12 +2191,9 @@ def run_daemon() -> int:
 
 
 def warn_if_systemd_without_daemon_mode() -> None:
-    """Systemd ustawia zmienna srodowiskowa INVOCATION_ID dla kazdej
-    uslugi, ktora odpala. Jesli proces dziala pod systemd, ale RUN_MODE w
-    .env nie jest 'daemon', skrypt wykona jeden cykl typu 'cron' i wyjdzie
-    ze statusem 0 - systemd (Type=simple) moze wtedy nie zrestartowac
-    uslugi, bo z jego perspektywy proces zakonczyl sie poprawnie. To tylko
-    ostrzeznie w logach - RUN_MODE nie jest tu w zaden sposob zmieniane."""
+    """Ostrzega, gdy proces dziala pod systemd (INVOCATION_ID), a RUN_MODE
+    nie jest 'daemon': jedno przejscie i exit 0 moze sprawic, ze systemd
+    nie zrestartuje uslugi."""
     if os.environ.get("INVOCATION_ID") and RUN_MODE != "daemon":
         log(
             "UWAGA: proces zostal odpalony przez systemd, ale RUN_MODE w "
@@ -2775,18 +2208,12 @@ def warn_if_systemd_without_daemon_mode() -> None:
 
 
 def main() -> int:
-    # Jedyne miejsce, w ktorym aplikacja faktycznie "startuje": czyta .env,
-    # waliduje konfiguracje, wczytuje dynamiczny stan itd. Musi byc
-    # wywolane PRZED sprawdzeniem komend Telegrama, cyklem cron i startem
-    # daemona - żadna z tych czynnosci nie dziala na harmless defaultach
-    # ustawionych przy imporcie modulu.
     initialize_runtime()
 
     warn_if_systemd_without_daemon_mode()
 
     if TELEGRAM_ENABLED and RUN_MODE != "daemon":
-        # W trybie cron sprawdzamy komendy raz na starcie, przed
-        # sprawdzeniem ofert - w trybie daemon robi to petla w run_daemon().
+        # W cron komendy sprawdzamy raz, przed ofertami (w daemon - petla).
         try:
             handle_telegram_updates()
         except Exception as exc:
