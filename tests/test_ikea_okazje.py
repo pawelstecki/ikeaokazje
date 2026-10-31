@@ -5198,5 +5198,68 @@ class TestApiSchemaSanityCheck(unittest.TestCase):
         mock_log.assert_not_called()
 
 
+class TestTelegramCommandParsing(unittest.TestCase):
+    """handle_telegram_updates(): komendy z @nazwa_bota i pomijanie
+    edytowanych wiadomosci. API Telegrama i plik offsetu sa zmockowane."""
+
+    CHAT_ID = "4242"
+
+    def _message(self, update_id, text, key="message", chat_id=None):
+        chat = int(chat_id or self.CHAT_ID)
+        return {"update_id": update_id, key: {"chat": {"id": chat}, "text": text}}
+
+    def _handle(self, updates, offset=100):
+        with mock.patch.object(ik, "TELEGRAM_CHAT_ID", self.CHAT_ID), \
+             mock.patch.object(ik, "load_telegram_offset", return_value=offset), \
+             mock.patch.object(ik, "telegram_get_updates", return_value=updates), \
+             mock.patch.object(ik, "save_telegram_offset") as save_offset, \
+             mock.patch.object(ik, "handle_command", return_value="ok") as handle_command, \
+             mock.patch.object(ik, "telegram_send_message") as send:
+            ik.handle_telegram_updates()
+        return handle_command, send, save_offset
+
+    def test_bot_name_suffix_is_stripped(self):
+        handle_command, send, _ = self._handle([self._message(100, "/status@MojBot")])
+        handle_command.assert_called_once_with("/status", "")
+        send.assert_called_once()
+
+    def test_bot_name_suffix_with_argument_and_upper_case_command(self):
+        handle_command, _, _ = self._handle([self._message(100, "/DODAJ@Moj_Bot  stall nowy")])
+        handle_command.assert_called_once_with("/dodaj", "stall nowy")
+
+    def test_plain_command_unchanged(self):
+        handle_command, _, _ = self._handle([self._message(100, "/usun stall")])
+        handle_command.assert_called_once_with("/usun", "stall")
+
+    def test_edited_message_is_ignored_but_offset_advances(self):
+        handle_command, send, save_offset = self._handle(
+            [self._message(105, "/usunsklep 294", key="edited_message")]
+        )
+        handle_command.assert_not_called()
+        send.assert_not_called()
+        save_offset.assert_called_once_with(106)
+
+    def test_only_new_messages_executed_in_mixed_batch(self):
+        updates = [
+            self._message(100, "/status"),
+            self._message(101, "/dodaj stall", key="edited_message"),
+            self._message(102, "/pomoc@MojBot"),
+        ]
+        handle_command, _, save_offset = self._handle(updates)
+        self.assertEqual(
+            [call.args for call in handle_command.call_args_list],
+            [("/status", ""), ("/pomoc", "")],
+        )
+        save_offset.assert_called_once_with(103)
+
+    def test_bot_name_suffix_from_other_chat_still_ignored(self):
+        handle_command, send, save_offset = self._handle(
+            [self._message(100, "/status@MojBot", chat_id="999")]
+        )
+        handle_command.assert_not_called()
+        send.assert_not_called()
+        save_offset.assert_called_once_with(101)
+
+
 if __name__ == "__main__":
     unittest.main()

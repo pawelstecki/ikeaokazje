@@ -220,7 +220,10 @@ pominięty. Wiadomości e-mail używają analogicznego grupowania.
 ```
 
 Bot reaguje tylko na wiadomości z `TELEGRAM_CHAT_ID` z `.env` - inni
-nadawcy są ignorowani.
+nadawcy są ignorowani. Komenda z nazwą bota (np. `/status@MojBot`, tak
+wysyła ją Telegram w grupach) działa tak samo jak `/status`. Edycja
+wysłanej wcześniej komendy nie wykonuje jej ponownie - wyślij ją jako
+nową wiadomość.
 
 ## Stan na dysku
 

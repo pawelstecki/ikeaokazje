@@ -2099,7 +2099,9 @@ def handle_telegram_updates() -> None:
     max_update_id = offset - 1
     for update in updates:
         max_update_id = max(max_update_id, update.get("update_id", max_update_id))
-        message = update.get("message") or update.get("edited_message")
+        # Tylko nowe wiadomosci: edycja starej komendy (edited_message) nie
+        # moze jej wykonac drugi raz. Offset i tak przesuwa sie dalej.
+        message = update.get("message")
         if not message:
             continue
 
@@ -2112,7 +2114,8 @@ def handle_telegram_updates() -> None:
             continue
 
         parts = text.split(maxsplit=1)
-        cmd = parts[0].lower()
+        # W grupach Telegram dokleja nazwe bota: /status@MojBot -> /status.
+        cmd = parts[0].split("@", 1)[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
 
         try:
