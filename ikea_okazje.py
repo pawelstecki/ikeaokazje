@@ -48,6 +48,7 @@ import smtplib
 import ssl
 import sys
 import time
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -79,6 +80,12 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 2700
 # podnoszona z ostrzezeniem (czeste odpytywanie prywatnego API).
 MIN_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS = 15
+
+# Po tylu kolejnych nieudanych cyklach idzie alert o awarii monitora
+# (HEALTH_ALERT_AFTER_CYCLES z .env ma pierwszenstwo; 0 wylacza alert).
+DEFAULT_HEALTH_ALERT_AFTER_CYCLES = 3
+# Limit opisu bledu w stanie i w alercie.
+HEALTH_LAST_ERROR_MAX_CHARS = 300
 
 # Symetryczny jitter (+/- %) interwalu sprawdzania - rozbija sztywny rytm.
 CHECK_INTERVAL_JITTER_PERCENT = 25
@@ -344,6 +351,24 @@ def parse_check_interval_seconds(raw):
     return value
 
 
+def parse_non_negative_int(raw, key: str, default: int) -> int:
+    """Liczba calkowita >= 0 z .env; pusty -> default, inna wartosc ->
+    RuntimeError."""
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip()
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise RuntimeError(
+            f"Nieprawidlowe {key} w {CONFIG_FILE}: '{text}' - oczekiwana "
+            "liczba calkowita >= 0."
+        )
+    return value
+
+
 def parse_run_mode(raw) -> str:
     """Waliduje RUN_MODE (jak parse_smtp_mode()): pusty -> 'cron', literowka
     konczy start RuntimeError zamiast cicho wlaczyc tryb cron."""
@@ -490,6 +515,7 @@ VERIFY_TLS = True
 RUN_MODE = "cron"
 CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL_SECONDS
 TELEGRAM_POLL_INTERVAL_SECONDS = DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS
+HEALTH_ALERT_AFTER_CYCLES = DEFAULT_HEALTH_ALERT_AFTER_CYCLES
 
 STORE_URL_SLUGS: dict = {}
 
@@ -556,8 +582,47 @@ def default_blocking_backoff_state_dict() -> dict:
     return BackoffState().to_dict()
 
 
+def default_health_state() -> dict:
+    """Pusty stan bloku 'health' (alert o dluzszej awarii monitora,
+    niezalezny od alertu o dostepie 403/429)."""
+    return {
+        "consecutive_failed_cycles": 0,
+        "alert_active": False,
+        "last_error": None,
+        "last_successful_check_at": None,
+    }
+
+
+def migrate_health_state(raw) -> dict:
+    """Odtwarza blok 'health' z JSON; niepoprawne pola -> wartosci domyslne.
+    alert_active tylko dla dokladnie true, zeby np. "false" nie wlaczylo
+    trwalego wyciszenia alertu."""
+    if not isinstance(raw, dict):
+        return default_health_state()
+    try:
+        failed_cycles = int(raw.get("consecutive_failed_cycles") or 0)
+    except (TypeError, ValueError):
+        failed_cycles = 0
+    last_error = raw.get("last_error")
+    if not isinstance(last_error, str):
+        last_error = None
+    last_success = raw.get("last_successful_check_at")
+    if (
+        isinstance(last_success, bool)
+        or not isinstance(last_success, (int, float))
+        or not math.isfinite(last_success)
+    ):
+        last_success = None
+    return {
+        "consecutive_failed_cycles": max(0, failed_cycles),
+        "alert_active": raw.get("alert_active") is True,
+        "last_error": last_error,
+        "last_successful_check_at": last_success,
+    }
+
+
 def load_dynamic_state() -> dict:
-    """Wczytuje dynamiczny stan (slowa, numery, sklepy, alert, backoff).
+    """Wczytuje dynamiczny stan (slowa, numery, sklepy, alerty, backoff).
     Pierwsze uruchomienie zasiewa go z .env; potem zrodlem prawdy jest plik
     (zmieniany komendami Telegrama). Brakujace klucze starszych plikow sa
     uzupelniane i zapisywane w miejscu, bez utraty danych."""
@@ -567,6 +632,7 @@ def load_dynamic_state() -> dict:
         had_store_ids = "store_ids" in data
         had_access_notification = "ikea_access_notification" in data
         had_blocking_backoff = "blocking_backoff" in data
+        had_health = "health" in data
         raw_access_notification = data.get("ikea_access_notification")
         had_pending_outage_field = (
             isinstance(raw_access_notification, dict)
@@ -582,12 +648,14 @@ def load_dynamic_state() -> dict:
             "store_ids": data.get("store_ids", list(BASE_STORE_IDS)),
             "ikea_access_notification": access_notification,
             "blocking_backoff": blocking_backoff,
+            "health": migrate_health_state(data.get("health")),
         }
         if (
             not had_store_ids
             or not had_access_notification
             or not had_pending_outage_field
             or not had_blocking_backoff
+            or not had_health
             or normalized_article_numbers != raw_article_numbers
         ):
             save_dynamic_state(state)
@@ -598,6 +666,7 @@ def load_dynamic_state() -> dict:
         "store_ids": list(BASE_STORE_IDS),
         "ikea_access_notification": default_access_notification_state(),
         "blocking_backoff": default_blocking_backoff_state_dict(),
+        "health": default_health_state(),
     }
     save_dynamic_state(state)
     return state
@@ -633,6 +702,18 @@ def set_blocking_backoff_state(state: BackoffState) -> None:
     save_dynamic_state(DYNAMIC_STATE)
 
 
+def get_health_state() -> dict:
+    """Kopia bloku 'health' z DYNAMIC_STATE (albo pusty stan)."""
+    return migrate_health_state(DYNAMIC_STATE.get("health"))
+
+
+def set_health_state(state: dict) -> None:
+    """Zapisuje blok 'health' na dysk, zeby restart nie zerowal licznika
+    nieudanych cykli ani nie powtarzal wyslanego alertu."""
+    DYNAMIC_STATE["health"] = migrate_health_state(state)
+    save_dynamic_state(DYNAMIC_STATE)
+
+
 def save_dynamic_state(state: dict) -> None:
     tmp_path = DYNAMIC_STATE_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -659,6 +740,7 @@ def initialize_runtime() -> None:
     global MIN_DISCOUNT_PERCENT, MAX_PRICE, KEYWORDS_EXCLUDE
     global ALERT_EXISTING_ON_FIRST_RUN, SMTP_MODE, VERIFY_TLS
     global RUN_MODE, CHECK_INTERVAL_SECONDS, TELEGRAM_POLL_INTERVAL_SECONDS
+    global HEALTH_ALERT_AFTER_CYCLES
     global STORE_URL_SLUGS
     global SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, USE_AUTH
     global EMAIL_ENABLED, EMAIL_TO
@@ -692,6 +774,11 @@ def initialize_runtime() -> None:
         ENV.get("TELEGRAM_POLL_INTERVAL_SECONDS"),
         "TELEGRAM_POLL_INTERVAL_SECONDS",
         DEFAULT_TELEGRAM_POLL_INTERVAL_SECONDS,
+    )
+    HEALTH_ALERT_AFTER_CYCLES = parse_non_negative_int(
+        ENV.get("HEALTH_ALERT_AFTER_CYCLES"),
+        "HEALTH_ALERT_AFTER_CYCLES",
+        DEFAULT_HEALTH_ALERT_AFTER_CYCLES,
     )
 
     # Ma pierwszenstwo nad KNOWN_STORES (nowe sklepy bez zmiany kodu).
@@ -901,6 +988,7 @@ def fetch_page_with_retry(store_id: str, page: int) -> dict:
 def fetch_store_offers(store_id: str) -> list:
     all_content = []
     page = 0
+    is_last = total_pages = None
 
     while page < MAX_PAGES:
         data = fetch_page_with_retry(store_id, page)
@@ -915,11 +1003,24 @@ def fetch_store_offers(store_id: str) -> list:
                 f"Klucze: {list(data.keys())[:20]}"
             )
 
-        all_content.extend(content)
-
+        # Zrzut przed kontrola formatu - przy zmianie API jest wtedy co
+        # obejrzec w RAW_DUMP_FILE.
         if page == 0:
             meta = {k: v for k, v in data.items() if k != "content"}
             dump_raw({"store_id": store_id, "page0_metadata": meta, "content": content})
+
+        # Zmiana schematu (np. inne nazwy pol) bez tego dalaby po cichu zero
+        # dopasowan; jako blad sklepu trafia do alertu o awarii monitora.
+        if content and not any(_looks_like_api_product(item) for item in content):
+            first = content[0]
+            first_keys = list(first.keys())[:10] if isinstance(first, dict) else type(first).__name__
+            raise RuntimeError(
+                f"Nieoczekiwany format odpowiedzi API (sklep {store_id}, strona {page}): "
+                "zaden element 'content' nie ma pola 'title' i listy 'offers'. "
+                f"Klucze pierwszego elementu: {first_keys}"
+            )
+
+        all_content.extend(content)
 
         is_last = data.get("last")
         total_pages = data.get("totalPages")
@@ -932,7 +1033,21 @@ def fetch_store_offers(store_id: str) -> list:
 
         page += 1
 
+    if page >= MAX_PAGES:
+        # Petla doszla do limitu bez sygnalu konca od API.
+        log(
+            f"UWAGA: sklep {store_id}: osiagnieto limit MAX_PAGES={MAX_PAGES} stron, "
+            f"a API wskazuje kolejne (last={is_last}, totalPages={total_pages}) - "
+            "wyniki sa niepelne.",
+            to_stderr=True,
+        )
+
     return all_content
+
+
+def _looks_like_api_product(item) -> bool:
+    """Element 'content' w znanym formacie: slownik z 'title' i lista 'offers'."""
+    return isinstance(item, dict) and "title" in item and isinstance(item.get("offers"), list)
 
 
 def fetch_all_offers() -> tuple:
@@ -1546,8 +1661,9 @@ ACCESS_RECOVERY_MESSAGE = (
 ACCESS_RECOVERY_TELEGRAM_MESSAGE = "✅ " + ACCESS_RECOVERY_MESSAGE
 
 
-def notify_access_status(email_subject: str, email_body: str, telegram_text: str) -> list:
-    """Wysyla komunikat o dostepie wszystkimi wlaczonymi kanalami. Zwraca
+def notify_status_message(email_subject: str, email_body: str, telegram_text: str) -> list:
+    """Wysyla komunikat o stanie monitora (dostep do API, awaria) wszystkimi
+    wlaczonymi kanalami. telegram_text idzie z parse_mode=HTML. Zwraca
     liste bledow (po jednym na kanal), zeby wolajacy rozpoznal calkowita
     porazke dostawy."""
     errors = []
@@ -1600,7 +1716,7 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
             return
 
         # Drugi kolejny taki cykl - potwierdzenie, wysylamy alert.
-        errors = notify_access_status(
+        errors = notify_status_message(
             ACCESS_OUTAGE_EMAIL_SUBJECT, ACCESS_OUTAGE_MESSAGE, ACCESS_OUTAGE_TELEGRAM_MESSAGE
         )
         for err in errors:
@@ -1628,7 +1744,7 @@ def handle_access_notification_state(all_stores_blocked: bool, blocked_status_co
         if not state.get("outage_active"):
             return  # nie bylo utraty dostepu
 
-        errors = notify_access_status(
+        errors = notify_status_message(
             ACCESS_RECOVERY_EMAIL_SUBJECT, ACCESS_RECOVERY_MESSAGE, ACCESS_RECOVERY_TELEGRAM_MESSAGE
         )
         for err in errors:
@@ -1661,6 +1777,126 @@ def reset_pending_outage_after_partial_cycle() -> None:
         "dostepu. Kolejna pelna blokada 403/429 zacznie nowe, dwucyklowe "
         "potwierdzanie od nowa."
     )
+
+
+# ---------------- POWIADOMIENIA O DLUZSZEJ AWARII MONITORA ----------------
+# Alert, gdy kolejne cykle koncza sie bledem innym niz pelna blokada 403/429
+# (ta ma wlasny alert powyzej). Stan w bloku 'health', kanaly te same co
+# dla ofert.
+
+# Wynik cyklu dla bloku 'health' (patrz run_ikea_check_cycle()).
+CYCLE_SKIPPED = "skipped"
+CYCLE_HEALTHY = "healthy"
+CYCLE_UNHEALTHY = "unhealthy"
+
+HEALTH_ALERT_EMAIL_SUBJECT = "IKEA Okazje: monitor nie dziala poprawnie"
+HEALTH_RECOVERY_EMAIL_SUBJECT = "IKEA Okazje: monitor znow dziala"
+HEALTH_RECOVERY_MESSAGE = (
+    "Monitor IKEA znow poprawnie sprawdza oferty.\n"
+    "Ostatni cykl zakonczyl sie bez bledow."
+)
+
+
+def format_local_timestamp(epoch) -> str:
+    """Czas lokalny 'RRRR-MM-DD GG:MM:SS' albo 'nigdy' dla None."""
+    if epoch is None:
+        return "nigdy"
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_health_alert_message(state: dict) -> str:
+    """Tresc alertu o awarii (tekst; dla Telegrama escapowany przez wolajacego)."""
+    return (
+        "Monitor IKEA nie moze poprawnie sprawdzic ofert.\n"
+        f"Kolejne nieudane cykle: {state['consecutive_failed_cycles']}\n"
+        "Ostatnie udane sprawdzenie: "
+        f"{format_local_timestamp(state['last_successful_check_at'])}\n"
+        f"Ostatni blad: {state['last_error'] or 'brak opisu'}\n"
+        "Szczegoly w logach: journalctl -u ikea-okazje (systemd) albo plik "
+        "logu z crona.\n"
+        "Kolejne nieudane cykle nie beda wysylaly nastepnych powiadomien."
+    )
+
+
+def exception_text(exc: BaseException) -> str:
+    """Tresc wyjatku albo nazwa typu, gdy tresc jest pusta (np. TimeoutError())."""
+    return str(exc) or type(exc).__name__
+
+
+def describe_store_errors(store_errors: dict) -> str:
+    """Krotki opis bledow sklepow dla bloku 'health'."""
+    return "; ".join(
+        f"sklep {store_id}: {exception_text(exc)}" for store_id, exc in store_errors.items()
+    )
+
+
+def sanitize_error_description(text: str) -> str:
+    """Opis bledu trafia do pliku stanu i do alertu: bez sekretow i adresow
+    URL, w jednej linii, max HEALTH_LAST_ERROR_MAX_CHARS znakow."""
+    text = str(text)
+    for secret in (TELEGRAM_BOT_TOKEN, SMTP_PASS):
+        if secret:
+            text = text.replace(secret, "[ukryte]")
+    text = re.sub(r"https?://\S+", "[url]", text)
+    text = " ".join(text.split())
+    if len(text) > HEALTH_LAST_ERROR_MAX_CHARS:
+        text = text[:HEALTH_LAST_ERROR_MAX_CHARS - 3] + "..."
+    return text
+
+
+def _all_channels_failed(errors: list) -> bool:
+    """Dostawa komunikatu zawiodla na wszystkich wlaczonych kanalach."""
+    return bool(errors) and len(errors) == len(_enabled_channels())
+
+
+def update_health_state(outcome: str, error_description=None) -> None:
+    """Aktualizuje blok 'health' po cyklu jednym zapisem na dysk i wysyla co
+    najwyzej jeden komunikat: alert po HEALTH_ALERT_AFTER_CYCLES kolejnych
+    nieudanych cyklach (0 - bez alertu) albo informacje o powrocie do
+    dzialania po wyslanym alercie. Gdy dostawa zawiedzie na wszystkich
+    kanalach, alert_active sie nie zmienia i nastepny taki cykl ponawia.
+    Cykl pominiety (CYCLE_SKIPPED) niczego nie zmienia."""
+    if outcome == CYCLE_SKIPPED:
+        return
+    state = get_health_state()
+
+    if outcome == CYCLE_HEALTHY:
+        state["consecutive_failed_cycles"] = 0
+        state["last_error"] = None
+        state["last_successful_check_at"] = time.time()
+        if state["alert_active"]:
+            errors = notify_status_message(
+                HEALTH_RECOVERY_EMAIL_SUBJECT,
+                HEALTH_RECOVERY_MESSAGE,
+                "✅ " + escape_html(HEALTH_RECOVERY_MESSAGE),
+            )
+            for err in errors:
+                log(f"Blad wysylki powiadomienia o powrocie monitora ({err})", to_stderr=True)
+            if not _all_channels_failed(errors):
+                state["alert_active"] = False
+                log("Wyslano powiadomienie o powrocie monitora do poprawnego dzialania.")
+        set_health_state(state)
+        return
+
+    state["consecutive_failed_cycles"] += 1
+    state["last_error"] = sanitize_error_description(error_description or "nieznany blad")
+    failed_cycles = state["consecutive_failed_cycles"]
+    log(
+        f"Nieudany cykl monitora ({failed_cycles} z rzedu): {state['last_error']}",
+        to_stderr=True,
+    )
+    threshold = HEALTH_ALERT_AFTER_CYCLES
+    if threshold > 0 and failed_cycles >= threshold and not state["alert_active"]:
+        message = build_health_alert_message(state)
+        errors = notify_status_message(
+            HEALTH_ALERT_EMAIL_SUBJECT, message, "⚠️ " + escape_html(message)
+        )
+        for err in errors:
+            log(f"Blad wysylki alertu o awarii monitora ({err})", to_stderr=True)
+        if not _all_channels_failed(errors):
+            state["alert_active"] = True
+            log(f"Wyslano alert o awarii monitora ({failed_cycles} nieudanych cykli z rzedu).")
+    set_health_state(state)
 
 
 # ---------------- KOMENDY TELEGRAMA ----------------
@@ -2037,19 +2273,52 @@ def _enabled_channels() -> list:
 
 def run_ikea_check_cycle() -> int:
     """Jeden cykl: pobranie ofert, backoff i alert o dostepie, dostawa per
-    kanal. 'pending' w STATE_FILE pamieta, ktore kanaly juz dostarczyly
-    oferte, wiec ponowienie idzie tylko do brakujacych; do 'seen' oferta
-    trafia po dostarczeniu wszystkimi aktywnymi kanalami.
+    kanal, a na koncu jedna aktualizacja bloku 'health' (alert o dluzszej
+    awarii monitora). Nieoczekiwany wyjatek jest logowany i liczony jako
+    nieudany cykl, zeby nie przerwac petli daemona.
 
-    Kod wyjscia: 0 - sukces/brak nowych ofert; 1 - zaden sklep nie pobrany
-    albo blad odczytu stanu; 2 - ktorys kanal zawiodl (postep zapisany);
-    3 - blad zapisu pliku stanu."""
+    Kod wyjscia: 0 - sukces/brak nowych ofert; 1 - zaden sklep nie pobrany,
+    blad odczytu stanu albo nieoczekiwany blad; 2 - ktorys kanal zawiodl
+    (postep zapisany); 3 - blad zapisu pliku stanu."""
+    try:
+        exit_code, outcome, error_description = _run_check_cycle()
+    except Exception as exc:
+        log(
+            f"Nieoczekiwany blad cyklu sprawdzania ofert: {exception_text(exc)}\n"
+            f"{traceback.format_exc()}",
+            to_stderr=True,
+        )
+        exit_code, outcome = 1, CYCLE_UNHEALTHY
+        error_description = f"nieoczekiwany blad: {type(exc).__name__}: {exc}"
+
+    try:
+        update_health_state(outcome, error_description)
+    except Exception as exc:
+        log(f"Blad aktualizacji stanu monitora (blok 'health'): {exception_text(exc)}", to_stderr=True)
+    return exit_code
+
+
+def _outcome_with_state_error(fetch_outcome: str, fetch_error, state_error: str) -> tuple:
+    """(wynik, opis) po bledzie pliku stanu: cykl jest nieudany, chyba ze i
+    tak byl pominiety (brak sklepow)."""
+    if fetch_outcome == CYCLE_SKIPPED:
+        return CYCLE_SKIPPED, None
+    return CYCLE_UNHEALTHY, "; ".join(part for part in (fetch_error, state_error) if part)
+
+
+def _run_check_cycle() -> tuple:
+    """Wlasciwy cykl run_ikea_check_cycle(). Zwraca (kod wyjscia, wynik dla
+    bloku 'health', opis bledu albo None). 'pending' w STATE_FILE pamieta,
+    ktore kanaly juz dostarczyly oferte, wiec ponowienie idzie tylko do
+    brakujacych; do 'seen' oferta trafia po dostarczeniu wszystkimi
+    aktywnymi kanalami. Bledy kanalow (kod 2) nie psuja wyniku - alert i
+    tak nie mialby jak dojsc."""
     if not SEARCH_TERMS and not SEARCH_ARTICLE_NUMBERS:
         log(
             "Brak aktywnych slow kluczowych i numerow artykulow - "
             "monitoring ofert jest wstrzymany."
         )
-        return 0
+        return 0, CYCLE_SKIPPED, None
 
     # Jeden profil klienta na caly cykl (wszystkie strony i sklepy).
     global CURRENT_CLIENT_PROFILE
@@ -2059,25 +2328,29 @@ def run_ikea_check_cycle() -> int:
         content, store_errors = fetch_all_offers()
     except Exception as exc:
         log(f"Blad zapytania do API: {exc}", to_stderr=True)
-        return 1
+        return 1, CYCLE_UNHEALTHY, f"blad zapytania do API: {exception_text(exc)}"
 
     update_blocking_backoff_state(store_errors)
 
     # Alert o dostepie dziala w cron i daemon (stan jest trwaly).
     if not STORE_IDS:
         # Nic nie sprawdzono - taki przebieg nie moze ani potwierdzic, ani
-        # wyczyscic stanu alertu.
-        pass
+        # wyczyscic stanu alertu (ani stanu 'health').
+        fetch_outcome, fetch_error = CYCLE_SKIPPED, None
     elif all_stores_blocked_by_403_429(store_errors):
         blocked_status_code = sorted({
             exc.status_code for exc in store_errors.values()
             if isinstance(exc, BlockedByServerError)
         })[-1]
         handle_access_notification_state(True, blocked_status_code)
+        # Pelna blokada ma wlasny alert o dostepie - bez podwojnego alertu.
+        fetch_outcome, fetch_error = CYCLE_SKIPPED, None
     elif full_cycle_fetched_successfully(store_errors):
         handle_access_notification_state(False, None)
+        fetch_outcome, fetch_error = CYCLE_HEALTHY, None
     else:
         reset_pending_outage_after_partial_cycle()
+        fetch_outcome, fetch_error = CYCLE_UNHEALTHY, describe_store_errors(store_errors)
 
     if store_errors and len(store_errors) >= len(STORE_IDS):
         log(
@@ -2085,7 +2358,7 @@ def run_ikea_check_cycle() -> int:
             f"({len(store_errors)}/{len(STORE_IDS)}). Przerywam cykl.",
             to_stderr=True,
         )
-        return 1
+        return 1, fetch_outcome, fetch_error
 
     if store_errors:
         log(
@@ -2099,9 +2372,13 @@ def run_ikea_check_cycle() -> int:
 
     try:
         state = load_seen_state()
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        # ValueError obejmuje JSONDecodeError; TypeError/AttributeError -
+        # poprawny JSON o zlej strukturze (np. lista zamiast obiektu).
         log(f"Blad odczytu pliku stanu: {exc}", to_stderr=True)
-        return 1
+        return (1, *_outcome_with_state_error(
+            fetch_outcome, fetch_error, f"plik stanu (odczyt): {exception_text(exc)}"
+        ))
 
     seen_uuids = state["seen"]
     pending = state["pending"]   # {uuid: [channels_delivered]}
@@ -2112,12 +2389,14 @@ def run_ikea_check_cycle() -> int:
             save_seen_state(current_uuids, {})
         except OSError as exc:
             log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
-            return 3
+            return (3, *_outcome_with_state_error(
+                fetch_outcome, fetch_error, f"plik stanu (zapis): {exception_text(exc)}"
+            ))
         log(
             "Pierwsze uruchomienie: zapisano stan bez wysylania alertu. "
             f"Znaleziono dopasowan: {len(matching_offers)}."
         )
-        return 0
+        return 0, fetch_outcome, fetch_error
 
     # Oferty znikniete z API wypadaja z pending - tylko przy komplecie
     # danych ze wszystkich sklepow; przy czesciowym cyklu oferta
@@ -2193,17 +2472,20 @@ def run_ikea_check_cycle() -> int:
         save_seen_state(seen_uuids, pending)
     except OSError as exc:
         log(f"Blad zapisu pliku stanu: {exc}", to_stderr=True)
-        return 3
+        return (3, *_outcome_with_state_error(
+            fetch_outcome, fetch_error, f"plik stanu (zapis): {exception_text(exc)}"
+        ))
 
     if any_channel_failed:
-        return 2  # postep sprawnych kanalow jest juz zapisany
+        # Postep sprawnych kanalow jest juz zapisany.
+        return 2, fetch_outcome, fetch_error
 
     if new_offers:
         log(f"Wyslano powiadomienie: {len(new_offers)} nowa(e) oferta(y).")
     else:
         log(f"Brak nowych ofert (aktualnie widocznych dopasowan: {len(matching_offers)}).")
 
-    return 0
+    return 0, fetch_outcome, fetch_error
 
 
 def request_shutdown(signum=None, frame=None) -> None:
@@ -2242,7 +2524,7 @@ def blocking_backoff_active(now_wall_clock=None) -> "float | None":
 def log_cron_backoff_skip(remaining_seconds: float) -> None:
     """Komunikat o pominieciu sprawdzenia w trybie cron z powodu backoffu."""
     state = get_blocking_backoff_state()
-    until_txt = datetime.fromtimestamp(state.next_allowed_check_at).strftime("%Y-%m-%d %H:%M:%S")
+    until_txt = format_local_timestamp(state.next_allowed_check_at)
     log(
         f"Aktywny backoff po blokadzie/rate limicie (porazka #{state.failure_count} "
         f"z rzedu, ostatni HTTP {state.last_status_code}) - pomijam sprawdzanie "

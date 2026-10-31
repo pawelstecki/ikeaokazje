@@ -52,6 +52,7 @@ Najważniejsze pola (pełny opis i przykłady w `.env.example`):
 | `RUN_MODE` | `cron` albo `daemon` | `cron` |
 | `CHECK_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać oferty; minimum `300` (mniejsza wartość jest podnoszona do 300 z ostrzeżeniem w logu) | `2700` (45 min) |
 | `TELEGRAM_POLL_INTERVAL_SECONDS` | tylko `daemon` - jak często sprawdzać komendy | `15` |
+| `HEALTH_ALERT_AFTER_CYCLES` | po ilu kolejnych nieudanych cyklach wysłać alert o awarii monitora; `0` wyłącza alert (patrz "Alert o awarii monitora") | `3` |
 
 Nieprawidłowa wartość pola liczbowego albo `RUN_MODE` (literówka, tekst
 zamiast liczby, liczba ujemna, zero dla interwałów) kończy start skryptu
@@ -76,8 +77,9 @@ pierwszym uruchomieniu** - zasiewają plik `~/.ikea_okazje_dynamic.json`,
 który od tej pory jest źródłem prawdy. Dalej zarządzasz listami komendami
 Telegrama - to bezpieczniejsza opcja niż ręczna edycja pliku. Jeśli
 edytujesz go wprost, zrób najpierw kopię. Usunięcie tego pliku resetuje
-nie tylko sklepy/słowa/numery do wartości z `.env`, ale też stan backoffu
-i stan alertu o utracie/odzyskaniu dostępu (patrz niżej) - traktuj to
+nie tylko sklepy/słowa/numery do wartości z `.env`, ale też stan backoffu,
+stan alertu o utracie/odzyskaniu dostępu i alertu o awarii monitora
+(patrz niżej) - traktuj to
 jako pełny reset, nie tylko zmianę listy wyszukiwania.
 
 Skrypt ma wbudowaną mapę wszystkich sklepów IKEA w Polsce (`KNOWN_STORES`
@@ -224,7 +226,7 @@ nadawcy są ignorowani.
 
 - `~/.ikea_okazje_dynamic.json` - aktywne sklepy, słowa i numery
   artykułów (źródło prawdy po pierwszym starcie, patrz wyżej), plus stan
-  backoffu i alertu dostępu (opisane niżej).
+  backoffu, alertu dostępu i alertu o awarii monitora (opisane niżej).
 - `~/.ikea_okazje_seen_offers.json` - identyfikatory już znanych ofert,
   aby nie zgłaszać ich ponownie. Nowe oferty są dopisywane do tego pliku
   wyłącznie wtedy, gdy wszystkie włączone kanały (e-mail, cała seria
@@ -273,7 +275,53 @@ wysyła. Jeśli po pierwszej takiej porażce kolejny cykl się powiedzie,
 pierwszym późniejszym w pełni udanym cyklu skrypt próbuje wysłać jedno
 powiadomienie o odzyskaniu dostępu.
 
+## Alert o awarii monitora
+
+Niezależnie od alertu o 403/429 skrypt pilnuje, czy w ogóle działa
+poprawnie. Cykl jest **nieudany**, gdy którykolwiek sklep zwróci błąd
+inny niż pełna blokada 403/429 (np. HTTP 404 albo 5xx, timeout, zmieniony
+format odpowiedzi API - także gdy pozostałe sklepy odpowiedziały), gdy
+nie da się odczytać albo zapisać pliku `~/.ikea_okazje_seen_offers.json`
+albo gdy w cyklu wystąpi nieoczekiwany wyjątek (daemon go loguje
+i działa dalej). Cykl, w którym wszystkie sklepy dostały wyłącznie
+403/429, nie liczy się ani jako udany, ani jako nieudany - ma własny
+alert opisany wyżej. Błąd wysyłki powiadomienia o ofercie nie psuje
+cyklu (taki alert i tak by nie doszedł; błąd jest w logu).
+
+Po `HEALTH_ALERT_AFTER_CYCLES` (domyślnie 3) nieudanych cyklach z rzędu
+skrypt wysyła **jeden** alert "IKEA Okazje: monitor nie dziala
+poprawnie" tymi samymi kanałami co oferty: liczbę nieudanych cykli, czas
+ostatniego udanego sprawdzenia, ostatni błąd i podpowiedź, gdzie szukać
+logów. Kolejne nieudane cykle nic nie wysyłają. Pierwszy w pełni udany
+cykl wysyła jedno powiadomienie, że monitor znów działa. Jeśli wysyłka
+zawiedzie na wszystkich kanałach, skrypt ponowi ją w następnym takim
+cyklu. `HEALTH_ALERT_AFTER_CYCLES=0` wyłącza te powiadomienia (licznik
+i ostatni błąd są dalej zapisywane). Stan trzyma klucz `"health"`
+w `~/.ikea_okazje_dynamic.json`, więc restart nie zeruje licznika ani nie
+powtarza alertu.
+
 ## Diagnozowanie problemów
+
+**Dostałeś alert "monitor nie dziala poprawnie".** Zobacz ostatni błąd
+w treści alertu i pełne logi: `journalctl -u ikea-okazje` (systemd) albo
+plik logu z crona (np. `~/ikea_okazje.log`). Najczęstsze przyczyny są
+opisane niżej. Ostatni błąd i licznik są też w kluczu `"health"`
+w `~/.ikea_okazje_dynamic.json`.
+
+**`Nieoczekiwany format odpowiedzi API`.** IKEA zmieniła format
+odpowiedzi (np. nazwy pól) - skrypt celowo traktuje to jako błąd, zamiast
+po cichu nie znajdować żadnych ofert. Surowa odpowiedź pierwszej strony
+jest w `~/.ikea_okazje_last_raw.json`; potrzebna jest aktualizacja
+skryptu.
+
+**`Blad odczytu pliku stanu`.** Plik `~/.ikea_okazje_seen_offers.json`
+jest uszkodzony. Popraw go albo usuń - po usunięciu następny cykl
+zapisze aktualne oferty jako znane bez wysyłania powiadomień (jak przy
+pierwszym uruchomieniu, chyba że `ALERT_EXISTING_ON_FIRST_RUN=true`).
+
+**`osiagnieto limit MAX_PAGES`.** Sklep ma więcej stron ofert niż limit
+`MAX_PAGES` w kodzie - wyniki z dalszych stron są pomijane.
+
 
 **Usługa systemd wychodzi natychmiast ze statusem 0.** Sprawdź
 `RUN_MODE=daemon` w `~/.config/ikea-okazje.env` - patrz wyżej.
