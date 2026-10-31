@@ -288,7 +288,10 @@ Powiadomienie o odzyskaniu dostępu (patrz niżej) to inna zasada i wciąż
 wymaga w pełni udanego cyklu, bez żadnych błędów. Wyliczony termin
 kolejnej próby jest zapisywany na dysku i przetrwa restart procesu albo
 usługi - po restarcie skrypt czeka do tego samego terminu, a nie zaczyna
-od nowa.
+od nowa. Uszkodzona wartość w kluczu `"blocking_backoff"` pliku
+`~/.ikea_okazje_dynamic.json` (np. tekst albo `NaN` zamiast liczby) jest
+traktowana jak brak wartości - skrypt działa dalej, zamiast kończyć się
+błędem.
 
 Osobno od backoffu, skrypt wysyła powiadomienie o **utracie dostępu**
 dopiero po dwóch kolejnych, w pełni nieudanych cyklach z rzędu (wszystkie

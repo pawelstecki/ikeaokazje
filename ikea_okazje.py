@@ -189,19 +189,33 @@ class BackoffState:
 
     @classmethod
     def from_dict(cls, data) -> "BackoffState":
-        """Odtwarza stan z JSON; odporne na brakujace lub niepoprawne pola."""
+        """Odtwarza stan z JSON; odporne na brakujace lub niepoprawne pola.
+        Uszkodzona wartosc (tekst, NaN, inf) nie moze wywrocic daemona ani
+        sprawdzenia backoffu w cron - staje sie None (brak wartosci)."""
         if not isinstance(data, dict):
             return cls()
         try:
             failure_count = int(data.get("failure_count") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             failure_count = 0
+        status_code = _finite_float_or_none(data.get("last_status_code"))
         return cls(
             failure_count=max(0, failure_count),
-            last_status_code=data.get("last_status_code"),
-            next_allowed_check_at=data.get("next_allowed_check_at"),
-            retry_after_seconds=data.get("retry_after_seconds"),
+            last_status_code=int(status_code) if status_code is not None else None,
+            next_allowed_check_at=_finite_float_or_none(data.get("next_allowed_check_at")),
+            retry_after_seconds=_finite_float_or_none(data.get("retry_after_seconds")),
         )
+
+
+def _finite_float_or_none(value) -> "float | None":
+    """Skonczona liczba z JSON jako float; bool, tekst, NaN i inf -> None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 STATE_FILE = os.path.expanduser("~/.ikea_okazje_seen_offers.json")
@@ -2343,7 +2357,9 @@ def compute_local_backoff_delay(failure_count: int) -> float:
         return 0.0
     base = effective_backoff_base_seconds()
     cap = effective_backoff_cap_seconds()
-    delay = base * (2 ** (failure_count - 1))
+    # Cap jest osiagany po kilku krokach; ograniczony wykladnik chroni przed
+    # OverflowError przy duzym failure_count (dluga blokada, uszkodzony plik).
+    delay = base * (2 ** min(failure_count - 1, 32))
     return min(delay, cap)
 
 

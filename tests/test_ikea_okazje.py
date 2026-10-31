@@ -5940,5 +5940,114 @@ class TestDaemonLongPolling(unittest.TestCase):
         self.assertIn("Zatrzymywanie", messages)
 
 
+class TestBackoffStateFromDictHardening(unittest.TestCase):
+    """BackoffState.from_dict(): uszkodzone pola trwalego backoffu ->
+    None/0 zamiast wyjatku w daemonie albo w sprawdzeniu backoffu cron."""
+
+    CORRUPTED = ("jutro", "1700000000", float("nan"), float("inf"), float("-inf"),
+                 True, False, [1], {"a": 1}, 10 ** 400)
+
+    def setUp(self):
+        self._orig_backoff = ik.get_blocking_backoff_state().to_dict()
+        ik.SHUTDOWN_EVENT.clear()
+
+    def tearDown(self):
+        ik.set_blocking_backoff_state(ik.BackoffState.from_dict(self._orig_backoff))
+        ik.SHUTDOWN_EVENT.clear()
+
+    def test_valid_numbers_are_kept_with_types(self):
+        state = ik.BackoffState.from_dict({
+            "failure_count": 2,
+            "last_status_code": 429.0,
+            "next_allowed_check_at": 1700000000,
+            "retry_after_seconds": 30,
+        })
+        self.assertEqual(state, ik.BackoffState(2, 429, 1700000000.0, 30.0))
+        self.assertIsInstance(state.last_status_code, int)
+        self.assertIsInstance(state.next_allowed_check_at, float)
+        self.assertIsInstance(state.retry_after_seconds, float)
+        self.assertEqual(ik.BackoffState.from_dict(state.to_dict()), state)
+
+    def test_corrupted_values_become_none(self):
+        for value in self.CORRUPTED:
+            with self.subTest(value=value):
+                state = ik.BackoffState.from_dict({
+                    "failure_count": 1,
+                    "last_status_code": value,
+                    "next_allowed_check_at": value,
+                    "retry_after_seconds": value,
+                })
+                self.assertEqual(state.failure_count, 1)
+                self.assertIsNone(state.last_status_code)
+                self.assertIsNone(state.next_allowed_check_at)
+                self.assertIsNone(state.retry_after_seconds)
+
+    def test_missing_fields_and_non_dict(self):
+        self.assertEqual(ik.BackoffState.from_dict({}), ik.BackoffState())
+        self.assertEqual(ik.BackoffState.from_dict(None), ik.BackoffState())
+        self.assertEqual(ik.BackoffState.from_dict("x"), ik.BackoffState())
+
+    def test_json_nan_and_infinity_from_file(self):
+        raw = json.loads(
+            '{"failure_count": Infinity, "last_status_code": NaN, '
+            '"next_allowed_check_at": Infinity, "retry_after_seconds": -Infinity}'
+        )
+        self.assertEqual(ik.BackoffState.from_dict(raw), ik.BackoffState())
+        for value in (float("nan"), "abc", -3, None):
+            with self.subTest(value=value):
+                self.assertEqual(ik.BackoffState.from_dict({"failure_count": value}).failure_count, 0)
+
+    def test_cron_backoff_check_tolerates_corrupted_deadline(self):
+        for deadline in ("2026-01-01 12:00", float("nan"), [1]):
+            with self.subTest(deadline=deadline):
+                ik.DYNAMIC_STATE["blocking_backoff"] = {
+                    "failure_count": 3, "last_status_code": "x",
+                    "next_allowed_check_at": deadline, "retry_after_seconds": "y",
+                }
+                self.assertIsNone(ik.blocking_backoff_active())
+                with mock.patch.object(ik, "initialize_runtime"), \
+                     mock.patch.object(ik, "warn_if_systemd_without_daemon_mode"), \
+                     mock.patch.object(ik, "run_ikea_check_cycle", return_value=0) as cycle, \
+                     mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+                     mock.patch.object(ik, "RUN_MODE", "cron"):
+                    self.assertEqual(ik.main(), 0)
+                cycle.assert_called_once()
+
+    def test_daemon_start_tolerates_corrupted_deadline(self):
+        ik.DYNAMIC_STATE["blocking_backoff"] = {
+            "failure_count": 2, "last_status_code": 429, "next_allowed_check_at": "jutro",
+        }
+
+        def stop_on_wait(timeout):
+            ik.SHUTDOWN_EVENT.set()
+            return True
+
+        with mock.patch.object(ik, "install_shutdown_signal_handlers"), \
+             mock.patch.object(ik, "run_ikea_check_cycle") as cycle, \
+             mock.patch.object(ik, "TELEGRAM_ENABLED", False), \
+             mock.patch.object(ik.SHUTDOWN_EVENT, "wait", side_effect=stop_on_wait):
+            self.assertEqual(ik.run_daemon(), 0)
+        cycle.assert_not_called()
+
+    def test_large_failure_count_does_not_overflow(self):
+        # Ulamkowy interwal z .env daje float w bazie - bez limitu wykladnika
+        # float * 2**2000 konczyl sie OverflowError.
+        patcher = mock.patch.object(ik, "CHECK_INTERVAL_SECONDS", 2700.5)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cap = ik.effective_backoff_cap_seconds()
+        for failure_count in (2000, 10 ** 6):
+            with self.subTest(failure_count=failure_count):
+                self.assertEqual(ik.compute_local_backoff_delay(failure_count), cap)
+        delay = ik.compute_next_allowed_check_delay(5000)
+        self.assertGreaterEqual(delay, cap)
+        self.assertLessEqual(delay, cap * (1 + ik.BACKOFF_JITTER_PERCENT / 100))
+        for failure_count in range(1, 40):
+            expected = min(
+                ik.effective_backoff_base_seconds() * 2 ** (failure_count - 1), cap
+            )
+            self.assertEqual(ik.compute_local_backoff_delay(failure_count), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
