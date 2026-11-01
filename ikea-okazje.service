@@ -7,29 +7,31 @@ Wants=network-online.target
 Type=simple
 User=TWOJ_UZYTKOWNIK
 WorkingDirectory=/home/TWOJ_UZYTKOWNIK
-# WAZNE: ten sam plik blokady /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock musi
-# byc uzywany przez usluge systemd, cron i ewentualne reczne odpalenie
-# skryptu - patrz README ("Ochrona przed rownoleglymi procesami"). "-n"
-# oznacza, ze flock NIE czeka: jesli blokada jest juz zajeta, ta kopia
-# procesu po prostu nic nie robi i wychodzi - dwie kopie monitoringu
-# nigdy nie dzialaja naraz, a stare cykle sie nie kolejkuja.
-# "-E 75" ustawia DEDYKOWANY kod wyjscia (75) na sytuacje "blokada byla
-# juz zajeta" - odrozniamy go od prawdziwych bledow skryptu (kody 1-3,
-# patrz main()/run_ikea_check_cycle()). RestartPreventExitStatus=75
-# nizej mowi systemd, zeby NIE restartowal uslugi w tym konkretnym
-# przypadku (to jest zamierzone, "cudze" wykonanie cyklu, a nie
-# awaria) - bez tego Restart=on-failure wchodziloby w petle restartow
-# co RestartSec, gdy blokada jest zajeta przez inny proces. Prawdziwe
-# awarie skryptu/API (kody wyjscia inne niz 75) sa wciaz restartowane
-# normalnie.
-# WAZNE: RUN_MODE=daemon ustawiasz w prywatnym pliku .env
-# (~/.config/ikea-okazje.env), NIE tutaj jako Environment= - kod nie daje
-# zmiennym srodowiskowym systemd priorytetu nad .env, wiec Environment=
-# tutaj by nic nie zmienil. Patrz README.
-ExecStart=/usr/bin/flock -n -E 75 /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikea_okazje.py
+# RUN_MODE=daemon ustaw w ~/.config/ikea-okazje.env, NIE tutaj -
+# Environment=RUN_MODE nic nie zmieni, skrypt czyta RUN_MODE tylko z .env.
+Environment=PYTHONUNBUFFERED=1
+# Ten sam plik blokady co w cronie i przy recznym uruchomieniu (README).
+# Gdy blokada jest zajeta, flock -n od razu wychodzi z kodem 75 (-E 75),
+# a RestartPreventExitStatus nie restartuje wtedy uslugi - dziala juz
+# inna kopia. Kod 78 to blad konfiguracji (.env): usluga konczy sie jako
+# "failed" zamiast restartu co 15 s - popraw .env i zrob systemctl restart.
+# Inne kody bledow sa restartowane (Restart=on-failure).
+ExecStart=/usr/bin/flock -n -E 75 /home/TWOJ_UZYTKOWNIK/.ikea_okazje.lock /usr/bin/python3 /home/TWOJ_UZYTKOWNIK/ikeaokazje/ikea_okazje.py
 Restart=on-failure
 RestartSec=15
-RestartPreventExitStatus=75
+RestartPreventExitStatus=75 78
+# Po SIGTERM daemon czeka na koniec biezacego zapytania long pollingu (do
+# TELEGRAM_LONG_POLL_SECONDS, przy maksimum ok. 65 s) albo trwajacego
+# sprawdzania IKEA - przy ponowieniach i timeoutach nawet kilka minut.
+# Po TimeoutStopSec systemd zabija proces (SIGKILL); pliki stanu sa
+# zapisywane atomowo, wiec zostaja poprawne.
+TimeoutStopSec=180
+
+# Utwardzenie: skrypt pisze tylko w katalogu domowym uzytkownika i laczy
+# sie z siecia (IKEA, Telegram, SMTP), wiec bez ProtectHome/PrivateNetwork.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
